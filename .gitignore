@@ -1,0 +1,21 @@
+# Node / extension build output (none yet, reserved for a later bundler step)
+node_modules/
+dist/
+
+# Rust (desktop app, later)
+target/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Captured media must never be committed
+*.mp4
+*.m4a
+*.m4s
+*.webm
+*.ts
+captures/
