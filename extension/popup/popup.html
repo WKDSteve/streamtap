@@ -15,12 +15,22 @@
       td.mime { white-space: normal; word-break: break-all; max-width: 200px; }
       .muted { color: #777; }
       button { margin-top: 6px; }
+      .sink { margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
+      .sink label { margin-right: 8px; }
+      .sink input { width: 110px; }
     </style>
   </head>
   <body>
     <h1>streamtap · Spike 1</h1>
     <div id="out" class="muted">loading…</div>
     <button id="clear">clear tab state</button>
+    <fieldset class="sink">
+      <legend>Sink (streamtap-sink serve)</legend>
+      <label>port <input id="port" type="number" min="1" max="65535" size="6" /></label>
+      <label>token <input id="token" type="password" size="16" /></label>
+      <button id="save">save</button>
+      <span id="link" class="muted"></span>
+    </fieldset>
     <script src="popup.js"></script>
   </body>
 </html>

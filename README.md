@@ -12,16 +12,19 @@ alone, by design.
 
 ## Status
 
-Spike 1: the extension logs what players feed into MSE. See
-[extension/README.md](extension/README.md) for how to load it and what the
-first live run showed.
+- Spike 1 (done): the extension logs what players feed into MSE. See
+  [extension/README.md](extension/README.md).
+- Spike 2 (sink done, browser run pending): `desktop/streamtap-sink` receives
+  segments over a loopback WebSocket, writes them per SourceBuffer and remuxes
+  with `ffmpeg -c copy`. See [desktop/README.md](desktop/README.md).
 
-Planned layout:
+Layout:
 
 ```
 streamtap/
   extension/   MV3 extension (hook, content script, service worker, popup)
-  desktop/     Tauri 2 app: WebSocket receiver, segment store, muxer (later)
+  desktop/     Rust workspace: streamtap-sink (WebSocket receiver, segment store, mux);
+               later the Tauri 2 app
   LICENSE
   README.md
 ```
@@ -30,7 +33,8 @@ streamtap/
 
 1. Spike 1: hook sees segments, timeline parses (done, see extension README).
 2. Spike 2: segments streamed binary to a local Rust server, written per
-   SourceBuffer, `ffmpeg -c copy` yields a playable MP4.
+   SourceBuffer, `ffmpeg -c copy` yields a playable MP4 (sink verified with a
+   test client; first real-browser run pending).
 3. MVP: desktop app with a tab/video list, background capture mode, DRM flag.
 4. Later: download modes (yt-dlp, manifest replay), tab capture, live ring
    buffer, Firefox.

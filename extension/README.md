@@ -1,11 +1,12 @@
-# Extension: Spike 1 – MSE hook logger
+# Extension: Spike 1 + 2 – MSE hook logger and segment streamer
 
-Minimal Manifest V3 extension that patches the Media Source Extensions
-prototypes in the page's main world and logs every `SourceBuffer.appendBuffer()`
-call: which SourceBuffer, MIME type, byte size, container kind, top-level
-boxes, `tfdt` start time and duration (once the init segment's timescale is
-known). Nothing is copied, stored or sent anywhere; this spike only proves
-that the hook sees the segments.
+Manifest V3 extension that patches the Media Source Extensions prototypes in
+the page's main world and, for every `SourceBuffer.appendBuffer()` call,
+records which SourceBuffer, MIME type, byte size, container kind, top-level
+boxes, `tfdt` start time and duration (spike 1), and streams a copy of the
+segment bytes to the local sink over a loopback WebSocket (spike 2, see
+[../desktop/README.md](../desktop/README.md)). Without a configured sink the
+extension stays in metadata-only mode.
 
 The concept and the DRM primer live in the nvim-config vault under
 `docs/ROADMAP/IDEAS/video-capture/`.
@@ -15,7 +16,7 @@ The concept and the DRM primer live in the nvim-config vault under
 | File | Runs where | Purpose |
 |---|---|---|
 | `src/hook.js` | page main world, `document_start`, all frames | Patches `MediaSource`, `SourceBuffer`, `URL.createObjectURL`, `Navigator.requestMediaKeySystemAccess`; parses fMP4 / WebM headers; posts records via `window.postMessage`. |
-| `src/content.js` | isolated world | Forwards the records to the service worker. |
+| `src/content.js` | isolated world | Forwards the records to the service worker; opens `ws://127.0.0.1:<port>/` to the sink, sends `hello` with the token, then one binary message per segment. Never buffers more than 64 MiB and only while connecting; when the sink is down segments are counted as dropped, not queued. |
 | `src/background.js` | service worker | Per-tab registry (in memory), badge with the number of SourceBuffers that received media. Red badge when a DRM key system was requested. |
 | `popup/` | action popup | Shows the registry for the current tab. |
 
@@ -32,6 +33,11 @@ The concept and the DRM primer live in the nvim-config vault under
 
 5. Click the extension icon for the per-tab summary (SourceBuffers, init /
    media segment counts, bytes, covered time range).
+6. To capture: start `streamtap-sink serve --token <secret>` (see
+   `../desktop/README.md`), enter port and token in the popup, **save**, reload
+   the video page. The popup's sink line shows connected / sent / dropped.
+   After the video ended (or you close the tab) run
+   `streamtap-sink mux captures/<dir>` and open the MP4 in mpv.
 
 After editing a file, hit the reload icon on `chrome://extensions` and reload
 the page.
@@ -67,6 +73,20 @@ Injected into a running ARD Mediathek page (hls.js → fMP4), 7 s after a seek:
   extension installed (hook runs at `document_start`) the init segment is seen
   and the values are filled in. The "pre-hook" path registers such
   SourceBuffers lazily so late injection still works.
+
+## Spike 2 status (2026-10-30)
+
+- Sink and wire format verified end to end with `desktop/scripts/test-sink.mjs`
+  (fragmented test MP4 → sink → `mux` → ffprobe OK).
+- Browser → sink **not yet verified**: the Claude desktop app's built-in
+  browser pane cannot reach loopback servers started from the shell (all
+  `ws://127.0.0.1:17650` attempts failed without a CSP message and without
+  reaching the listener). The hook + content script injected on the hls.js
+  demo page did produce segments (18 appends in 12 s, 1920×1080) and the
+  content script counted them as dropped, so the page-side path works; only
+  the socket needs a real Chrome. Open question from the concept remains:
+  does the page CSP (`connect-src`) apply to a content script's WebSocket in
+  Chromium? First real-Chrome run answers it.
 
 ## Known limitations of the spike
 

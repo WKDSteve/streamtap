@@ -23,9 +23,10 @@
   const msInfo = new WeakMap(); // MediaSource -> { id, blobUrl }
   const sbInfo = new WeakMap(); // SourceBuffer -> { id, msId, mime, timescale, seq }
 
-  const post = (type, payload) => {
+  // `transfer` moves ArrayBuffers to the receiver instead of cloning them.
+  const post = (type, payload, transfer) => {
     try {
-      window.postMessage({ __vc: 1, type, frameUrl: location.href, ...payload }, "*");
+      window.postMessage({ __vc: 1, type, frameUrl: location.href, ...payload }, "*", transfer || []);
     } catch (e) {
       // A detached frame or a serialization problem must never break the player.
     }
@@ -292,7 +293,10 @@
       samples: parsed ? parsed.samples : 0,
       head: hex(u8, 12),
     };
-    post("append", rec);
+    // One copy (the player keeps using the original), then hand the copy over
+    // by transfer so no second copy is made on the way to the content script.
+    const copy = u8.slice().buffer;
+    post("append", { ...rec, payload: copy }, [copy]);
 
     const where =
       rec.isInit ? "INIT" : rec.startSec !== null ? `t=${rec.startSec}s` : "t=?";

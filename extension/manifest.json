@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Logs every SourceBuffer.appendBuffer() call so we can see what media players feed into MSE. No data is stored or sent anywhere.",
   "minimum_chrome_version": "111",
-  "permissions": [],
+  "permissions": ["storage"],
   "action": {
     "default_title": "streamtap",
     "default_popup": "popup/popup.html"

@@ -37,12 +37,38 @@ const render = (state) => {
   out.innerHTML = html;
 };
 
+const fmtLink = (s) =>
+  !s
+    ? "no content script in this tab"
+    : `${s.connected ? "connected" : "not connected"} · ${s.sent} msgs / ${fmtBytes(s.sentBytes)} sent · ${s.dropped} dropped`;
+
 const load = async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return render(null);
   chrome.runtime.sendMessage({ kind: "vc-get", tabId: tab.id }, (state) => render(state));
   document.getElementById("clear").onclick = () =>
     chrome.runtime.sendMessage({ kind: "vc-clear", tabId: tab.id }, () => render(null));
+
+  const port = document.getElementById("port");
+  const token = document.getElementById("token");
+  chrome.storage.local.get({ sinkPort: 17650, sinkToken: "" }, (v) => {
+    port.value = v.sinkPort;
+    token.value = v.sinkToken;
+  });
+  document.getElementById("save").onclick = () =>
+    chrome.storage.local.set({ sinkPort: Number(port.value) || 17650, sinkToken: token.value }, () => {
+      document.getElementById("link").textContent = "saved; reload the page to reconnect";
+    });
+
+  // Ask the top frame's content script how the sink link is doing.
+  try {
+    chrome.tabs.sendMessage(tab.id, { kind: "vc-link-status" }, { frameId: 0 }, (s) => {
+      void chrome.runtime.lastError;
+      document.getElementById("link").textContent = fmtLink(s);
+    });
+  } catch (e) {
+    document.getElementById("link").textContent = fmtLink(null);
+  }
 };
 
 load();

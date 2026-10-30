@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/streamtap-sink"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/WKDSteve/streamtap"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
