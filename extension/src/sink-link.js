@@ -39,6 +39,7 @@ const sinkSegmentHeader = (h) => ({
   dur: h.dur ?? null,
   tso: h.tso ?? null,
   seqMode: h.seqMode === true,
+  tsoSet: h.tsoSet === true,
 });
 
 // The item for one segment; an init+media append also carries a framed copy
@@ -67,15 +68,46 @@ let sinkKeptTotal = 0;
 
 const blobsSize = (chunks) => (chunks ? chunks.reduce((n, b) => n + b.size, 0) : 0);
 
+// The kept init with the most bytes on any link but `except`, as [link, sb].
+const largestKept = (except) => {
+  let best = null;
+  let bestSize = 0;
+  for (const m of sinkLinks.values()) {
+    for (const l of m.values()) {
+      if (l === except) continue;
+      for (const [sb, chunks] of l.inits) {
+        const n = blobsSize(chunks);
+        if (n > bestSize) {
+          best = [l, sb];
+          bestSize = n;
+        }
+      }
+    }
+  }
+  return best;
+};
+
 // Sets (or with null drops) the init bytes a link keeps for sb, within the
-// worker-wide budget: what does not fit is not kept at all, so a stale init
-// is never replayed in its place.
+// worker-wide budget. A link's current init is never refused for another
+// link's: the largest one kept elsewhere goes first (a page that forges big
+// inits loses its own). What still does not fit is not kept at all, so a
+// stale init is never replayed in its place. A link whose port is gone
+// keeps nothing.
 const linkKeep = (link, sb, chunks) => {
   const old = blobsSize(link.inits.get(sb));
   let size = blobsSize(chunks);
-  if (chunks && (size > SINK_MAX_INIT_BYTES || sinkKeptTotal - old + size > SINK_MAX_KEPT_TOTAL)) {
+  if (link.gone || size > SINK_MAX_INIT_BYTES) {
     chunks = null;
     size = 0;
+  }
+  while (chunks && sinkKeptTotal - old + size > SINK_MAX_KEPT_TOTAL) {
+    const victim = largestKept(link);
+    if (!victim) {
+      chunks = null;
+      size = 0;
+      break;
+    }
+    linkKeep(victim[0], victim[1], null);
   }
   link.inits.delete(sb);
   if (chunks) link.inits.set(sb, chunks);
@@ -270,6 +302,7 @@ chrome.runtime.onConnect.addListener((port) => {
     overflow: true, // until linkAdmit gives it a slot
     inits: new Map(), // sb -> [framed init, continuation...] in effect, replayed on every new socket
     lostInit: new Set(), // sb whose init was dropped: nothing until the next init
+    gone: false, // the port's cleanup ran: nothing is kept any more
     pending: [], // { blob, sb, isInit, initCont } while connecting
     pendingBytes: 0,
     sent: 0,
@@ -304,6 +337,10 @@ chrome.runtime.onConnect.addListener((port) => {
         if (initBytes) {
           const sb = h.sb;
           chain = chain.then(() => {
+            if (!link.lostInit.has(sb) && Number.isSafeInteger(sb) && sb >= 0 && linkAdmit(link)) {
+              // The sink notes it, and mux says the capture of sb ends here.
+              linkSend(link, { blob: sinkFrame({ type: "event", name: "initlost", sb }), sb: null, isInit: false, initCont: false });
+            }
             link.lostInit.add(sb);
             linkKeep(link, sb, null);
           });
@@ -385,6 +422,9 @@ chrome.runtime.onConnect.addListener((port) => {
       if (!link.overflow) sinkLinkCount--;
       link.overflow = true; // never admitted again
       for (const sb of [...link.inits.keys()]) linkKeep(link, sb, null);
+      // Items still queued on a connecting socket are consumed later; they
+      // must not be kept for a link that is gone.
+      link.gone = true;
       const m = sinkLinks.get(tabId);
       if (m) {
         m.delete(portId);

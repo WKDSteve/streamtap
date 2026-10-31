@@ -103,6 +103,7 @@
       dur: m.dur ?? null,
       tso: m.tso ?? null,
       seqMode: m.seqMode === true,
+      tsoSet: m.tsoSet === true,
     };
   };
 

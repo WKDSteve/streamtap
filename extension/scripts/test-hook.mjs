@@ -315,6 +315,35 @@ check(last().initLen === ini12.length, "initLen ends before styp/sidx");
 sb8.appendBuffer(ab(clear8.subarray(0, 20)));
 check(last().isInit === true && last().timescale === null, "the head of a split init has no stale timescale");
 
+// A set timestampOffset is flagged on the next append only.
+const sb13 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+sb13.appendBuffer(ab(init("avc1")));
+sb13.timestampOffset = 4;
+sb13.appendBuffer(ab(media(0)));
+check(last().tsoSet === true && last().tso === 4, "a set timestampOffset is flagged");
+sb13.appendBuffer(ab(media(90000)));
+check(last().tsoSet === false, "only on the append right after it");
+
+// A short tail of media, then an init: both posted on their own, the init intact.
+const sb14 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const ini14 = init("avc1");
+const before14 = appends().length;
+sb14.appendBuffer(ab(Buffer.from([1, 2, 3])));
+sb14.appendBuffer(ab(ini14));
+const recs14 = appends().slice(before14);
+check(
+  recs14.length === 2 && recs14[0].bytes === 3 && recs14[0].isInit === false && recs14[1].isInit === true && recs14[1].bytes === ini14.length,
+  "a short tail before an init does not swallow it"
+);
+
+// An init+index range (ftyp moov sidx, no moof) is all init.
+const sb15 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const ini15 = Buffer.concat([init("avc1"), box("sidx", Buffer.alloc(4))]);
+sb15.appendBuffer(ab(ini15));
+check(last().isInit === true && last().initLen === null, "a trailing sidx without moof stays init");
+sb15.appendBuffer(ab(media(0)));
+check(last().isInit === false && last().initCont === false, "the init after it was complete");
+
 // The MediaSource closing is reported for the content script.
 ms.handlers.sourceclose();
 check(posted.some((p) => p.data.type === "msclose"), "sourceclose posts msclose");

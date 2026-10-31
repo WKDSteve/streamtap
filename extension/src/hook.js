@@ -339,10 +339,13 @@
   // end right after ftyp or Info are still an open init.
   // Per-segment boxes (a sidx differs per segment): media, not init.
   const MEDIA_BOXES = ["styp", "sidx", "ssix", "emsg", "prft", "moof", "mdat"];
+  // They end the init only with a moof/mdat after them: an init+index range
+  // of a single-file stream (ftyp moov sidx) is all init.
   const mp4InitEnd = (u8) => {
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     let off = 0;
     let sawMoov = false;
+    let mediaStart = null;
     while (off + 8 <= u8.byteLength) {
       let size = dv.getUint32(off);
       const type = ascii(u8, off + 4);
@@ -354,8 +357,9 @@
       } else if (size === 0) {
         size = u8.byteLength - off;
       }
-      if (MEDIA_BOXES.includes(type)) return { end: off, open: false };
-      if (size < header) return { end: off, open: false };
+      if (type === "moof" || type === "mdat") return { end: mediaStart ?? off, open: false };
+      if (MEDIA_BOXES.includes(type) && mediaStart === null) mediaStart = off;
+      if (size < header) return { end: mediaStart ?? off, open: false };
       if (off + size > u8.byteLength) return { end: u8.byteLength, open: true };
       if (type === "moov") sawMoov = true;
       off += size;
@@ -517,7 +521,7 @@
   }
 
   const onAppend = (sb, data, api) => {
-    let u8 = toU8(data);
+    const u8 = toU8(data);
     if (!u8) return;
     let info = sbInfo.get(sb);
     if (!info) {
@@ -531,16 +535,26 @@
     info.seq++;
 
     // Fewer than 8 bytes cannot be told apart (an init head, or media): they
-    // are held and posted together with the next append, so an init that
-    // starts that way is recorded as one.
+    // are held until the next append. When both together start an init, they
+    // are posted as that one init; otherwise each on its own.
     if (info.shortHead) {
-      u8 = concat(info.shortHead, u8);
+      const head = info.shortHead;
       info.shortHead = null;
+      const joined = concat(head.bytes, u8);
+      if (startsInit(joined, sniff(joined))) {
+        onBytes(sb, info, joined, api, head.seq);
+        return;
+      }
+      onBytes(sb, info, head.bytes, api, head.seq);
     } else if (!info.initBuf && u8.byteLength < 8 && sniff(u8) === "unknown") {
-      info.shortHead = u8.slice();
+      info.shortHead = { bytes: u8.slice(), seq: info.seq };
       return;
     }
+    onBytes(sb, info, u8, api, info.seq);
+  };
 
+  // One append's bytes (or a held short head joined with them).
+  const onBytes = (sb, info, u8, api, seq) => {
     const kind = sniff(u8);
     const parsed = kind === "mp4" ? parseIsoBmff(u8) : kind === "webm" ? parseWebm(u8) : null;
     if (parsed && parsed.timescale) info.timescale = parsed.timescale;
@@ -601,6 +615,10 @@
     } catch (e) {
       tso = null;
     }
+    // The player set timestampOffset since the last append: in sequence mode
+    // the browser starts this append at that offset.
+    const tsoSet = !!info.tsoSet;
+    info.tsoSet = false;
 
     // WebM Cluster timecodes count in the init's TimecodeScale (1 ms when the
     // init did not say otherwise).
@@ -610,7 +628,7 @@
       sbId: info.id,
       msId: info.msId,
       mime: info.mime,
-      seq: info.seq,
+      seq,
       api,
       bytes: u8.byteLength,
       kind,
@@ -623,6 +641,7 @@
       dur: parsed && parsed.duration ? parsed.duration : null,
       tso,
       seqMode,
+      tsoSet,
       encrypted: !!info.encrypted || emeActive,
       startSec: tfdtNum !== null && ts ? +(tfdtNum / ts).toFixed(3) : null,
       durationSec: parsed && parsed.duration && ts ? +(parsed.duration / ts).toFixed(3) : null,
@@ -705,6 +724,7 @@
       set: function (v) {
         const info = sbInfo.get(this);
         if (info) {
+          info.tsoSet = true;
           log(`SourceBuffer #${info.id} timestampOffset = ${v}`);
           post("timestampoffset", { sbId: info.id, value: v });
         }

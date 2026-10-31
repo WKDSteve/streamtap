@@ -169,6 +169,10 @@ enum Header {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "wire format: independent flags of one append"
+)]
 struct SegmentHeader {
     sb: u32,
     seq: u64,
@@ -201,10 +205,13 @@ struct SegmentHeader {
     #[serde(default)]
     tso: Option<f64>,
     /// The `SourceBuffer` is in "sequence" mode: the browser places media
-    /// one after the other and rewrites `timestampOffset` itself, so the
-    /// recorded offset is not used.
+    /// one after the other and rewrites `timestampOffset` itself.
     #[serde(default, rename = "seqMode")]
     seq_mode: bool,
+    /// The player set `timestampOffset` since the previous append. In
+    /// sequence mode the browser then starts this append at that offset.
+    #[serde(default, rename = "tsoSet")]
+    tso_set: bool,
 }
 
 /// `Option<u64>` from a JSON number or a decimal string.
@@ -238,6 +245,7 @@ struct IndexLine<'a> {
     dur: Option<u64>,
     tso: Option<f64>,
     seq_mode: bool,
+    tso_set: bool,
     mime: &'a str,
     kind: &'a str,
 }
@@ -275,8 +283,13 @@ struct TrackState {
     parts: u32,
     /// Chunks of an init still arriving (it may come in several appends): the
     /// decision (duplicate, switch back, new part) waits for the whole init.
-    pending: Vec<(SegmentHeader, Vec<u8>)>,
-    pending_bytes: usize,
+    /// Header and length of each chunk; the bytes are `pending_whole`.
+    pending: Vec<(SegmentHeader, usize)>,
+    pending_whole: Vec<u8>,
+    /// Where the completeness scan of `pending_whole` resumes, and whether it
+    /// found the `moov` / `Tracks` (each byte is scanned once).
+    pending_scan: usize,
+    pending_done: bool,
     /// The pending init came right after an encrypted stretch.
     pending_after_refusal: bool,
     /// Container of the last init ("mp4", "webm"): continuation chunks have
@@ -425,50 +438,97 @@ fn init_prefix_len(kind: &str, payload: &[u8]) -> Option<usize> {
         return None;
     }
     // A box starts where the previous one ended (headers may be 8 or 16 bytes).
-    let mut start = 0;
-    for (kind, _, end) in boxes_in(payload, 0, payload.len()) {
-        if MEDIA_BOXES.contains(&&kind) {
-            return (start > 0).then_some(start);
-        }
-        start = end;
+    // Only with a moof/mdat after it: an init+index range of a single-file
+    // stream (ftyp moov sidx) is all init.
+    let boxes = boxes_in(payload, 0, payload.len());
+    let first_media = boxes
+        .iter()
+        .position(|(k, _, _)| MEDIA_BOXES.contains(&k))?;
+    if !boxes[first_media..]
+        .iter()
+        .any(|(k, _, _)| k == b"moof" || k == b"mdat")
+    {
+        return None;
     }
-    None
+    let start = if first_media == 0 {
+        0
+    } else {
+        boxes[first_media - 1].2
+    };
+    (start > 0).then_some(start)
 }
 
 /// The init bytes so far hold a complete `moov` (MP4) or `Tracks` (`WebM`):
 /// nothing more of this init is to come.
+#[cfg(test)]
 fn init_complete(kind: &str, bytes: &[u8]) -> bool {
+    init_scan(kind, bytes, 0).0
+}
+
+/// Scans init bytes for a complete `moov` (MP4) or `Tracks` (`WebM`) from
+/// `from`, the start of the first box or element not yet complete. Returns
+/// whether it was found and where the next scan resumes, so bytes arriving
+/// in many chunks are each walked once.
+fn init_scan(kind: &str, bytes: &[u8], from: usize) -> (bool, usize) {
+    let mut off = from;
     if kind == "webm" {
-        let mut off = 0;
         while off < bytes.len() {
             let Some((id, il)) = read_vint(bytes, off, true) else {
-                return false;
+                return (false, off);
             };
             let Some((size, sl)) = read_vint(bytes, off + il, false) else {
-                return false;
+                return (false, off);
             };
             let body = off + il + sl;
             let unknown = sl < 8 && size == (1u64 << (7 * sl)) - 1;
             if id == 0x1853_8067 || unknown {
-                off = body;
+                off = body; // descend into Segment
                 continue;
             }
             let Some(end) = usize::try_from(size).ok().and_then(|s| body.checked_add(s)) else {
-                return false;
+                return (false, off);
             };
             if end > bytes.len() {
-                return false;
+                return (false, off);
             }
             if id == 0x1654_ae6b {
-                return true;
+                return (true, end);
             }
             off = end;
         }
-        return false;
+        return (false, off);
     }
-    boxes_in(bytes, 0, bytes.len())
-        .iter()
-        .any(|(kind, _, _)| kind == b"moov")
+    while off + 8 <= bytes.len() {
+        let size32 =
+            u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        let (size, header) = match size32 {
+            // Up to the end of the stream: never complete before it ends.
+            0 => return (false, off),
+            1 => {
+                let Some(b) = bytes.get(off + 8..off + 16) else {
+                    return (false, off);
+                };
+                let mut v = [0u8; 8];
+                v.copy_from_slice(b);
+                match usize::try_from(u64::from_be_bytes(v)) {
+                    Ok(s) => (s, 16),
+                    Err(_) => return (false, off),
+                }
+            }
+            s => (s as usize, 8),
+        };
+        let Some(end) = off
+            .checked_add(size)
+            .filter(|e| size >= header && *e <= bytes.len())
+        else {
+            return (false, off);
+        };
+        if &bytes[off + 4..off + 8] == b"moov" {
+            return (true, end);
+        }
+        off = end;
+    }
+    (false, off)
 }
 
 /// `WebM`/Matroska encryption in init bytes: the element IDs
@@ -680,6 +740,9 @@ fn handle_connection(
             }
             (Header::Event { name, sb }, Some(s)) => {
                 println!("{}: event {name} sb={sb:?}", s.dir.display());
+                if let ("initlost", Some(sb)) = (name.as_str(), sb) {
+                    s.note_lost_init(sb)?;
+                }
                 if name == "endofstream" {
                     s.finish();
                     s.summary();
@@ -749,7 +812,9 @@ impl TrackState {
             hash_part: HashMap::new(),
             parts: 1,
             pending: Vec::new(),
-            pending_bytes: 0,
+            pending_whole: Vec::new(),
+            pending_scan: 0,
+            pending_done: false,
             pending_after_refusal: false,
             init_kind: String::new(),
             skip_tail: false,
@@ -762,13 +827,25 @@ impl TrackState {
         }
     }
 
-    /// The pending init chunks together form a complete init.
-    fn pending_complete(&self) -> bool {
-        let mut whole = Vec::with_capacity(self.pending_bytes);
-        for (_, c) in &self.pending {
-            whole.extend_from_slice(c);
+    /// Holds one more chunk of the pending init.
+    fn push_pending(&mut self, h: &SegmentHeader, payload: &[u8]) {
+        self.pending.push((h.clone(), payload.len()));
+        self.pending_whole.extend_from_slice(payload);
+        if !self.pending_done {
+            let (done, next) = init_scan(&self.init_kind, &self.pending_whole, self.pending_scan);
+            self.pending_done = done;
+            self.pending_scan = next;
         }
-        init_complete(&self.init_kind, &whole)
+    }
+
+    /// Takes the pending chunks and their bytes, leaving nothing pending.
+    fn take_pending(&mut self) -> (Vec<(SegmentHeader, usize)>, Vec<u8>) {
+        self.pending_scan = 0;
+        self.pending_done = false;
+        (
+            std::mem::take(&mut self.pending),
+            std::mem::take(&mut self.pending_whole),
+        )
     }
 
     /// Makes `part` the current part file, keeping the state of the old one.
@@ -971,6 +1048,7 @@ impl Session {
             dur: if as_init { None } else { h.dur },
             tso: h.tso.filter(|v| v.is_finite()),
             seq_mode: h.seq_mode,
+            tso_set: h.tso_set && !as_init,
             mime: &h.mime,
             kind: &h.kind,
         };
@@ -1000,12 +1078,7 @@ impl Session {
         if track.pending.is_empty() {
             return Ok(());
         }
-        let chunks = std::mem::take(&mut track.pending);
-        track.pending_bytes = 0;
-        let mut whole = Vec::new();
-        for (_, c) in &chunks {
-            whole.extend_from_slice(c);
-        }
+        let (chunks, whole) = track.take_pending();
         let parts_before = track.parts;
         let write = track.decide_init(fnv1a(&whole), &dir, sb)?;
         let new_file = track.parts != parts_before;
@@ -1013,10 +1086,27 @@ impl Session {
         if (new_file && !self.within_budget(PART_FILE_COST)) || !write {
             return Ok(());
         }
-        for (h, c) in &chunks {
-            self.write_row(sb, h, c, true)?;
+        let mut at = 0;
+        for (h, len) in &chunks {
+            self.write_row(sb, h, &whole[at..at + len], true)?;
+            at += len;
         }
         Ok(())
+    }
+
+    /// The extension dropped an init of `sb` (its backlog was full) and
+    /// nothing of `sb` after it: recorded in `events.jsonl` for `mux`.
+    fn note_lost_init(&mut self, sb: u32) -> io::Result<()> {
+        let mut line = serde_json::to_vec(&serde_json::json!({ "sb": sb, "event": "initlost" }))?;
+        line.push(b'\n');
+        if !self.within_budget(line.len() as u64) {
+            return Ok(());
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("events.jsonl"))?
+            .write_all(&line)
     }
 
     /// Decides about every pending init (end of a connection or stream).
@@ -1086,7 +1176,7 @@ impl Session {
         // is media (a segment cut inside its moof), not init bytes.
         let continuation = !h.is_init
             && h.tfdt.is_none()
-            && (h.init_cont || (!track.pending.is_empty() && !track.pending_complete()));
+            && (h.init_cont || (!track.pending.is_empty() && !track.pending_done));
 
         if payload_encrypted(h, payload, continuation, &track.init_kind) {
             if !track.refused {
@@ -1097,8 +1187,7 @@ impl Session {
                 );
             }
             track.refused = true;
-            track.pending.clear();
-            track.pending_bytes = 0;
+            track.take_pending();
             track.skipped += 1;
             return Ok(());
         }
@@ -1113,17 +1202,15 @@ impl Session {
             // A clear init ends an encrypted stretch.
             track.pending_after_refusal = std::mem::take(&mut track.refused);
             track.init_kind.clone_from(&h.kind);
-            track.pending.push((h.clone(), payload.to_vec()));
-            track.pending_bytes = payload.len();
-            if track.pending_bytes > MAX_PENDING_INIT {
+            track.push_pending(h, payload);
+            if track.pending_whole.len() > MAX_PENDING_INIT {
                 self.flush_init(h.sb)?;
             }
             return Ok(());
         }
         if continuation && !track.pending.is_empty() {
-            if track.pending_bytes + payload.len() <= MAX_PENDING_INIT {
-                track.pending.push((h.clone(), payload.to_vec()));
-                track.pending_bytes += payload.len();
+            if track.pending_whole.len() + payload.len() <= MAX_PENDING_INIT {
+                track.push_pending(h, payload);
                 return Ok(());
             }
             // Too large to hold: decide on what came so far, write the rest
@@ -1198,6 +1285,8 @@ struct IndexRow {
     tso: Option<f64>,
     #[serde(default)]
     seq_mode: bool,
+    #[serde(default)]
+    tso_set: bool,
     mime: String,
     #[serde(default)]
     kind: String,
@@ -1395,32 +1484,54 @@ fn rescale(ticks: i64, from: Option<u32>, to: u32) -> i64 {
     i64::try_from(quot.clamp(i128::from(i64::MIN), i128::from(i64::MAX))).expect("clamped")
 }
 
-/// Sequence mode: the browser lays out the appends one after the other.
-/// Where a segment does not start within 100 ms of where the previous one
-/// ended (a seek, or a new period that restarts `tfdt`), it is moved there,
-/// as the browser does; the segments after it keep that move. Returns the
-/// move (ticks of `ts`) per row offset and the number of jumps.
-fn seq_layout(media: &[&IndexRow], ts: u32) -> (HashMap<u64, i64>, usize) {
-    let tolerance = i128::from(ts / 10);
+/// Moves of sequence-mode media rows, per (part, offset), in ticks of each
+/// row's timescale.
+type SeqMoves = HashMap<(u32, u64), i64>;
+
+/// Sequence mode: where the browser places each append (MSE coded frame
+/// processing), per `SourceBuffer` over all its parts in arrival order (an
+/// ABR switch and back keeps one timeline). After the player set
+/// `timestampOffset` (`tso_set`: a seek, a resync) the append starts at that
+/// offset, the group start. Otherwise it starts at its `tfdt` plus the offset
+/// in effect, unless that does not continue within 100 ms of where the
+/// previous append ended (a discontinuity, a new period restarting `tfdt`):
+/// then the browser starts it right there. Returns the moves and the number
+/// of discontinuities; `None` when a row lacks `tfdt`, duration or timescale.
+fn seq_layout(rows: &[&IndexRow]) -> Option<(SeqMoves, usize)> {
+    const NS: i128 = 1_000_000_000;
     let mut moves = HashMap::new();
-    let mut adj: i128 = 0;
-    let mut prev_end: Option<i128> = None;
+    let mut group_end: Option<i128> = None;
     let mut jumps = 0;
-    for r in media {
-        let Some(t) = r.tfdt else { continue };
-        let mut start = i128::from(t) + adj;
-        if let Some(end) = prev_end {
-            if (start - end).abs() > tolerance {
-                adj += end - start;
-                start = end;
-                jumps += 1;
+    for r in rows.iter().filter(|r| !r.is_init && r.seq_mode) {
+        let (Some(t), Some(d), Some(ts)) = (
+            r.tfdt,
+            r.dur.filter(|d| *d > 0),
+            r.timescale.filter(|t| *t > 0),
+        ) else {
+            return None;
+        };
+        let ts = i128::from(ts);
+        let t_ns = i128::from(t) * NS / ts;
+        let tso_ns = i128::from(shift_ticks(r.tso, Some(1_000_000_000)));
+        let start = if r.tso_set {
+            tso_ns
+        } else {
+            let s = t_ns + tso_ns;
+            match group_end {
+                Some(e) if (s - e).abs() > NS / 10 => {
+                    jumps += 1;
+                    e
+                }
+                _ => s,
             }
-        }
-        prev_end = r.dur.map(|d| start + i128::from(d));
-        let clamped = adj.clamp(i128::from(i64::MIN), i128::from(i64::MAX));
-        moves.insert(r.offset, i64::try_from(clamped).expect("clamped"));
+        };
+        group_end = Some(start + i128::from(d) * NS / ts);
+        let num = (start - t_ns) * ts;
+        let ticks = (num + num.signum() * NS / 2) / NS;
+        let clamped = ticks.clamp(i128::from(i64::MIN), i128::from(i64::MAX));
+        moves.insert((r.part, r.offset), i64::try_from(clamped).expect("clamped"));
     }
-    (moves, jumps)
+    Some((moves, jumps))
 }
 
 fn read_segment(src: &mut File, r: &IndexRow, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -1520,6 +1631,7 @@ fn ordered_part(
     sb: u32,
     part: u32,
     rows: &[&IndexRow],
+    seq_moves: Option<&SeqMoves>,
 ) -> io::Result<(PathBuf, Option<f64>, usize)> {
     let raw = dir.join(format!("sb{sb}.p{part}.bin"));
     let init: Vec<&IndexRow> = rows.iter().copied().filter(|r| r.is_init).collect();
@@ -1544,22 +1656,15 @@ fn ordered_part(
     let tracks = raw_tracks.max(1);
     // Per-track timescales let a multi-track segment be shifted traf by traf.
     let track_ts = trak_timescales(&init_bytes);
-    // Sequence mode: the browser rewrote timestampOffset itself, the recorded
-    // one is stale and never used; the part is laid out like the browser does.
-    let seq: Vec<&IndexRow> = media.iter().copied().filter(|r| r.seq_mode).collect();
-    let seq_ok = ts.is_some() && seq.iter().all(|r| r.dur.is_some_and(|d| d > 0));
-    let (seq_adj, jumps) = match ts {
-        Some(ts) if seq_ok && !seq.is_empty() => seq_layout(&seq, ts),
-        _ => (HashMap::new(), 0),
-    };
-    if jumps > 0 {
-        eprintln!(
-            "mux: sb{sb}.p{part}: sequence mode: {jumps} jump(s) in the timeline (a seek or a new period); laid out one after the other in arrival order, as the browser plays it"
-        );
-    }
+    // Sequence mode: placed where the browser placed it (`seq_layout`, over
+    // all parts of the SourceBuffer); without that layout the arrival order.
+    let seq_ok = seq_moves.is_some() || !media.iter().any(|r| r.seq_mode);
     let offset = |r: &IndexRow| {
         if r.seq_mode {
-            seq_adj.get(&r.offset).copied().unwrap_or(0)
+            seq_moves
+                .and_then(|m| m.get(&(part, r.offset)))
+                .copied()
+                .unwrap_or(0)
         } else {
             shift_ticks(r.tso, ts)
         }
@@ -1577,8 +1682,7 @@ fn ordered_part(
     let pts = |r: &IndexRow| i128::from(r.tfdt.unwrap_or(0)) + i128::from(offset(r));
     // Sequence mode needs durations to lay out the jumps; without them the
     // arrival order (duplicates already removed by the sink) is kept.
-    let timed =
-        !media.is_empty() && media.iter().all(|r| r.tfdt.is_some()) && (seq.is_empty() || seq_ok);
+    let timed = !media.is_empty() && media.iter().all(|r| r.tfdt.is_some()) && seq_ok;
     let init_first = rows.iter().take(init.len()).all(|r| r.is_init);
 
     let mut order: Vec<&IndexRow> = media.clone();
@@ -1743,11 +1847,33 @@ fn run_mux(args: &[String], tools: &Tools) -> Result<(), SinkError> {
     }
 
     keep_main_media_source(&mut rows);
+    report_lost_inits(&dir);
     let plan = mux_inputs(&dir, &rows, tools)?;
     for w in &plan.warnings {
         eprintln!("mux: {w}");
     }
     run_ffmpeg(tools, &plan.inputs, &out, timeout)
+}
+
+/// Names the `SourceBuffer`s whose capture ends early because the extension
+/// dropped one of their inits (`events.jsonl`, written by the sink).
+fn report_lost_inits(dir: &Path) {
+    let Ok(events) = fs::read_to_string(dir.join("events.jsonl")) else {
+        return;
+    };
+    let mut lost: Vec<u64> = events
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "initlost")
+        .filter_map(|v| v["sb"].as_u64())
+        .collect();
+    lost.sort_unstable();
+    lost.dedup();
+    for sb in lost {
+        eprintln!(
+            "mux: sb{sb}: the extension dropped an init (its queue was full); what came after it is not captured"
+        );
+    }
 }
 
 /// The first line of `ffmpeg -version`, e.g. `ffmpeg version 7.1 ...`.
@@ -1875,17 +2001,27 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
                 printable(mime, 120)
             );
         }
-        let part_rows: Vec<&IndexRow> = rows
+        let sb_rows: Vec<&IndexRow> = rows.iter().filter(|r| r.sb == *id).collect();
+        let seq = seq_layout(&sb_rows);
+        if let Some((_, jumps)) = seq.as_ref().filter(|(_, j)| *j > 0) {
+            eprintln!(
+                "mux: sb{id}: sequence mode: {jumps} discontinuity(ies) without a timestampOffset set; placed right after the previous append, as the browser does"
+            );
+        }
+        let part_rows: Vec<&IndexRow> = sb_rows
             .iter()
-            .filter(|r| r.sb == *id && r.part == *part)
+            .copied()
+            .filter(|r| r.part == *part)
             .collect();
         let kind = part_rows
             .iter()
             .find(|r| r.is_init)
             .map_or("", |r| r.kind.as_str());
-        let (path, start, traks) = ordered_part(dir, *id, *part, &part_rows).map_err(|e| {
-            SinkError::io(format!("sb{id}.p{part}: cannot reorder segments"), None, e)
-        })?;
+        let moves = seq.as_ref().map(|(m, _)| m);
+        let (path, start, traks) =
+            ordered_part(dir, *id, *part, &part_rows, moves).map_err(|e| {
+                SinkError::io(format!("sb{id}.p{part}: cannot reorder segments"), None, e)
+            })?;
         // An MP4 init without a complete moov (cut short) cannot be decoded,
         // and ffmpeg would fail the whole mux with it.
         if kind == "mp4" && traks == 0 {
@@ -2203,6 +2339,7 @@ mod tests {
             dur: None,
             tso,
             seq_mode: false,
+            tso_set: false,
             mime: "video/mp4".into(),
             kind: "mp4".into(),
         }
@@ -2231,7 +2368,10 @@ mod tests {
 
     fn order(dir: &Path, rows: &[IndexRow]) -> (Vec<u8>, PathBuf, Option<f64>) {
         let refs: Vec<&IndexRow> = rows.iter().collect();
-        let (path, start, _) = ordered_part(dir, 1, 0, &refs).expect("ordered");
+        // As mux_inputs does: the sequence-mode layout over the SourceBuffer.
+        let seq = seq_layout(&refs);
+        let moves = seq.as_ref().map(|(m, _)| m);
+        let (path, start, _) = ordered_part(dir, 1, 0, &refs, moves).expect("ordered");
         (fs::read(&path).expect("read"), path, start)
     }
 
@@ -2450,9 +2590,7 @@ mod tests {
         );
         rows[1].dur = Some(1000);
         rows[2].dur = Some(1000);
-        let refs: Vec<&IndexRow> = rows.iter().collect();
-        let (path, _, _) = ordered_part(&dir, 1, 0, &refs).expect("ordered");
-        let got = fs::read(path).expect("read");
+        let got = order(&dir, &rows).0;
         assert_eq!(got.len(), init.len() + 64, "both periods kept");
     }
 
@@ -2582,6 +2720,7 @@ mod tests {
             dur: None,
             tso,
             seq_mode: false,
+            tso_set: false,
         }
     }
 
@@ -3336,6 +3475,94 @@ built with gcc"),
         assert_eq!(path, dir.join("sb1.p0.bin"), "unchanged");
         let tfdts: Vec<u32> = got[init.len()..].chunks(32).map(tfdt_of).collect();
         assert_eq!(tfdts, [0, 1000, 0, 1000, 500]);
+    }
+
+    #[test]
+    fn sequence_mode_follows_a_set_timestamp_offset() {
+        // Shaka in sequence mode: 0, 1 s, a seek to 4 s (timestampOffset set
+        // to 4), 5 s (the browser left the offset at 0), a seek back to 2 s
+        // (set to 2), 3 s. The browser places each at its own time.
+        let dir = temp_dir("seqtso");
+        let init = init_with_traks(1);
+        let segs = [
+            moof(0),
+            moof(1000),
+            moof(4000),
+            moof(5000),
+            moof(2000),
+            moof(3000),
+        ];
+        let set = [false, false, true, false, true, false];
+        let tso = [0.0, 0.0, 4.0, 0.0, 2.0, 0.0];
+        let mut list: Vec<TestSeg<'_>> = vec![(&init, true, None, None)];
+        for (i, s) in segs.iter().enumerate() {
+            list.push((s, false, Some(u64::from(tfdt_of(s))), Some(tso[i])));
+        }
+        let mut rows = write_part(&dir, &list);
+        for (i, r) in rows[1..].iter_mut().enumerate() {
+            r.seq_mode = true;
+            r.dur = Some(1000);
+            r.tso_set = set[i];
+        }
+        let got = order(&dir, &rows).0;
+        let tfdts: Vec<u32> = got[init.len()..].chunks(32).map(tfdt_of).collect();
+        assert_eq!(tfdts, [0, 1000, 2000, 3000, 4000, 5000], "in time order");
+        let refs: Vec<&IndexRow> = rows.iter().collect();
+        let (moves, jumps) = seq_layout(&refs).expect("layout");
+        assert_eq!(jumps, 0, "no discontinuity");
+        assert!(
+            moves.values().all(|m| *m == 0),
+            "each at its own time, none moved: {moves:?}"
+        );
+    }
+
+    #[test]
+    fn sequence_mode_layout_spans_all_parts() {
+        // An ABR switch and back: part 0 has 0, 1 s and 4, 5 s, part 1 the
+        // 2, 3 s in between. One timeline: nothing moves.
+        let init = init_with_traks(1);
+        let mut rows = Vec::new();
+        for (i, (part, t)) in [
+            (0, 0),
+            (0, 1000),
+            (1, 2000),
+            (1, 3000),
+            (0, 4000),
+            (0, 5000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = row(i as u64 * 100, 32, false, Some(t), Some(0.0));
+            r.part = part;
+            r.seq_mode = true;
+            r.dur = Some(1000);
+            rows.push(r);
+        }
+        let mut first = row(9999, init.len() as u64, true, None, None);
+        first.seq_mode = true;
+        rows.insert(0, first);
+        let refs: Vec<&IndexRow> = rows.iter().collect();
+        let (moves, jumps) = seq_layout(&refs).expect("layout");
+        assert_eq!(jumps, 0);
+        assert!(moves.values().all(|m| *m == 0), "{moves:?}");
+    }
+
+    #[test]
+    fn init_index_range_stays_one_init() {
+        // SegmentBase: ftyp moov sidx with no moof is all init.
+        let mut v = init_with_traks(1);
+        v.extend(mp4_box(*b"sidx", b"1234"));
+        assert_eq!(init_prefix_len("mp4", &v), None);
+    }
+
+    #[test]
+    fn init_scan_resumes_where_it_stopped() {
+        let init = init_with_traks(1);
+        let (done, at) = init_scan("mp4", &init[..20], 0);
+        assert!(!done);
+        assert_eq!(at, 12, "after the complete ftyp");
+        assert!(init_scan("mp4", &init, at).0);
     }
 
     #[test]

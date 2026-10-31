@@ -71,7 +71,9 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
 - An init appended together with media (video.js VHS) is stored as two rows:
   the init part and the media part. The init part ends at the first media box
   (`styp`, `sidx`, `emsg`, `prft`, `moof`, `mdat`; a `sidx` differs per
-  segment and must not make every combined append a new init). The init is
+  segment and must not make every combined append a new init), but only with
+  a `moof`/`mdat` after it: an init+index range of a single-file stream
+  (`ftyp moov sidx`) stays one init. The init is
   decided right there, so the media part never counts as its continuation
   (also without a `tfdt`).
 - An init is decided once it is complete: its chunks (an init split across
@@ -157,15 +159,26 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   warned. Without a `tfdt` on every media segment (WebM blocks, continuation
   chunks, a segment cut inside its `moof`) the arrival order is kept, and
   re-fetches cannot be told apart there.
-- **Sequence mode:** the browser lays out the appends one after the other
-  (the sink already dropped re-appends). `mux` does the same: where a segment
-  does not start within 100 ms of the previous one's end (a seek, a new period
-  restarting `tfdt`), it and the ones after it are moved there and their
-  `tfdt` rewritten, and the jumps are counted. Media fetched after a seek back
-  therefore plays after what came before it, as in the browser. Without
-  durations this cannot be done: the arrival order is kept, which is warned.
+- **Sequence mode:** `mux` places each append where the browser placed it
+  (MSE coded frame processing), per SourceBuffer over all its parts in
+  arrival order, so an ABR switch and back keeps one timeline. After the
+  player set `timestampOffset` (`tsoSet`, a seek or a resync as Shaka does
+  it) the append starts at that offset; otherwise at its `tfdt` plus the
+  offset in effect, unless that does not continue within 100 ms of where the
+  previous append ended (a discontinuity, a new period restarting `tfdt`):
+  then right there, as the browser does, and these are counted. A seek
+  without a set offset therefore plays after what came before it, as in the
+  browser; a seek with one keeps its place and its gap is reported. Moved
+  segments get their `tfdt` rewritten. Without `tfdt`, durations and
+  timescale on every segment this cannot be done: the arrival order is kept,
+  which is warned. The first append keeps its own time (the browser may start
+  it at 0; the alignment between SourceBuffers is relative anyway).
 - **Gaps:** ranges skipped by a forward seek are reported with their
   approximate length.
+- **Lost inits:** when the extension had to drop an init (its queue was
+  full), it takes nothing more of that SourceBuffer until the next init and
+  sends `initlost`; the sink notes it in `events.jsonl` and `mux` says that
+  the capture of that SourceBuffer ends there.
 - A bad `index.jsonl` line (an interrupted sink) is skipped, not fatal.
 - A SourceBuffer without any init segment is skipped (capture started after
   the player had appended it; the extension avoids this by running at
@@ -185,8 +198,8 @@ Headers:
 | `type` | fields | payload |
 |---|---|---|
 | `hello` | `token`, `session`, `url`, `title` | none; must be the first message |
-| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode` | the segment bytes exactly as passed to `appendBuffer` |
-| `event` | `name` (`endofstream`, `changetype`), `sb` | none |
+| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append) | the segment bytes exactly as passed to `appendBuffer` |
+| `event` | `name` (`endofstream`, `changetype`, `initlost`), `sb` | none |
 ## Test without a browser
 
 `cargo test --release` runs the unit tests (dedupe, split inits, ABR
