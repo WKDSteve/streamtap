@@ -10,7 +10,7 @@
 //!   u32 little-endian header length | JSON header | payload bytes
 //! The first message of a connection is a `hello` header carrying the token.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream};
@@ -231,6 +231,10 @@ fn de_opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::
 }
 
 #[derive(Debug, Serialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "index format: independent flags of one row"
+)]
 struct IndexLine<'a> {
     sb: u32,
     ms: Option<u32>,
@@ -246,6 +250,10 @@ struct IndexLine<'a> {
     tso: Option<f64>,
     seq_mode: bool,
     tso_set: bool,
+    /// A sequence-mode duplicate: no bytes of its own, it points at the row
+    /// it repeats and only holds its place in the timeline.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    mark: bool,
     mime: &'a str,
     kind: &'a str,
 }
@@ -263,8 +271,9 @@ const MAX_PARTS_PER_TRACK: u32 = 64;
 const PART_FILE_COST: u64 = 4096;
 
 /// Dedupe keys: (tfdt, timestampOffset in ms, duration), or in sequence mode
-/// (payload hash, `i64::MIN`, length).
-type SeenSet = HashSet<(u64, i64, u64)>;
+/// (payload hash, `i64::MIN`, length); each with the offset of its row in the
+/// part file (a sequence-mode duplicate points there, `Admit::Mark`).
+type SeenSet = HashMap<(u64, i64, u64), u64>;
 
 #[allow(
     clippy::struct_excessive_bools,
@@ -413,6 +422,9 @@ fn read_vint(b: &[u8], off: usize, keep_marker: bool) -> Option<(u64, usize)> {
 const MEDIA_BOXES: [&[u8; 4]; 7] = [
     b"styp", b"sidx", b"ssix", b"emsg", b"prft", b"moof", b"mdat",
 ];
+/// Of those, the ones only a media segment has (`sidx`/`ssix` also form the
+/// index range of a single-file stream, right after its `moov`).
+const SEGMENT_BOXES: [&[u8; 4]; 5] = [b"styp", b"emsg", b"prft", b"moof", b"mdat"];
 
 /// Where the init part of an init+media append ends (video.js VHS appends the
 /// init together with the first segment): the first top-level media box
@@ -440,8 +452,8 @@ fn init_prefix_len(kind: &str, payload: &[u8]) -> Option<usize> {
         return None;
     }
     // A box starts where the previous one ended (headers may be 8 or 16 bytes).
-    // Only with a moof/mdat after it: an init+index range of a single-file
-    // stream (ftyp moov sidx) is all init.
+    // Only with a box after it that only a segment has (`SEGMENT_BOXES`): an
+    // init+index range of a single-file stream (ftyp moov sidx) is all init.
     // A last box cut off (a chunked fetch) counts by its type, as in the
     // hook: (type, start) of every box, complete or not.
     let complete = boxes_in(payload, 0, payload.len());
@@ -457,7 +469,7 @@ fn init_prefix_len(kind: &str, payload: &[u8]) -> Option<usize> {
     let first_media = starts.iter().position(|(k, _)| MEDIA_BOXES.contains(&k))?;
     if !starts[first_media..]
         .iter()
-        .any(|(k, _)| k == b"moof" || k == b"mdat")
+        .any(|(k, _)| SEGMENT_BOXES.contains(&k))
     {
         return None;
     }
@@ -808,6 +820,12 @@ enum Admit {
     Write {
         as_init: bool,
     },
+    /// A sequence-mode duplicate: not written again, but its place in the
+    /// timeline is (an index line pointing at the row at `offset`). The
+    /// browser placed it, and the next append continues after it.
+    Mark {
+        offset: u64,
+    },
 }
 
 impl TrackState {
@@ -817,7 +835,7 @@ impl TrackState {
             file,
             offset: 0,
             init_hash: None,
-            seen: HashSet::new(),
+            seen: HashMap::new(),
             saved: HashMap::new(),
             hash_part: HashMap::new(),
             parts: 1,
@@ -939,16 +957,20 @@ impl TrackState {
         } else {
             (t, tso_millis(h.tso), h.dur.unwrap_or(0))
         };
-        if self.seen.contains(&key) {
+        if let Some(&offset) = self.seen.get(&key) {
             self.dupes += 1;
             self.skip_tail = true;
-            return Admit::Skip;
+            return if h.seq_mode {
+                Admit::Mark { offset }
+            } else {
+                Admit::Skip
+            };
         }
         if !seen_room {
             self.skipped += 1;
             return Admit::Skip;
         }
-        self.seen.insert(key);
+        self.seen.insert(key, self.offset);
         Admit::Write { as_init: false }
     }
 }
@@ -1065,6 +1087,7 @@ impl Session {
             tso: h.tso.filter(|v| v.is_finite()),
             seq_mode: h.seq_mode,
             tso_set: h.tso_set && !as_init,
+            mark: false,
             mime: &h.mime,
             kind: &h.kind,
         };
@@ -1110,8 +1133,9 @@ impl Session {
         Ok(())
     }
 
-    /// The extension dropped an init of `sb` (its backlog was full) and
-    /// nothing of `sb` after it: recorded in `events.jsonl` for `mux`.
+    /// The extension lost an init of `sb` (its backlog was full, or the kept
+    /// init a new socket replays had to make room) and sends nothing of `sb`
+    /// until the next init: recorded in `events.jsonl` for `mux`.
     fn note_lost_init(&mut self, sb: u32) -> io::Result<()> {
         let mut line = serde_json::to_vec(&serde_json::json!({ "sb": sb, "event": "initlost" }))?;
         line.push(b'\n');
@@ -1253,13 +1277,52 @@ impl Session {
             self.seen_limit_logged = true;
         }
         let track = self.tracks.get_mut(&h.sb).expect("present");
-        let Admit::Write { as_init } = track.admit_media(h, payload, seen_room) else {
-            return Ok(());
-        };
-        if h.tfdt.is_some() {
-            self.seen_total += 1;
+        match track.admit_media(h, payload, seen_room) {
+            Admit::Skip => Ok(()),
+            Admit::Mark { offset } => self.write_mark(h.sb, h, offset, payload.len()),
+            Admit::Write { as_init } => {
+                if h.tfdt.is_some() {
+                    self.seen_total += 1;
+                }
+                self.write_row(h.sb, h, payload, as_init)
+            }
         }
-        self.write_row(h.sb, h, payload, as_init)
+    }
+
+    /// Writes the index line of a sequence-mode duplicate (`Admit::Mark`):
+    /// the bytes of the row at `offset`, appended again at this point.
+    fn write_mark(
+        &mut self,
+        sb: u32,
+        h: &SegmentHeader,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<()> {
+        let track = self.tracks.get_mut(&sb).expect("present");
+        let line = IndexLine {
+            sb,
+            ms: h.ms,
+            part: track.part,
+            seq: h.seq,
+            offset,
+            len,
+            is_init: false,
+            tfdt: h.tfdt,
+            timescale: h.timescale,
+            dur: h.dur,
+            tso: h.tso.filter(|v| v.is_finite()),
+            seq_mode: true,
+            tso_set: h.tso_set,
+            mark: true,
+            mime: &h.mime,
+            kind: &h.kind,
+        };
+        let mut line_buf = serde_json::to_vec(&line)?;
+        line_buf.push(b'\n');
+        if !self.within_budget(line_buf.len() as u64) {
+            return Ok(());
+        }
+        self.index.write_all(&line_buf)
     }
 
     fn summary(&self) {
@@ -1285,6 +1348,10 @@ impl Session {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "index format: independent flags of one row"
+)]
 struct IndexRow {
     sb: u32,
     #[serde(default)]
@@ -1303,6 +1370,9 @@ struct IndexRow {
     seq_mode: bool,
     #[serde(default)]
     tso_set: bool,
+    /// Only for the sequence-mode layout (`IndexLine::mark`).
+    #[serde(default)]
+    mark: bool,
     mime: String,
     #[serde(default)]
     kind: String,
@@ -1516,7 +1586,10 @@ type SeqMoves = HashMap<(u32, u64), i64>;
 /// far that lies after its `tfdt` (composition offset of the first sample
 /// minus the edit list's `media_time`). A row without `tfdt`, duration or
 /// timescale gets no move and ends the group (the next one is not checked
-/// against it). Returns the moves and the number of discontinuities.
+/// against it). A duplicate the sink did not store again (`mark`) is placed
+/// like any append, so the next one continues after it, but keeps the move
+/// of the row it repeats. Returns the moves and the number of
+/// discontinuities.
 fn seq_layout(rows: &[&IndexRow], leads: &SeqMoves) -> (SeqMoves, usize) {
     const NS: i128 = 1_000_000_000;
     let mut moves = HashMap::new();
@@ -1548,6 +1621,9 @@ fn seq_layout(rows: &[&IndexRow], leads: &SeqMoves) -> (SeqMoves, usize) {
             }
         };
         group_end = Some(start + i128::from(d) * NS / ts);
+        if r.mark {
+            continue;
+        }
         let num = (start - t_ns) * ts;
         let ticks = (num + num.signum() * NS / 2) / NS;
         let clamped = ticks.clamp(i128::from(i64::MIN), i128::from(i64::MAX));
@@ -1584,7 +1660,7 @@ fn first_cto(seg: &[u8]) -> i64 {
         return 0;
     };
     let trun = &seg[s..e];
-    let (Some(version), Some(flags)) = (be_uint(trun, 0, 1), be_uint(trun, 1, 3)) else {
+    let Some(flags) = be_uint(trun, 1, 3) else {
         return 0;
     };
     if flags & 0x800 == 0 {
@@ -1601,12 +1677,10 @@ fn first_cto(seg: &[u8]) -> i64 {
     let Some(raw) = be_uint(trun, at, 4) else {
         return 0;
     };
+    // Signed in both versions, as Chrome and ffmpeg read it (a version-0 box
+    // with a negative offset is out of spec but written by some muxers).
     let raw = u32::try_from(raw).expect("4 bytes");
-    if version == 1 {
-        i64::from(i32::from_be_bytes(raw.to_be_bytes()))
-    } else {
-        i64::from(raw)
-    }
+    i64::from(i32::from_be_bytes(raw.to_be_bytes()))
 }
 
 /// `media_time` of the first non-empty edit of the first track's edit list
@@ -1628,7 +1702,8 @@ fn elst_media_time(init: &[u8]) -> i64 {
     let elst = &init[s..e];
     let v1 = elst.first() == Some(&1);
     let count = be_uint(elst, 4, 4).unwrap_or(0);
-    let entry = if v1 { 16 } else { 8 };
+    // segment_duration, media_time, media_rate (16.16).
+    let entry = if v1 { 20 } else { 12 };
     for i in 0..count.min(16) {
         let at = 8 + usize::try_from(i).expect("small") * entry;
         let media_time = if v1 {
@@ -1690,21 +1765,30 @@ fn seq_leads(dir: &Path, sb: u32, rows: &[&IndexRow]) -> SeqMoves {
 /// a decode time before 0 (B-frames: at a set offset the browser puts the
 /// presentation time there; a negative `timestampOffset`), which an MP4
 /// cannot hold: then every `SourceBuffer` moves later by the same amount, so
-/// their alignment stays.
-fn seq_layouts(dir: &Path, rows: &[IndexRow], ids: &[u32]) -> (HashMap<u32, SeqMoves>, i64) {
+/// their alignment stays. Only the `chosen` (`SourceBuffer`, part) pairs, the
+/// ones muxed, count for the lift: a part left out (another rendition, a
+/// forged one) moves nothing.
+fn seq_layouts(
+    dir: &Path,
+    rows: &[IndexRow],
+    chosen: &[(u32, u32)],
+) -> (HashMap<u32, SeqMoves>, i64) {
     const NS: i128 = 1_000_000_000;
     let mut layouts = HashMap::new();
     let mut earliest: i128 = 0;
-    for id in ids {
-        let sb_rows: Vec<&IndexRow> = rows.iter().filter(|r| r.sb == *id).collect();
-        let leads = seq_leads(dir, *id, &sb_rows);
+    for &(id, part) in chosen {
+        let sb_rows: Vec<&IndexRow> = rows.iter().filter(|r| r.sb == id).collect();
+        let leads = seq_leads(dir, id, &sb_rows);
         let (moves, jumps) = seq_layout(&sb_rows, &leads);
         if jumps > 0 {
             eprintln!(
                 "mux: sb{id}: sequence mode: {jumps} discontinuity(ies) without a timestampOffset set; placed right after the previous append, as the browser does"
             );
         }
-        for r in sb_rows.iter().filter(|r| !r.is_init) {
+        for r in sb_rows
+            .iter()
+            .filter(|r| r.part == part && !r.is_init && !r.mark)
+        {
             let (Some(t), Some(ts)) = (r.tfdt, r.timescale.filter(|t| *t > 0)) else {
                 continue;
             };
@@ -1715,7 +1799,7 @@ fn seq_layouts(dir: &Path, rows: &[IndexRow], ids: &[u32]) -> (HashMap<u32, SeqM
             };
             earliest = earliest.min((i128::from(t) + i128::from(m)) * NS / i128::from(ts));
         }
-        layouts.insert(*id, moves);
+        layouts.insert(id, moves);
     }
     let lift = i64::try_from((-earliest).clamp(0, i128::from(i64::MAX))).expect("clamped");
     if lift > 0 {
@@ -1828,6 +1912,10 @@ struct MuxInput {
 /// - Without a `tfdt` on every media segment (`WebM` blocks, continuation
 ///   chunks), or in sequence mode without durations, the arrival order is
 ///   kept.
+///
+/// The last value says whether the file's bytes carry the lift (`lift_ns`):
+/// not for a part that cannot be shifted (`WebM`, several tracks without
+/// per-track timescales), whose probed start then lacks it.
 fn ordered_part(
     dir: &Path,
     sb: u32,
@@ -1835,7 +1923,7 @@ fn ordered_part(
     rows: &[&IndexRow],
     seq_moves: Option<&SeqMoves>,
     lift_ns: i64,
-) -> io::Result<(PathBuf, Option<f64>, usize)> {
+) -> io::Result<(PathBuf, Option<f64>, usize, bool)> {
     let raw = dir.join(format!("sb{sb}.p{part}.bin"));
     let init: Vec<&IndexRow> = rows.iter().copied().filter(|r| r.is_init).collect();
     let media: Vec<&IndexRow> = rows.iter().copied().filter(|r| !r.is_init).collect();
@@ -1929,14 +2017,13 @@ fn ordered_part(
         _ => None,
     };
 
-    let same_order = order.len() == media.len()
-        && order
-            .iter()
-            .zip(media.iter())
-            .all(|(a, b)| std::ptr::eq(*a, *b));
+    let same_order = same_rows(&order, &media);
     let shifted = can_shift && wants_shift;
+    // ffprobe reads the start from the first media segment: did it move?
+    let carries_lift =
+        |first_moved: bool| lift_ns == 0 || (ts.is_some() && can_shift && first_moved);
     if init_first && !shifted && same_order {
-        return Ok((raw, start, raw_tracks));
+        return Ok((raw, start, raw_tracks, carries_lift(true)));
     }
 
     // The tfdt shift of a row's traf: per track in a multi-track part, the
@@ -1954,8 +2041,14 @@ fn ordered_part(
         }
     };
     let rows_out: Vec<&IndexRow> = init.iter().chain(order.iter()).copied().collect();
-    let sorted = write_sorted(dir, (sb, part), &mut src, &rows_out, &shift_for, shifted)?;
-    Ok((sorted, start, raw_tracks))
+    let (sorted, first_moved) =
+        write_sorted(dir, (sb, part), &mut src, &rows_out, &shift_for, shifted)?;
+    Ok((sorted, start, raw_tracks, carries_lift(first_moved)))
+}
+
+/// The same rows (not equal ones) in the same order.
+fn same_rows(a: &[&IndexRow], b: &[&IndexRow]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| std::ptr::eq(*x, *y))
 }
 
 /// Says why a part keeps its arrival order.
@@ -1976,7 +2069,8 @@ fn warn_arrival_order(sb: u32, part: u32, media: &[&IndexRow]) {
 }
 
 /// Writes `sbN.pM.sorted.bin` from `rows` in that order, shifting each
-/// media segment's tfdt by `shift_for`.
+/// media segment's tfdt by `shift_for`. Also returns whether the first media
+/// segment got its shift (or needed none).
 fn write_sorted(
     dir: &Path,
     (sb, part): (u32, u32),
@@ -1984,15 +2078,20 @@ fn write_sorted(
     rows: &[&IndexRow],
     shift_for: &dyn Fn(&IndexRow, Option<u32>) -> i64,
     shifted: bool,
-) -> io::Result<PathBuf> {
+) -> io::Result<(PathBuf, bool)> {
     let sorted = dir.join(format!("sb{sb}.p{part}.sorted.bin"));
     let mut dst = io::BufWriter::new(File::create(&sorted)?);
     let mut buf = Vec::new();
     let mut unshifted = 0usize;
+    let mut first_moved = None;
     for r in rows {
         read_segment(src, r, &mut buf)?;
-        if shift_for(r, None) != 0 && !shift_tfdt_by(&mut buf, &|tid| shift_for(r, tid)) {
+        let moved = shift_for(r, None) == 0 || shift_tfdt_by(&mut buf, &|tid| shift_for(r, tid));
+        if !moved {
             unshifted += 1;
+        }
+        if !r.is_init && first_moved.is_none() {
+            first_moved = Some(moved);
         }
         dst.write_all(&buf)?;
     }
@@ -2011,7 +2110,7 @@ fn write_sorted(
         },
         sorted.display()
     );
-    Ok(sorted)
+    Ok((sorted, first_moved.unwrap_or(true)))
 }
 
 fn run_mux(args: &[String], tools: &Tools) -> Result<(), SinkError> {
@@ -2081,7 +2180,7 @@ fn report_lost_inits(dir: &Path) {
     lost.dedup();
     for sb in lost {
         eprintln!(
-            "mux: sb{sb}: the extension dropped an init (its queue was full); the media between it and the next init of sb{sb} is not captured"
+            "mux: sb{sb}: the extension lost an init (its queue was full, or the init could not be kept for a new connection); the media between it and the next init of sb{sb} is not captured"
         );
     }
 }
@@ -2163,33 +2262,23 @@ struct MuxPlan {
     warnings: Vec<String>,
 }
 
-/// The ffmpeg inputs: per `SourceBuffer` the chosen part in timeline order.
-fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, SinkError> {
+/// Per `SourceBuffer` the part to mux, as (`SourceBuffer`, part). Adaptive
+/// players often start at a low quality and switch after the first
+/// segment, which starts a new part: the decodable part (has an init
+/// segment) with the most bytes.
+fn pick_parts(stored: &[&IndexRow]) -> Vec<(u32, u32)> {
     let mut parts: HashMap<(u32, u32), (u64, bool, String)> = HashMap::new();
-    for row in rows {
+    for row in stored {
         let e = parts
             .entry((row.sb, row.part))
             .or_insert((0, false, row.mime.clone()));
         e.0 += row.len;
         e.1 |= row.is_init;
     }
-    if parts.is_empty() {
-        return Err(SinkError::Capture("index is empty".into()));
-    }
-    let mut prober = Prober {
-        tools,
-        missing: false,
-        warnings: Vec::new(),
-    };
-
-    // Adaptive players often start at a low quality and switch after the
-    // first segment, which starts a new part. Pick, per SourceBuffer, the
-    // decodable part (has an init segment) with the most bytes.
     let mut ids: Vec<u32> = parts.keys().map(|(sb, _)| *sb).collect();
     ids.sort_unstable();
     ids.dedup();
-    let (layouts, lift) = seq_layouts(dir, rows, &ids);
-    let mut inputs = Vec::new();
+    let mut chosen = Vec::new();
     for id in &ids {
         let mut candidates: Vec<_> = parts
             .iter()
@@ -2212,20 +2301,42 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
                 printable(mime, 120)
             );
         }
-        let sb_rows: Vec<&IndexRow> = rows.iter().filter(|r| r.sb == *id).collect();
+        chosen.push((*id, *part));
+    }
+    chosen
+}
+
+/// The ffmpeg inputs: per `SourceBuffer` the chosen part in timeline order.
+fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, SinkError> {
+    // Marks only hold a duplicate's place in the sequence-mode layout; they
+    // have no bytes of their own.
+    let stored: Vec<&IndexRow> = rows.iter().filter(|r| !r.mark).collect();
+    if stored.is_empty() {
+        return Err(SinkError::Capture("index is empty".into()));
+    }
+    let mut prober = Prober {
+        tools,
+        missing: false,
+        warnings: Vec::new(),
+    };
+    let chosen = pick_parts(&stored);
+    let (layouts, lift) = seq_layouts(dir, rows, &chosen);
+    let lift_secs = Duration::from_nanos(lift.unsigned_abs()).as_secs_f64();
+    let mut inputs = Vec::new();
+    for (id, part) in chosen {
         let no_moves = SeqMoves::new();
-        let seq_moves = layouts.get(id).unwrap_or(&no_moves);
-        let part_rows: Vec<&IndexRow> = sb_rows
+        let seq_moves = layouts.get(&id).unwrap_or(&no_moves);
+        let part_rows: Vec<&IndexRow> = stored
             .iter()
             .copied()
-            .filter(|r| r.part == *part)
+            .filter(|r| r.sb == id && r.part == part)
             .collect();
         let kind = part_rows
             .iter()
             .find(|r| r.is_init)
             .map_or("", |r| r.kind.as_str());
-        let (path, start, traks) = ordered_part(dir, *id, *part, &part_rows, Some(seq_moves), lift)
-            .map_err(|e| {
+        let (path, start, traks, lifted) =
+            ordered_part(dir, id, part, &part_rows, Some(seq_moves), lift).map_err(|e| {
                 SinkError::io(format!("sb{id}.p{part}: cannot reorder segments"), None, e)
             })?;
         // An MP4 init without a complete moov (cut short) cannot be decoded,
@@ -2256,7 +2367,9 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
                 eprintln!("mux: sb{id}.p{part} cannot be decoded; skipped");
                 continue;
             }
-            Some(Probe::Start(s)) => Some(s),
+            // A part whose bytes could not take the lift is aligned as if
+            // they had.
+            Some(Probe::Start(s)) => Some(if lifted { s } else { s + lift_secs }),
             Some(Probe::Unknown) | None => start,
         };
         inputs.push(MuxInput {
@@ -2603,6 +2716,7 @@ mod tests {
             tso,
             seq_mode: false,
             tso_set: false,
+            mark: false,
             mime: "video/mp4".into(),
             kind: "mp4".into(),
         }
@@ -2634,7 +2748,7 @@ mod tests {
         // As mux_inputs does: the sequence-mode layout over the SourceBuffer.
         let leads = seq_leads(dir, 1, &refs);
         let (moves, _) = seq_layout(&refs, &leads);
-        let (path, start, _) = ordered_part(dir, 1, 0, &refs, Some(&moves), 0).expect("ordered");
+        let (path, start, _, _) = ordered_part(dir, 1, 0, &refs, Some(&moves), 0).expect("ordered");
         (fs::read(&path).expect("read"), path, start)
     }
 
@@ -3077,12 +3191,27 @@ mod tests {
         h.seq_mode = true;
         write(&mut s, &h, b"A");
         h.tso = Some(7.0); // rewritten by the browser, not a new period
+        h.tso_set = true;
         write(&mut s, &h, b"A");
         assert_eq!(
-            index_lines(&s.dir),
-            2,
+            fs::read(s.dir.join("sb1.p0.bin")).expect("part"),
+            b"INITA",
             "a re-append after a seek back is a duplicate"
         );
+        let rows = index_rows(&s.dir);
+        assert_eq!(rows.len(), 3, "init, A, and the mark of the re-append");
+        assert_eq!(rows[2]["mark"], true, "it holds its place: {rows:?}");
+        assert_eq!(rows[2]["offset"], rows[1]["offset"], "pointing at A");
+        assert_eq!(rows[2]["tso_set"], true, "with its timestampOffset set");
+        assert!(rows[1].get("mark").is_none(), "stored rows carry no mark");
+    }
+
+    fn index_rows(dir: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(dir.join("index.jsonl"))
+            .expect("index")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect()
     }
 
     #[test]
@@ -3291,10 +3420,131 @@ mod tests {
         write(&mut s, &h, b"period-2"); // discontinuity: tfdt restarts
         write(&mut s, &h, b"period-1"); // seek back: same bytes
         assert_eq!(
-            index_lines(&s.dir),
-            3,
-            "init, both periods; the re-append dropped"
+            fs::read(s.dir.join("sb1.p0.bin")).expect("part"),
+            b"INITperiod-1period-2",
+            "init, both periods; the re-append not stored again"
         );
+        let rows = index_rows(&s.dir);
+        assert_eq!(rows.len(), 4, "plus the re-append's mark: {rows:?}");
+        assert_eq!(rows[3]["mark"], true);
+        assert_eq!(rows[3]["offset"], rows[1]["offset"]);
+    }
+
+    /// Segments mode places by tfdt and offset: a duplicate needs no mark.
+    #[test]
+    fn segments_mode_duplicate_writes_no_mark() {
+        let mut s = session("segdupe");
+        write(&mut s, &seg(1, true, None, None), b"INIT");
+        write(&mut s, &seg(1, false, Some(0), None), b"A");
+        write(&mut s, &seg(1, false, Some(0), None), b"A");
+        assert_eq!(index_lines(&s.dir), 2);
+    }
+
+    /// Sequence mode: a re-append the sink did not store again still holds
+    /// its place, so the next append continues after it (not after the end
+    /// of the stretch before the seek), and the row it repeats keeps its own
+    /// place.
+    #[test]
+    fn seq_layout_continues_after_a_marked_duplicate() {
+        let mut rows = Vec::new();
+        let mut add = |offset: u64, tfdt: u64, tso: f64, tso_set: bool, mark: bool| {
+            let mut r = row(offset, 1, false, Some(tfdt), Some(tso));
+            r.seq_mode = true;
+            r.dur = Some(1000);
+            r.tso_set = tso_set;
+            r.mark = mark;
+            rows.push(r);
+        };
+        add(0, 0, 0.0, true, false); // A at 0
+        add(1, 1000, 0.0, false, false); // B at 1
+        add(2, 2000, 0.0, false, false); // C at 2
+        add(3, 4000, 4.0, true, false); // seek forward: E at 4
+        add(4, 5000, 0.0, false, false); // F at 5
+        add(2, 2000, 10.0, true, true); // seek: C again, at 10
+        add(5, 3000, 8.0, false, false); // D right after it, at 11
+        let refs: Vec<&IndexRow> = rows.iter().collect();
+        let (moves, jumps) = seq_layout(&refs, &SeqMoves::new());
+        assert_eq!(jumps, 0, "D continues the re-append: {moves:?}");
+        assert_eq!(moves[&(0, 5)], 8000, "D where the browser played it");
+        assert_eq!(moves[&(0, 2)], 0, "C keeps its first place");
+    }
+
+    /// The lift counts only the parts that are muxed: a part left out (here
+    /// one with a negative offset) moves nothing.
+    #[test]
+    fn lift_counts_only_the_chosen_parts() {
+        let dir = temp_dir("liftchosen");
+        let mut low = row(0, 1, false, Some(0), Some(-5.0));
+        low.part = 0;
+        let mut high = row(0, 1, false, Some(0), None);
+        high.part = 1;
+        let rows = vec![low, high];
+        let (_, lift) = seq_layouts(&dir, &rows, &[(1, 1)]);
+        assert_eq!(lift, 0, "part 0 is not muxed");
+        let (_, lift) = seq_layouts(&dir, &rows, &[(1, 0)]);
+        assert_eq!(lift, 5_000_000_000, "part 0 muxed: lifted by 5 s");
+    }
+
+    /// A part whose bytes cannot take the lift (no tfdt to rewrite: `WebM`)
+    /// says so, so mux aligns its probed start as if they had.
+    #[test]
+    fn ordered_part_says_whether_the_bytes_carry_the_lift() {
+        let lifted = |name: &str, media: &[u8]| {
+            let dir = temp_dir(name);
+            let init = init_with_traks(1);
+            let rows = write_part(
+                &dir,
+                &[(&init, true, None, None), (media, false, Some(0), None)],
+            );
+            let refs: Vec<&IndexRow> = rows.iter().collect();
+            ordered_part(&dir, 1, 0, &refs, Some(&SeqMoves::new()), 1_000_000_000)
+                .expect("ordered")
+                .3
+        };
+        assert!(lifted("liftmp4", &moof(0)), "an MP4 segment is moved");
+        assert!(
+            !lifted("liftwebm", b"\x1f\x43\xb6\x75cluster"),
+            "nothing to move"
+        );
+    }
+
+    #[test]
+    fn first_cto_reads_version_0_offsets_signed() {
+        let mut trun = vec![0, 0, 0x08, 0x00]; // version 0, cto present
+        trun.extend_from_slice(&1u32.to_be_bytes());
+        trun.extend_from_slice(&(-1024i32).to_be_bytes());
+        let seg = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"trun", &trun)));
+        assert_eq!(first_cto(&seg), -1024);
+    }
+
+    #[test]
+    fn elst_media_time_skips_an_empty_first_edit() {
+        let mut elst = vec![0, 0, 0, 0];
+        elst.extend_from_slice(&2u32.to_be_bytes());
+        for (dur, media_time) in [(100u32, -1i32), (500, 1024)] {
+            elst.extend_from_slice(&dur.to_be_bytes());
+            elst.extend_from_slice(&media_time.to_be_bytes());
+            elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        }
+        let edts = mp4_box(*b"edts", &mp4_box(*b"elst", &elst));
+        let mut init = mp4_box(*b"ftyp", b"iso6");
+        init.extend(mp4_box(*b"moov", &mp4_box(*b"trak", &edts)));
+        assert_eq!(elst_media_time(&init), 1024);
+    }
+
+    /// A combined append cut right after the per-segment styp (or emsg) is
+    /// split there; an init+index range (ftyp moov sidx) stays init.
+    #[test]
+    fn init_prefix_len_splits_at_a_lone_styp() {
+        let init = init_with_traks(1);
+        for kind in [*b"styp", *b"emsg", *b"prft"] {
+            let mut p = init.clone();
+            p.extend(mp4_box(kind, b"msdh"));
+            assert_eq!(init_prefix_len("mp4", &p), Some(init.len()), "{kind:?}");
+        }
+        let mut p = init.clone();
+        p.extend(mp4_box(*b"sidx", b"index"));
+        assert_eq!(init_prefix_len("mp4", &p), None, "single-file index");
     }
 
     #[test]

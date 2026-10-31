@@ -72,8 +72,10 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   the init part and the media part. The init part ends at the first media box
   (`styp`, `sidx`, `emsg`, `prft`, `moof`, `mdat`; a `sidx` differs per
   segment and must not make every combined append a new init), but only with
-  a `moof`/`mdat` after it: an init+index range of a single-file stream
-  (`ftyp moov sidx`) stays one init. The init is
+  a box after it that only a media segment has (`styp`, `emsg`, `prft`,
+  `moof`, `mdat`; also when it is cut off, or the append ends right after
+  it): an init+index range of a single-file stream (`ftyp moov sidx`) stays
+  one init. The init is
   decided right there, so the media part never counts as its continuation
   (also without a `tfdt`).
 - An init is decided once it is complete: its chunks (an init split across
@@ -171,19 +173,27 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   previous append ended (a discontinuity, a new period restarting `tfdt`):
   then right there, as the browser does, and these are counted. A seek
   without a set offset therefore plays after what came before it, as in the
-  browser; a seek with one keeps its place and its gap is reported. Moved
-  segments get their `tfdt` rewritten. A segment without `tfdt`, duration or
+  browser; a seek with one keeps its place and its gap is reported. A
+  re-appended segment the sink did not store again (same bytes) still holds
+  its place: the sink writes an index line that points at the stored copy
+  (`mark`), so what follows it continues there; the copy itself plays once,
+  at its first place. Moved segments get their `tfdt` rewritten. Edit lists
+  with an empty first edit and signed composition offsets in version-0
+  `trun` boxes are read as the browser reads them. A segment without `tfdt`, duration or
   timescale ends the group (the next one is not checked against it); a part
   with such a segment keeps its arrival order, which is warned. When a frame
   would decode before 0 (B-frames at a set offset, a negative
   `timestampOffset`), every SourceBuffer is moved later by the same amount,
-  which is said, so they stay aligned. The first append keeps its own time (the browser may start
+  which is said, so they stay aligned. Only the parts that are muxed count
+  for that amount; a part whose bytes cannot be moved (WebM, several tracks
+  without per-track timescales) is aligned as if they had been. The first append keeps its own time (the browser may start
   it at 0; the alignment between SourceBuffers is relative anyway).
 - **Gaps:** ranges skipped by a forward seek are reported with their
   approximate length.
 - **Lost inits:** when the extension had to drop an init (its queue was
-  full), it takes nothing more of that SourceBuffer until the next init and
-  sends `initlost`; the sink notes it in `events.jsonl` and `mux` says that
+  full), or a new connection cannot replay one (its kept copy made room for
+  another tab's), it takes nothing more of that SourceBuffer until the next
+  init and sends `initlost`; the sink notes it in `events.jsonl` and `mux` says that
   the media of that SourceBuffer between the lost init and its next init is
   not captured.
 - A bad `index.jsonl` line (an interrupted sink) is skipped, not fatal.
@@ -205,7 +215,7 @@ Headers:
 | `type` | fields | payload |
 |---|---|---|
 | `hello` | `token`, `session`, `url`, `title` | none; must be the first message |
-| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append) | the segment bytes exactly as passed to `appendBuffer` |
+| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append that carried media; an init-only append does not use it up) | the segment bytes exactly as passed to `appendBuffer` |
 | `event` | `name` (`endofstream`, `changetype`, `initlost`), `sb` | none |
 ## Test without a browser
 

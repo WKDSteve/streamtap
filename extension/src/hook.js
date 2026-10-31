@@ -339,8 +339,10 @@
   // end right after ftyp or Info are still an open init.
   // Per-segment boxes (a sidx differs per segment): media, not init.
   const MEDIA_BOXES = ["styp", "sidx", "ssix", "emsg", "prft", "moof", "mdat"];
-  // They end the init only with a moof/mdat after them: an init+index range
-  // of a single-file stream (ftyp moov sidx) is all init.
+  // They end the init only with a box after them that only a media segment
+  // has (sidx/ssix also form the index range of a single-file stream: ftyp
+  // moov sidx is all init). Read by its type, even when it is cut off.
+  const SEGMENT_BOXES = ["styp", "emsg", "prft", "moof", "mdat"];
   const mp4InitEnd = (u8) => {
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     let off = 0;
@@ -357,7 +359,7 @@
       } else if (size === 0) {
         size = u8.byteLength - off;
       }
-      if (type === "moof" || type === "mdat") return { end: mediaStart ?? off, open: false };
+      if (SEGMENT_BOXES.includes(type)) return { end: mediaStart ?? off, open: false };
       if (MEDIA_BOXES.includes(type) && mediaStart === null) mediaStart = off;
       if (size < header) return { end: mediaStart ?? off, open: false };
       if (off + size > u8.byteLength) return { end: u8.byteLength, open: true };
@@ -615,10 +617,11 @@
     } catch (e) {
       tso = null;
     }
-    // The player set timestampOffset since the last media append: in
-    // sequence mode the browser starts this media at that offset. Init bytes
-    // in between do not use it up.
-    const media = !isInit && !initCont;
+    // The player set timestampOffset since the last append with media: in
+    // sequence mode the browser starts this media at that offset. An init
+    // appended on its own in between does not use it up; an init+media
+    // append (initLen) does, its media starts there.
+    const media = (!isInit || initLen !== null) && !initCont;
     const tsoSet = media && !!info.tsoSet;
     if (media) info.tsoSet = false;
 

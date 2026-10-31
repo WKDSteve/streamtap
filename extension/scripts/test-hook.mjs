@@ -310,6 +310,11 @@ const sb12 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
 const ini12 = init("avc1");
 sb12.appendBuffer(ab(Buffer.concat([ini12, box("styp", Buffer.from("msdh")), box("sidx", Buffer.alloc(4)), media(0)])));
 check(last().initLen === ini12.length, "initLen ends before styp/sidx");
+// The append ends right after the per-segment styp (a chunked fetch).
+const sb12b = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const ini12b = init("avc1");
+sb12b.appendBuffer(ab(Buffer.concat([ini12b, box("styp", Buffer.from("msdh"))])));
+check(last().initLen === ini12b.length, "a lone styp after the moov still ends the init");
 
 // The head of a new split init does not carry the previous init's timescale.
 sb8.appendBuffer(ab(clear8.subarray(0, 20)));
@@ -328,6 +333,11 @@ sb13.appendBuffer(ab(init("avc1")));
 check(last().isInit === true && last().tsoSet === false, "an init append does not use it up");
 sb13.appendBuffer(ab(media(0)));
 check(last().tsoSet === true, "the media after the init carries it");
+sb13.timestampOffset = 12;
+sb13.appendBuffer(ab(Buffer.concat([init("avc1"), media(0)])));
+check(last().initLen !== null && last().tsoSet === true, "an init+media append carries it: its media starts there");
+sb13.appendBuffer(ab(media(90000)));
+check(last().tsoSet === false, "an init+media append uses it up");
 
 // A short tail of media, then an init: both posted on their own, the init intact.
 const sb14 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');

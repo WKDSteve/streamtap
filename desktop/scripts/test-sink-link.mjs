@@ -13,6 +13,11 @@
 //               then must still reach the sink once a socket opens.
 //   switch      a quality switch arrives while reconnecting: the old init must
 //               precede the old media, the new init the new media.
+//   evicted     the kept init was dropped for the budget: the new socket says
+//               initlost, drops queued media up to the next queued init and
+//               takes everything after it.
+//   kept        (no sockets) a page or an ad frame filling the kept-init
+//               budget loses its own inits, not another tab's or frame's.
 // Usage:
 //   node scripts/test-sink-link.mjs <fragmented.mp4> --token <t> --captures <sink --out dir>
 //        [--port 17650] [--origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia]
@@ -220,6 +225,41 @@ const half = Math.ceil(segments.length / 2);
   }
 }
 
+// --- evicted init: resume at the next init ------------------------------------
+{
+  const p = fakePort(5, "evicted-a");
+  seg(p, init, true);
+  seg(p, segments[0], false);
+  await sleep(800);
+  // What a full kept-init budget leaves behind: no kept copy, the link marked.
+  vm.runInThisContext(`{ const l = [...sinkLinks.get(5).values()][0]; linkKeep(l, 1, null); l.evicted.add(1); }`);
+  closeSockets(5);
+  // onclose comes after the close handshake: wait until the retry is due.
+  const due = () => vm.runInThisContext(`[...sinkLinks.get(5).values()].every((l) => !l.ws && Date.now() >= l.nextRetryAt)`);
+  await sleep(300);
+  for (let i = 0; i < 50 && !due(); i++) await sleep(100);
+  // Queued while the new socket connects: media without its init, then a
+  // seek (init + media); one more segment once the socket is open.
+  seg(p, segments[1], false);
+  seg(p, init, true);
+  seg(p, segments[2], false);
+  await sleep(1000);
+  seg(p, segments[3], false);
+  await sleep(800);
+  p.onDisconnect();
+  await sleep(500);
+  const dirs = newDirs("evicted-");
+  check(dirs.length === 2, `evicted: two capture directories (got ${dirs.length})`);
+  if (dirs.length === 2) {
+    const shape = rows(dirs[1]).map((x) => (x.is_init ? "I" : "M")).join("");
+    check(shape === "IMM", `evicted: resumes at the queued init, nothing after it lost (got ${shape})`);
+    const events = existsSync(join(captures, dirs[1], "events.jsonl"))
+      ? readFileSync(join(captures, dirs[1], "events.jsonl"), "utf8")
+      : "";
+    check(events.includes('"initlost"'), "evicted: the sink is told (initlost)");
+  }
+}
+
 // --- link limit ---------------------------------------------------------------
 {
   const ports = [];
@@ -236,6 +276,38 @@ const half = Math.ceil(segments.length / 2);
   extra.onDisconnect();
   await sleep(500);
   newDirs("limit-");
+}
+
+// --- kept-init budget (no sockets) ---------------------------------------------
+{
+  const r = vm.runInThisContext(`(() => {
+    const mk = (tabId, frameId) => {
+      const l = { tabId, frameId, inits: new Map(), evicted: new Set(), gone: false };
+      if (!sinkLinks.has(tabId)) sinkLinks.set(tabId, new Map());
+      sinkLinks.get(tabId).set("kept-" + frameId, l);
+      return l;
+    };
+    const bytes = (n) => [new Blob([new Uint8Array(n)])];
+    const victim = mk(300, 0);
+    linkKeep(victim, 1, bytes(778));
+    // One page fills the budget and keeps going.
+    const page = mk(301, 0);
+    for (let i = 0; i < 80; i++) linkKeep(page, i, bytes(1024 * 1024));
+    const crossTab = victim.inits.has(1) && victim.evicted.size === 0;
+    // An ad frame in the player's tab does the same.
+    const player = mk(302, 0);
+    linkKeep(player, 1, bytes(1024 * 1024)); // as large as any forged one
+    const ad = mk(302, 9);
+    for (let i = 0; i < 80; i++) linkKeep(ad, i, bytes(1024 * 1024));
+    const sameTab = player.inits.has(1) && player.evicted.size === 0;
+    const total = sinkKeptTotal;
+    for (const l of [victim, page, player, ad]) for (const sb of [...l.inits.keys()]) linkKeep(l, sb, null);
+    for (const t of [300, 301, 302]) sinkLinks.delete(t);
+    return { crossTab, sameTab, total, after: sinkKeptTotal };
+  })()`);
+  check(r.crossTab, "kept inits: a page filling the budget loses its own inits, not another tab's");
+  check(r.sameTab, "kept inits: an ad frame filling the budget loses its own, not the player frame's");
+  check(r.total <= 64 * 1024 * 1024 && r.after === 0, `kept inits: budget held and released (${r.total}, ${r.after})`);
 }
 
 console.log(failures.length ? `FAILED: ${failures.length} check(s)` : "ok: all checks passed");

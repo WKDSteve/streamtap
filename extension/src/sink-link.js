@@ -68,43 +68,58 @@ let sinkKeptTotal = 0;
 
 const blobsSize = (chunks) => (chunks ? chunks.reduce((n, b) => n + b.size, 0) : 0);
 
-// What to drop when the kept-init budget is full: the largest init of the
-// tab that keeps the most bytes, other than `except`'s tab, as [link, sb].
-// Shares are per tab, so a page cannot push another tab's init out with
-// many small forged ones.
-const largestKept = (except) => {
-  let tab = null;
-  let tabSize = 0;
-  for (const [tabId, m] of sinkLinks) {
-    if (tabId === except.tabId) continue;
-    let n = 0;
-    for (const l of m.values()) for (const chunks of l.inits.values()) n += blobsSize(chunks);
-    if (n > tabSize) {
-      tab = m;
-      tabSize = n;
-    }
+// Groups of `links` by `keyOf`, the one keeping the most init bytes first;
+// the group of `keeperKey` counts `adding` bytes more (the init about to be
+// kept).
+const keptShares = (links, keyOf, keeperKey, adding) => {
+  const shares = new Map();
+  for (const l of links) {
+    const k = keyOf(l);
+    let n = shares.has(k) ? shares.get(k) : k === keeperKey ? adding : 0;
+    for (const chunks of l.inits.values()) n += blobsSize(chunks);
+    shares.set(k, n);
   }
-  if (!tab) return null;
-  let best = null;
-  let bestSize = 0;
-  for (const l of tab.values()) {
-    for (const [sb, chunks] of l.inits) {
-      const n = blobsSize(chunks);
-      if (n > bestSize) {
-        best = [l, sb];
-        bestSize = n;
+  return [...shares].sort((a, b) => b[1] - a[1]).map(([k]) => k);
+};
+
+// What to drop when the kept-init budget is full, as [link, sb]: the largest
+// init of the frame that keeps the most bytes within the tab that keeps the
+// most, the keeper's own tab and frame counted with the init it is about to
+// keep. A page that forges inits fills its own tab's share and so loses its
+// own; many small forged ones do not push another tab's init out, nor do
+// an ad frame's another frame's of the same tab. The init being kept
+// (`keeper`, `sb`) is never the one dropped.
+const largestKept = (keeper, sb, adding) => {
+  const all = [];
+  for (const m of sinkLinks.values()) all.push(...m.values());
+  for (const tab of keptShares(all, (l) => l.tabId, keeper.tabId, adding)) {
+    const inTab = all.filter((l) => l.tabId === tab);
+    const keeperFrame = tab === keeper.tabId ? keeper.frameId : undefined;
+    for (const frame of keptShares(inTab, (l) => l.frameId, keeperFrame, adding)) {
+      let best = null;
+      let bestSize = 0;
+      for (const l of inTab) {
+        if (l.frameId !== frame) continue;
+        for (const [s, chunks] of l.inits) {
+          if (l === keeper && s === sb) continue;
+          const n = blobsSize(chunks);
+          if (n > bestSize) {
+            best = [l, s];
+            bestSize = n;
+          }
+        }
       }
+      if (best) return best;
     }
   }
-  return best;
+  return null;
 };
 
 // Sets (or with null drops) the init bytes a link keeps for sb, within the
-// worker-wide budget. A link's current init is never refused for another
-// link's: the largest one kept elsewhere goes first (a page that forges big
-// inits loses its own). What still does not fit is not kept at all, so a
-// stale init is never replayed in its place. A link whose port is gone
-// keeps nothing.
+// worker-wide budget: what does not fit makes room by `largestKept`. What
+// still does not fit is not kept at all, so a stale init is never replayed
+// in its place, and the link's next socket says so (initlost). A link whose
+// port is gone keeps nothing.
 const linkKeep = (link, sb, chunks) => {
   const old = blobsSize(link.inits.get(sb));
   let size = blobsSize(chunks);
@@ -113,8 +128,9 @@ const linkKeep = (link, sb, chunks) => {
     size = 0;
   }
   while (chunks && sinkKeptTotal - old + size > SINK_MAX_KEPT_TOTAL) {
-    const victim = largestKept(link);
+    const victim = largestKept(link, sb, size - old);
     if (!victim) {
+      link.evicted.add(sb);
       chunks = null;
       size = 0;
       break;
@@ -209,10 +225,12 @@ const linkConnect = async (link) => {
   ws.onopen = () => {
     openedAt = Date.now();
     ws.send(sinkFrame({ type: "hello", token: settings.token, ...link.hello }));
-    // An init that had to make room for another tab's cannot be replayed:
-    // that SourceBuffer waits for its next init, and the sink is told.
+    // An init that had to make room cannot be replayed: that SourceBuffer
+    // resumes at its next init (in the queue or later), and the sink is told.
+    const resume = new Set();
     for (const sb of link.evicted) {
       if (link.inits.has(sb)) continue;
+      resume.add(sb);
       link.lostInit.add(sb);
       if (Number.isSafeInteger(sb) && sb >= 0) ws.send(sinkFrame({ type: "event", name: "initlost", sb }));
     }
@@ -231,7 +249,19 @@ const linkConnect = async (link) => {
     sinkPendingTotal -= link.pendingBytes;
     link.pending = [];
     link.pendingBytes = 0;
-    for (const item of queued) linkWrite(link, ws, item);
+    for (const item of queued) {
+      // Queued media of such a SourceBuffer has no init on this socket.
+      if (resume.has(item.sb)) {
+        if (!item.isInit) {
+          linkConsumed(link, item);
+          link.dropped++;
+          continue;
+        }
+        resume.delete(item.sb);
+        link.lostInit.delete(item.sb);
+      }
+      linkWrite(link, ws, item);
+    }
     // WebSocket.close() still sends what is buffered.
     if (link.closed) ws.close();
   };
@@ -317,6 +347,7 @@ chrome.runtime.onConnect.addListener((port) => {
   const portId = nextPortId++;
   const link = {
     tabId,
+    frameId: port.sender.frameId,
     top: port.sender.frameId === 0,
     hello: null,
     ws: null,
