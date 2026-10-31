@@ -47,6 +47,7 @@ jobs:
       # Installs the toolchain of rust-toolchain.toml when it is missing, then names it.
       - run: rustup show active-toolchain || rustup toolchain install
       - run: rustc --version && cargo --version && cargo audit --version && cargo deny --version
+      # The workspace includes the Tauri app: it builds on a plain Windows runner (WebView2 is only needed to run it).
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -64,7 +65,7 @@ jobs:
       - run: node --version
       # Syntax of every script of the extension and of the test drivers (TST-17).
       - name: node --check
-        run: git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' | xargs -0 -n1 node --check
+        run: git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' 'desktop/crates/streamtap-app/ui/*.js' | xargs -0 -n1 node --check
       # The MSE hook in Node with stand-ins; needs neither a browser nor a sink.
       - run: node extension/scripts/test-hook.mjs
       # The content script's replay for a new port, also without a browser.

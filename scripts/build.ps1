@@ -1,15 +1,16 @@
 <#
 .SYNOPSIS
-Builds desktop\target\release\streamtap-sink.exe (release, locked).
+Builds desktop\target\release\streamtap-sink.exe and streamtap-app.exe (release, locked).
 
 .DESCRIPTION
 Used by the nvim-config's :MyNative build and :MyPlugins machine. Two things a
 bare `cargo build` gets wrong for them:
-- A running sink (`streamtap-sink serve`) locks the exe; cargo then fails with
-  "Access is denied (os error 5)". The script names the process instead.
-- A no-op build leaves the exe's timestamp alone, so a build that is current
+- A running sink (`streamtap-sink serve`, also the one the app started) or a running
+  app locks its exe; cargo then fails with "Access is denied (os error 5)". The
+  script names the process instead.
+- A no-op build leaves the exes' timestamps alone, so a build that is current
   still looks older than the newest commit and stays "stale". After a
-  successful build the exe gets the current time.
+  successful build both exes get the current time.
 Nothing is installed (spike stage); the extension is loaded unpacked.
 
 .EXAMPLE
@@ -21,14 +22,18 @@ param()
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $root 'desktop\Cargo.toml'
-$exe = Join-Path $root 'desktop\target\release\streamtap-sink.exe'
+$exes = @('streamtap-sink', 'streamtap-app') | ForEach-Object {
+    [pscustomobject]@{ Name = $_; Path = (Join-Path $root "desktop\target\release\$_.exe") }
+}
 
-$running = Get-Process -Name 'streamtap-sink' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and ($_.Path -eq $exe) }
-if ($running) {
-    $ids = ($running | ForEach-Object { $_.Id }) -join ', '
-    Write-Error "streamtap-sink is running from this checkout (PID $ids); stop it before building"
-    exit 1
+foreach ($e in $exes) {
+    $running = Get-Process -Name $e.Name -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and ($_.Path -eq $e.Path) }
+    if ($running) {
+        $ids = ($running | ForEach-Object { $_.Id }) -join ', '
+        Write-Error "$($e.Name) is running from this checkout (PID $ids); stop it before building"
+        exit 1
+    }
 }
 
 # The target dir is named explicitly: a CARGO_TARGET_DIR or a build.target-dir
@@ -40,9 +45,11 @@ if ($LASTEXITCODE -ne 0) {
     Write-Error "cargo build failed (exit code $LASTEXITCODE)"
     exit 1
 }
-if (-not (Test-Path -LiteralPath $exe)) {
-    Write-Error "build finished but $exe is missing"
-    exit 1
+foreach ($e in $exes) {
+    if (-not (Test-Path -LiteralPath $e.Path)) {
+        Write-Error "build finished but $($e.Path) is missing"
+        exit 1
+    }
+    (Get-Item -LiteralPath $e.Path).LastWriteTime = Get-Date
+    Write-Output "built $($e.Path)"
 }
-(Get-Item -LiteralPath $exe).LastWriteTime = Get-Date
-Write-Output "built $exe"
