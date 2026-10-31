@@ -44,22 +44,32 @@ pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
     cmd
 }
 
-/// Where the sink executable is: next to this exe (installed), else the
-/// `release` and `debug` directories of the cargo target dir (development).
+/// Where the sink executable may be: next to the app exe (installed). Debug
+/// builds also look in the `release` and `debug` directories of the cargo
+/// target dir and in the source tree (development); a release build never
+/// runs a program from a sibling directory that is not its own.
+fn sink_candidates(exe_dir: &Path, dev: bool) -> Vec<PathBuf> {
+    let mut candidates = vec![exe_dir.join(SINK_EXE)];
+    if dev {
+        if let Some(target) = exe_dir.parent() {
+            candidates.push(target.join("release").join(SINK_EXE));
+            candidates.push(target.join("debug").join(SINK_EXE));
+        }
+        candidates.push(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/release")
+                .join(SINK_EXE),
+        );
+    }
+    candidates
+}
+
+/// Where the sink executable is (see `sink_candidates`).
 pub(crate) fn find_sink() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let mut candidates = vec![dir.join(SINK_EXE)];
-    if let Some(target) = dir.parent() {
-        candidates.push(target.join("release").join(SINK_EXE));
-        candidates.push(target.join("debug").join(SINK_EXE));
-    }
-    candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/release")
-            .join(SINK_EXE),
-    );
-    candidates.into_iter().find(|p| p.is_file())
+    sink_candidates(exe.parent()?, cfg!(debug_assertions))
+        .into_iter()
+        .find(|p| p.is_file())
 }
 
 /// `ffmpeg` on `PATH` (the sink looks there too).
@@ -128,16 +138,21 @@ pub(crate) fn push_log(log: &mut VecDeque<String>, line: String) {
 /// The capture directory name from a sink line that reports a DRM refusal:
 /// `<dir>: sbN carries encrypted media (DRM); ...` or
 /// `<dir>: sbN was refused as DRM before this reconnect; ...`.
-pub(crate) fn drm_capture_of(line: &str) -> Option<String> {
+///
+/// `<dir>` must be exactly `<root>/<capture id>`. Other sink lines carry page
+/// text (the session line prints the page URL), so a page could otherwise
+/// forge a refusal for any capture by putting `/<id>: sb1 carries ...` into
+/// its URL; such a line has a prefix that is no path under `root`.
+pub(crate) fn drm_capture_of(line: &str, root: &Path) -> Option<String> {
     let (dir, rest) = line.split_once(": sb")?;
     let reported =
         rest.contains("carries encrypted media (DRM)") || rest.contains("refused as DRM");
     if !reported {
         return None;
     }
-    // The sink prints the directory with the platform's separator.
-    let name = dir.rsplit(['/', '\\']).next()?;
-    crate::paths::validate_id(name).ok().map(str::to_owned)
+    let dir = Path::new(dir);
+    let name = crate::paths::validate_id(dir.file_name()?.to_str()?).ok()?;
+    (dir.parent()? == root).then(|| name.to_owned())
 }
 
 /// What a `streamtap-sink mux` exit code means (README, "Exit codes").
@@ -251,18 +266,66 @@ mod tests {
 
     #[test]
     fn drm_lines_name_their_capture() {
-        let a = r"E:\cap\1730000000_abcd1234: sb1 carries encrypted media (DRM); not capturing this track";
-        assert_eq!(drm_capture_of(a).as_deref(), Some("1730000000_abcd1234"));
-        let b = "/home/u/captures/1730000000_abcd1234-2: sb3 was refused as DRM before this reconnect; not capturing it";
-        assert_eq!(drm_capture_of(b).as_deref(), Some("1730000000_abcd1234-2"));
-        assert_eq!(drm_capture_of("1_x: sb1 init not written"), None);
-        assert_eq!(drm_capture_of("listening on ws://127.0.0.1:1"), None);
-        // Only the last path component counts, and it must be a plain id; the
-        let evil = r"..\..\x: sb1 carries encrypted media (DRM)";
-        assert_eq!(drm_capture_of(evil).as_deref(), Some("x"));
-        // caller resolves it against the captures directory anyway.
-        let evil2 = "C:: sb1 carries encrypted media (DRM)";
-        assert_eq!(drm_capture_of(evil2), None);
+        let root = Path::new("captures-root");
+        let line = |name: &str, what: &str| format!("{}: sb1 {what}", root.join(name).display());
+        let a = line(
+            "1730000000_abcd1234",
+            "carries encrypted media (DRM); not capturing this track",
+        );
+        assert_eq!(
+            drm_capture_of(&a, root).as_deref(),
+            Some("1730000000_abcd1234")
+        );
+        let b = line(
+            "1730000000_abcd1234-2",
+            "was refused as DRM before this reconnect; not capturing it",
+        );
+        assert_eq!(
+            drm_capture_of(&b, root).as_deref(),
+            Some("1730000000_abcd1234-2")
+        );
+        assert_eq!(drm_capture_of(&line("1_x", "init not written"), root), None);
+        assert_eq!(drm_capture_of("listening on ws://127.0.0.1:1", root), None);
+        // Another folder, a non-capture name, a path that only ends like one.
+        let other = format!(
+            "{}: sb1 carries encrypted media (DRM)",
+            Path::new("elsewhere").join("1_x").display()
+        );
+        assert_eq!(drm_capture_of(&other, root), None);
+        assert_eq!(
+            drm_capture_of(&line("src", "carries encrypted media (DRM)"), root),
+            None
+        );
+        assert_eq!(
+            drm_capture_of("C:: sb1 carries encrypted media (DRM)", root),
+            None
+        );
+    }
+
+    #[test]
+    fn a_page_cannot_forge_a_drm_refusal_through_its_url() {
+        // The sink prints `<peer>: session <dir> (<page url>)`; the URL is
+        // page text and may contain what a DRM line looks like.
+        let root = Path::new("captures-root");
+        let session = format!(
+            "127.0.0.1:5555: session {} (https://x/1730000000_victim: sb1 carries encrypted media (DRM))",
+            root.join("1730000001_attack").display()
+        );
+        assert_eq!(drm_capture_of(&session, root), None);
+        let slashed = format!(
+            "127.0.0.1:5555: session {} (/1730000000_victim: sb1 carries encrypted media (DRM))",
+            root.join("1730000001_attack").display()
+        );
+        assert_eq!(drm_capture_of(&slashed, root), None);
+    }
+
+    #[test]
+    fn a_release_build_only_trusts_the_directory_of_its_own_exe() {
+        let dir = Path::new("some").join("install");
+        assert_eq!(sink_candidates(&dir, false), vec![dir.join(SINK_EXE)]);
+        let dev = sink_candidates(&dir, true);
+        assert_eq!(dev[0], dir.join(SINK_EXE));
+        assert!(dev.len() > 1, "development builds look further");
     }
 
     #[test]

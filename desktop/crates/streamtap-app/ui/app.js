@@ -148,7 +148,7 @@ const muxBox = (job) => {
   return el("div", { class: "mux failed", role: "alert" }, el("strong", { text: `Mux failed${code}: ${job.meaning}` }), job.stderr_tail ? el("pre", { text: job.stderr_tail }) : null);
 };
 
-const card = (c, job) => {
+const card = (c, job, detailsOpen) => {
   const title = c.title || "(untitled page)";
   const badges = el("div", { class: "badges" });
   badges.append(badge(c.live ? "live" : "done", c.live ? "live" : "done"));
@@ -183,7 +183,7 @@ const card = (c, job) => {
       el("span", { text: `${c.source_buffers.length} SourceBuffer${c.source_buffers.length === 1 ? "" : "s"}` }),
       c.muxed ? el("span", { text: `Result ${fmtBytes(c.result_bytes)}` }) : null,
     ),
-    c.source_buffers.length ? el("details", {}, el("summary", { text: "SourceBuffers" }), sbTable) : null,
+    c.source_buffers.length ? el("details", { open: detailsOpen }, el("summary", { text: "SourceBuffers" }), sbTable) : null,
     muxBox(job),
     actions,
   );
@@ -191,7 +191,10 @@ const card = (c, job) => {
 
 const renderList = (snap) => {
   const list = $("list");
-  list.replaceChildren(...snap.captures.map((c) => card(c, snap.mux[c.id])));
+  // The list is rebuilt on every change (a live capture changes every poll): keep
+  // the SourceBuffer tables the user opened.
+  const open = new Set([...list.querySelectorAll("li.card details[open]")].map((d) => d.closest("li").dataset.id));
+  list.replaceChildren(...snap.captures.map((c) => card(c, snap.mux[c.id], open.has(c.id))));
   $("captures-count").textContent = snap.captures.length ? `(${snap.captures.length})` : "";
 };
 

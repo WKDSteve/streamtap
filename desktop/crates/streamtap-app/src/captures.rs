@@ -22,6 +22,10 @@ const MAX_CAPTURES: usize = 1000;
 /// New index bytes parsed per capture and scan; the rest follows next poll.
 const MAX_INDEX_CHUNK: u64 = 32 * 1024 * 1024;
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
+/// The sink accepts titles and URLs up to 64 KiB; the list shows far less
+/// (1000 such captures would make every 2 s snapshot huge).
+const MAX_TITLE_CHARS: usize = 300;
+const MAX_URL_CHARS: usize = 1000;
 /// File the app writes into a capture when the sink logged a DRM refusal.
 pub(crate) const DRM_FLAG: &str = "app-drm.flag";
 
@@ -71,15 +75,19 @@ pub(crate) struct IndexAcc {
 }
 
 impl IndexAcc {
-    /// Adds the complete lines of `text`; returns the bytes consumed (a
-    /// trailing line without a newline is left for the next call).
-    fn feed(&mut self, text: &str) -> usize {
-        let end = text.rfind('\n').map_or(0, |i| i + 1);
-        for line in text[..end].lines() {
+    /// Adds the complete lines of `data`; returns the bytes consumed (a
+    /// trailing line without a newline is left for the next call). Works on
+    /// the raw bytes so the count is the file's, whatever the lines hold.
+    fn feed(&mut self, data: &[u8]) -> usize {
+        let end = data.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        for raw in data[..end].split(|b| *b == b'\n') {
+            // Index lines are ASCII JSON; a lossy conversion only touches a
+            // forged byte, which the line parser then rejects.
+            let line = String::from_utf8_lossy(raw);
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Row>(line) {
+            match serde_json::from_str::<Row>(&line) {
                 Ok(row) => self.add(row),
                 Err(_) => self.bad_lines += 1,
             }
@@ -137,10 +145,14 @@ impl IndexAcc {
         let mut buf = Vec::new();
         f.take((len - self.pos).min(MAX_INDEX_CHUNK))
             .read_to_end(&mut buf)?;
-        // Index lines are ASCII JSON; a lossy conversion only touches a
-        // forged byte, which the line parser then rejects.
-        let text = String::from_utf8_lossy(&buf);
-        self.pos += self.feed(&text) as u64;
+        let mut used = self.feed(&buf) as u64;
+        if used == 0 && buf.len() as u64 >= MAX_INDEX_CHUNK {
+            // A "line" longer than a whole chunk is no index row: count it
+            // as one bad line and move on instead of re-reading it forever.
+            self.bad_lines += 1;
+            used = buf.len() as u64;
+        }
+        self.pos += used;
         Ok(())
     }
 
@@ -173,7 +185,7 @@ pub(crate) struct CaptureInfo {
 /// The host of a page URL (`https://user@Example.com:8080/x` gives `example.com`).
 pub(crate) fn host_of(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or("");
     let host = if host.starts_with('[') {
         host.split(']')
@@ -187,6 +199,25 @@ pub(crate) fn host_of(url: &str) -> String {
         .filter(char::is_ascii_graphic)
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+/// Page-controlled text made safe to show: control characters and the
+/// bidirectional or invisible formatting characters (which can reorder or
+/// hide text) are dropped, and the length is bounded.
+pub(crate) fn display_text(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    *c,
+                    '\u{200b}'..='\u{200f}'
+                        | '\u{2028}'..='\u{202e}'
+                        | '\u{2060}'..='\u{2069}'
+                        | '\u{feff}'
+                )
+        })
+        .take(max_chars)
+        .collect()
 }
 
 fn read_session(dir: &Path) -> SessionFile {
@@ -256,8 +287,8 @@ pub(crate) fn scan(
         out.push(CaptureInfo {
             host: host_of(&session.url),
             id: name,
-            title: session.title,
-            url: session.url,
+            title: display_text(&session.title, MAX_TITLE_CHARS),
+            url: display_text(&session.url, MAX_URL_CHARS),
             started: session.started,
             duration_ms: acc.duration_ms(),
             bytes: acc.bytes,
@@ -305,7 +336,7 @@ mod tests {
             "not json\n".into(),
         ]
         .concat();
-        assert_eq!(acc.feed(&text), text.len());
+        assert_eq!(acc.feed(text.as_bytes()), text.len());
         assert_eq!(acc.inits, 1);
         assert_eq!(acc.segments, 3);
         assert_eq!(acc.bytes, 100 + 5000 + 6000 + 700);
@@ -324,16 +355,16 @@ mod tests {
         let mut acc = IndexAcc::default();
         let full = row(1, 10, false, 1000, 1000);
         let (a, b) = full.split_at(full.len() - 5);
-        assert_eq!(acc.feed(a), 0);
+        assert_eq!(acc.feed(a.as_bytes()), 0);
         assert_eq!(acc.segments, 0);
-        assert_eq!(acc.feed(&format!("{a}{b}")), full.len());
+        assert_eq!(acc.feed(format!("{a}{b}").as_bytes()), full.len());
         assert_eq!(acc.segments, 1);
     }
 
     #[test]
     fn zero_timescale_does_not_divide_by_zero() {
         let mut acc = IndexAcc::default();
-        acc.feed(&row(1, 10, false, 1000, 0));
+        acc.feed(row(1, 10, false, 1000, 0).as_bytes());
         assert_eq!(acc.duration_ms(), 0);
         assert_eq!(acc.segments, 1);
     }
@@ -363,6 +394,67 @@ mod tests {
         let mut empty = IndexAcc::default();
         empty.update(&dir.join("nothing.jsonl")).unwrap();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_invalid_byte_does_not_shift_the_file_position() {
+        // A lossy conversion turns one bad byte into three (U+FFFD); the
+        // consumed count must still be the file's, or every later line is
+        // read from the wrong place.
+        let dir = tmp("badbyte");
+        let path = dir.join("index.jsonl");
+        let mut data = b"garbage \xff\xfe\xfd line\n".to_vec();
+        data.extend_from_slice(row(1, 10, false, 1000, 1000).as_bytes());
+        fs::write(&path, &data).unwrap();
+        let mut acc = IndexAcc::default();
+        acc.update(&path).unwrap();
+        assert_eq!(acc.bad_lines, 1);
+        assert_eq!(acc.segments, 1);
+        assert_eq!(acc.pos, data.len() as u64);
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(row(1, 10, false, 1000, 1000).as_bytes())
+            .unwrap();
+        drop(f);
+        acc.update(&path).unwrap();
+        assert_eq!(
+            acc.segments, 2,
+            "the appended row is read from the right offset"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn page_text_is_bounded_and_stripped() {
+        assert_eq!(display_text("a\u{202e}b\u{200b}c\nd\te", 100), "abcde");
+        assert_eq!(display_text(&"x".repeat(5000), 300).len(), 300);
+        assert_eq!(display_text("\u{e4}\u{6f22}", 100), "\u{e4}\u{6f22}");
+    }
+
+    #[test]
+    fn scan_bounds_a_huge_title_and_url() {
+        let root = tmp("hugetitle");
+        let d = root.join("1_x");
+        fs::create_dir(&d).unwrap();
+        let big = "t\u{202e}".repeat(7_000);
+        fs::write(
+            d.join("session.json"),
+            format!("{{\"url\":\"{big}\",\"title\":\"{big}\",\"started\":1}}"),
+        )
+        .unwrap();
+        let list = scan(&root, &mut HashMap::new(), false, SystemTime::now()).unwrap();
+        assert_eq!(list[0].title.chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(list[0].url.chars().count(), MAX_URL_CHARS);
+        assert!(!list[0].title.contains('\u{202e}'));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn host_of_reads_a_backslash_as_the_end_of_the_host() {
+        // Browsers treat `\` like `/` in special URLs: this host is evil.example.
+        assert_eq!(
+            host_of(r"https://evil.example\@good.example/x"),
+            "evil.example"
+        );
     }
 
     #[test]

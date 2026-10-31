@@ -345,8 +345,9 @@ cargo run -p streamtap-app            # development (needs the sink built: cargo
 target\release\streamtap-app.exe
 ```
 
-The app finds the sink next to its own exe, else in `target/release` or
-`target/debug` of the cargo target dir. Running it needs WebView2 (part of
+The app finds the sink next to its own exe. A debug build (`cargo run`) also
+looks in `target/release` and `target/debug` of the cargo target dir; a
+release build never runs a program from another directory. Running it needs WebView2 (part of
 Windows 11); building it needs nothing extra.
 
 What it does:
@@ -359,7 +360,9 @@ What it does:
   dir (`%APPDATA%\io.github.wkdsteve.streamtap`); the token is generated on
   first run. A config that does not parse is not overwritten: defaults run and
   the UI says so.
-- **Captures:** every directory in the captures folder, newest first, refreshed
+- **Captures:** every capture directory in the captures folder (named like the
+  sink names them, `<unix seconds>_<session>[-n]`; other folders are ignored),
+  newest first, refreshed
   every 2 s: title, page host, start time, duration, size, segments,
   SourceBuffers (kind, MIME, size), and badges: `live` (the sink runs and wrote
   into it within 10 s; the sink keeps no connection flag on disk, so a paused
@@ -382,9 +385,12 @@ Security:
   (`build.rs` + `capabilities/main.json`; no fs, shell or opener plugin). CSP is
   `default-src 'none'` with scripts, styles and images from the app only and
   IPC as the one connection; the UI sets every disk or page string with
-  `textContent`.
-- Commands take a capture **id** (the directory name), never a path. An id is
-  plain `[A-Za-z0-9_.-]` (no leading or trailing dot); it is joined to the
+  `textContent`; titles and URLs from the page are also cut to a bounded
+  length and stripped of control and bidirectional characters on the Rust side.
+- Commands take a capture **id** (the directory name), never a path. An id has
+  the sink's shape `<digits>_<[A-Za-z0-9_-]>`, so an ordinary subfolder
+  (`src`, `Documents`) of a captures folder that was pointed at the wrong place
+  is no capture and cannot be deleted; it is joined to the
   captures folder, must be a real directory (no symlink or junction) and its
   canonical form must lie directly inside the canonical captures folder.
   Delete additionally refuses a live capture or one that is being muxed.
