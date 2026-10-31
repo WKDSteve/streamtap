@@ -44,7 +44,9 @@ cargo test --workspace --locked
 cargo audit --deny warnings     # cargo install cargo-audit
 cargo deny check                # cargo install cargo-deny; policy in desktop/deny.toml
 cd ..
+git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' | xargs -0 -n1 node --check
 node extension/scripts/test-hook.mjs
+python -m unittest discover tools
 python tools/check-control-chars.py
 ```
 

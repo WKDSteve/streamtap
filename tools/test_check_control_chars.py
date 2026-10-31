@@ -1,8 +1,12 @@
 """Tests of tools/check-control-chars.py: `python -m unittest discover tools`."""
 
 import importlib.util
+import io
 import pathlib
+import sys
+import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location(
     "check_control_chars", pathlib.Path(__file__).with_name("check-control-chars.py")
@@ -50,6 +54,25 @@ class ControlCharacters(unittest.TestCase):
         self.assertEqual(check.name_problems("docs/read" + chr(8) + "me.md"), [8])
         self.assertEqual(check.name_problems("docs/a" + chr(0x202E) + "b.md"), [0x202E])
         self.assertEqual(check.name_problems("docs/Grüße/readme.md"), [])
+
+    def test_findings_in_paths_outside_the_output_code_page_are_printed(self):
+        # A pipe on Windows writes cp1252; CJK in a path must not end the run.
+        cjk = "\u65e5\u672c"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp, cjk + ".md")
+            path.write_bytes(b"a" + bytes([8]) + b"b\n")
+            named = str(pathlib.Path(tmp, cjk + chr(8) + ".md"))
+            out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+            files = [str(path), named]
+            with mock.patch.object(check, "tracked_files", return_value=files), \
+                    mock.patch.object(sys, "argv", ["check"]), \
+                    mock.patch.object(sys, "stdout", out), \
+                    mock.patch.object(sys, "stderr", io.StringIO()):
+                self.assertEqual(check.main(), 1)
+                out.flush()
+                printed = out.buffer.getvalue().decode("cp1252")
+        self.assertIn("\\u65e5\\u672c.md:1: U+0008", printed)
+        self.assertIn("the name holds U+0008", printed)
 
     def test_this_tool_and_its_test_hold_none(self):
         here = pathlib.Path(__file__).parent

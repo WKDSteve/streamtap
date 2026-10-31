@@ -2287,11 +2287,68 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    fn temp_dir(name: &str) -> PathBuf {
+    /// A fresh directory under the system temp directory, removed again when
+    /// the guard drops: the name carries the pid, so a leftover would pile up
+    /// with every run (CI on the author's machine included).
+    struct TestDir(PathBuf);
+
+    impl std::ops::Deref for TestDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TestDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(name: &str) -> TestDir {
         let d = std::env::temp_dir().join(format!("streamtap-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).expect("temp dir");
-        d
+        TestDir(d)
+    }
+
+    /// A session together with the directory it lives in; the session drops
+    /// first (field order), so its files are closed when the directory goes.
+    struct TestSession {
+        s: Session,
+        _dir: TestDir,
+    }
+
+    impl std::ops::Deref for TestSession {
+        type Target = Session;
+        fn deref(&self) -> &Session {
+            &self.s
+        }
+    }
+
+    impl std::ops::DerefMut for TestSession {
+        fn deref_mut(&mut self) -> &mut Session {
+            &mut self.s
+        }
+    }
+
+    #[test]
+    fn test_dirs_are_removed_when_dropped() {
+        let dir = temp_dir("dropped");
+        fs::write(dir.join("f"), b"x").expect("write");
+        let path = dir.to_path_buf();
+        drop(dir);
+        assert!(!path.exists(), "{} left behind", path.display());
+        let s = session("dropped-session");
+        let root = s.dir.parent().expect("parent").to_path_buf();
+        drop(s);
+        assert!(!root.exists(), "{} left behind", root.display());
     }
 
     fn mp4_box(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
@@ -2732,16 +2789,12 @@ mod tests {
         })
     }
 
-    fn session(name: &str) -> Session {
-        Session::open(
-            &temp_dir(name),
-            "test",
-            "u",
-            "t",
-            budget(16 * GIB, 64 * GIB),
-        )
-        .expect("session")
-        .expect("within budget")
+    fn session(name: &str) -> TestSession {
+        let dir = temp_dir(name);
+        let s = Session::open(&dir, "test", "u", "t", budget(16 * GIB, 64 * GIB))
+            .expect("session")
+            .expect("within budget");
+        TestSession { s, _dir: dir }
     }
 
     fn index_lines(dir: &Path) -> usize {
@@ -2919,9 +2972,11 @@ mod tests {
         // few rows.
         let shared = budget(16 * GIB, 20_000);
         let open = |name: &str| {
-            Session::open(&temp_dir(name), name, "u", "t", Arc::clone(&shared))
+            let dir = temp_dir(name);
+            let s = Session::open(&dir, name, "u", "t", Arc::clone(&shared))
                 .expect("session")
-                .expect("within budget")
+                .expect("within budget");
+            TestSession { s, _dir: dir }
         };
         let mut a = open("tot-a");
         let mut b = open("tot-b");

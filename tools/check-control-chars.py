@@ -104,6 +104,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--allow", nargs="*", default=[], help="extra paths to skip")
     args = parser.parse_args()
+    # A pipe on Windows gets the locale code page (cp1252): a path outside it must print as an
+    # escape, not end the run with a UnicodeEncodeError in place of the findings.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
     skip = set(ALLOWED) | set(args.allow)
     bad = 0
     for path in tracked_files():
