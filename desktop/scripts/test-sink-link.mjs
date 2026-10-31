@@ -20,7 +20,36 @@
 //               keep an init: initlost, media dropped up to the next init.
 //   kept        (no sockets) a page or an ad frame filling the kept-init
 //               budget loses its own inits, not another tab's or frame's.
+// Without a sink (always run first, in a vm context of their own with a fake
+// WebSocket that records what it is sent):
+//   mock-open       init bytes dropped under backpressure on an open socket:
+//                   initlost right away, that SourceBuffer's media dropped
+//                   until its next init.
+//   mock-salvage    the same for an init+media append with a small init
+//                   part: that part still goes out, the next media flows.
+//   mock-pending    while connecting with the queue full: a small init is
+//                   still queued (twice the limits), and of an init+media
+//                   append its small init part; the next media flows.
+//   mock-sbcap      forged records with ever new sb ids on a stalled socket:
+//                   initlost frames for at most 32 sb ids per link.
+//   mock-backlog    init bytes dropped because too much waits for decoding:
+//                   initlost past the limit on an open socket; while
+//                   reconnecting, queued media still goes out under its init.
+//   mock-gone       a socket that starts, or still connects, when the port's
+//                   cleanup runs replays the kept init first; then nothing is
+//                   kept.
+//   mock-queue      init bytes dropped while connecting with older items of
+//                   the same SourceBuffer queued: those still go out under
+//                   their init, then initlost; not replayed in front of them.
+//   mock-failed     the same when that socket never opens: the next socket
+//                   says initlost and replays no stale init.
+//   mock-lost       content.js dropped an init (`lost` with drop) while the
+//                   worker keeps the previous one: initlost, media dropped.
+//   mock-drain      the port closes while the socket connects and a payload
+//                   is still decoding: it is still sent, then the socket
+//                   closes.
 // Usage:
+//   node scripts/test-sink-link.mjs            (only the mock scenarios)
 //   node scripts/test-sink-link.mjs <fragmented.mp4> --token <t> --captures <sink --out dir>
 //        [--port 17650] [--origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia]
 // Exit 0 when every check passed.
@@ -40,8 +69,9 @@ const token = flag("--token");
 const port = Number(flag("--port", "17650"));
 const captures = flag("--captures");
 const origin = flag("--origin", "chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia");
-if (!file || !token || !captures) {
-  console.error("usage: test-sink-link.mjs <fragmented.mp4> --token <t> --captures <dir> [--port 17650] [--origin <o>]");
+const live = !!(file || token || captures);
+if (live && (!file || !token || !captures)) {
+  console.error("usage: test-sink-link.mjs [<fragmented.mp4> --token <t> --captures <dir> [--port 17650] [--origin <o>]]");
   process.exit(2);
 }
 
@@ -53,6 +83,434 @@ const check = (ok, what) => {
   console.log(`${ok ? "ok  " : "FAIL"} ${what}`);
   if (!ok) failures.push(what);
 };
+
+// --- mock scenarios: fake WebSocket, no sink ------------------------------------
+{
+  class FakeSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.bufferedAmount = 0;
+      this.sent = [];
+      sockets.push(this);
+    }
+    send(blob) {
+      if (this.readyState !== 1) throw new Error("send on a socket that is not open");
+      this.sent.push(blob);
+    }
+    open() {
+      this.readyState = 1;
+      this.onopen();
+    }
+    close() {
+      if (this.readyState >= 2) return;
+      this.readyState = 2;
+      setTimeout(() => {
+        this.readyState = 3;
+        this.onclose();
+      }, 0);
+    }
+  }
+  Object.assign(FakeSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+  const sockets = [];
+  const gates = new Map(); // data: URL -> promise its decode waits for
+  let connect = null;
+  const ctx = vm.createContext({
+    console,
+    Blob,
+    TextEncoder,
+    setTimeout,
+    WebSocket: FakeSocket,
+    fetch: async (u) => {
+      if (gates.has(u)) await gates.get(u);
+      return fetch(u);
+    },
+    chrome: {
+      runtime: { onConnect: { addListener: (f) => (connect = f) } },
+      storage: { local: { get: (d, cb) => setTimeout(() => cb({ ...d, sinkPort: 1, sinkToken: "t" }), 0) } },
+    },
+  });
+  vm.runInContext(linkSrc, ctx, { filename: "sink-link.js" });
+  const tick = () => sleep(30);
+  const mkPort = (tabId) => {
+    const p = {};
+    connect({
+      name: "vc-sink",
+      sender: { tab: { id: tabId }, frameId: 0, url: "https://example.test/watch" },
+      onMessage: { addListener: (f) => (p.post = f) },
+      onDisconnect: { addListener: (f) => (p.gone = f) },
+      disconnect: () => {},
+    });
+    p.post({ t: "hello", session: `mock-${tabId}`, title: "test-sink-link.mjs" });
+    return p;
+  };
+  // A payload is its label, "|", then padding up to `size` bytes.
+  const body = (label, size = 0) => {
+    const b = Buffer.alloc(Math.max(size, label.length + 1), 0x20);
+    b.write(`${label}|`, 0, "latin1");
+    return "data:application/octet-stream;base64," + b.toString("base64");
+  };
+  let mseq = 1;
+  const segMsg = (label, { init = false, initLen = null, size = 0, sb = 1 } = {}) => ({
+    t: "segment",
+    header: { sb, seq: mseq++, ms: 1, mime: "video/mp4", isInit: init, initLen, kind: "mp4", tso: 0 },
+    payload: body(label, size),
+  });
+  // What a socket was sent: H(ello), event names, segment labels.
+  const labels = async (ws) => {
+    const out = [];
+    for (const blob of ws.sent) {
+      const b = Buffer.from(await blob.arrayBuffer());
+      const n = b.readUInt32LE(0);
+      const h = JSON.parse(b.subarray(4, 4 + n).toString("utf8"));
+      if (h.type === "hello") out.push("H");
+      else if (h.type === "event") out.push(h.name);
+      else out.push(b.subarray(4 + n).toString("latin1").split("|")[0]);
+    }
+    return out.join(" ");
+  };
+  const linkOf = (tab) => vm.runInContext(`sinkLinks.has(${tab}) ? [...sinkLinks.get(${tab}).values()][0] : undefined`, ctx);
+  const fillPendingTotal = (on) => vm.runInContext(`sinkPendingTotal ${on ? "+" : "-"}= 1024 * 1024 * 1024`, ctx);
+
+  // mock-open: an init+media append over 1 MiB has the plain 64 MiB limit;
+  // its init part is too large to go out on its own.
+  {
+    const p = mkPort(1);
+    await tick();
+    const ws = sockets.at(-1);
+    ws.open();
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    ws.bufferedAmount = 64 * 1024 * 1024 - 1000;
+    p.post(segMsg("B", { init: true, initLen: 1536 * 1024, size: 2 * 1024 * 1024 }));
+    await tick();
+    check(!linkOf(1).inits.has(1), "mock-open: the init before the dropped one is no longer kept");
+    ws.bufferedAmount = 0;
+    p.post(segMsg("b1"));
+    p.post(segMsg("C", { init: true }));
+    p.post(segMsg("c1"));
+    await tick();
+    const got = await labels(ws);
+    check(got === "H A a1 initlost C c1", `mock-open: initlost at once, media dropped until the next init (got ${got})`);
+    p.gone();
+    await tick();
+  }
+
+  // mock-queue: the init and media of A are queued, B does not fit.
+  {
+    const p = mkPort(2);
+    await tick();
+    const ws = sockets.at(-1);
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    fillPendingTotal(true);
+    p.post(segMsg("B", { init: true }));
+    p.post(segMsg("b1"));
+    await tick();
+    fillPendingTotal(false);
+    ws.open();
+    // Media of the lost init arriving once the socket is open.
+    p.post(segMsg("b2"));
+    p.post(segMsg("C", { init: true }));
+    p.post(segMsg("c1"));
+    await tick();
+    const got = await labels(ws);
+    check(got === "H A a1 initlost C c1", `mock-queue: queued items under their init, then initlost (got ${got})`);
+    p.gone();
+    await tick();
+  }
+
+  // mock-failed: as mock-queue, but that socket never opens.
+  {
+    const p = mkPort(3);
+    await tick();
+    const first = sockets.at(-1);
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    fillPendingTotal(true);
+    p.post(segMsg("B", { init: true }));
+    await tick();
+    fillPendingTotal(false);
+    first.close();
+    await tick();
+    linkOf(3).nextRetryAt = 0;
+    p.post(segMsg("b1"));
+    p.post(segMsg("C", { init: true }));
+    p.post(segMsg("c1"));
+    await tick();
+    const ws = sockets.at(-1);
+    ws.open();
+    await tick();
+    const got = ws === first ? "(no second socket)" : await labels(ws);
+    check(got === "H initlost C c1", `mock-failed: the next socket says initlost, no stale init replayed (got ${got})`);
+    p.gone();
+    await tick();
+  }
+
+  // mock-lost: content.js dropped init bytes of a running stream.
+  {
+    const p = mkPort(4);
+    await tick();
+    const ws = sockets.at(-1);
+    ws.open();
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    p.post({ t: "lost", header: { sb: 1, drop: true } });
+    p.post(segMsg("a2"));
+    p.post(segMsg("C", { init: true }));
+    p.post(segMsg("c1"));
+    await tick();
+    const got = await labels(ws);
+    check(got === "H A a1 initlost C c1", `mock-lost: initlost, media dropped until the next init (got ${got})`);
+    p.gone();
+    await tick();
+  }
+
+  // mock-salvage: the same append with a small init part: that part still
+  // goes out, so the rendition's next media flows.
+  {
+    const p = mkPort(7);
+    await tick();
+    const ws = sockets.at(-1);
+    ws.open();
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    ws.bufferedAmount = 63 * 1024 * 1024;
+    p.post(segMsg("B", { init: true, initLen: 100, size: 2 * 1024 * 1024 }));
+    await tick();
+    const kept = linkOf(7).inits.get(1);
+    check(kept && kept.length === 1 && kept[0].size < 1024, "mock-salvage: the init part is kept for a new socket");
+    ws.bufferedAmount = 0;
+    p.post(segMsg("b2"));
+    p.post(segMsg("b3"));
+    await tick();
+    const got = await labels(ws);
+    check(got === "H A a1 B b2 b3", `mock-salvage: init part sent, the next media flows (got ${got})`);
+    p.gone();
+    await tick();
+  }
+
+  // mock-pending: A and a1 are queued on a connecting socket, then the queue
+  // of the worker is exactly full when B arrives.
+  const fillPendingFull = () => {
+    const d = vm.runInContext("SINK_MAX_PENDING_TOTAL - sinkPendingTotal", ctx);
+    vm.runInContext(`sinkPendingTotal += ${d}`, ctx);
+    return () => vm.runInContext(`sinkPendingTotal -= ${d}`, ctx);
+  };
+  {
+    // A small init goes up to twice the limit.
+    const p = mkPort(12);
+    await tick();
+    const ws = sockets.at(-1);
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    const undo = fillPendingFull();
+    p.post(segMsg("B", { init: true }));
+    await tick();
+    undo();
+    ws.open();
+    p.post(segMsg("b1"));
+    await tick();
+    const got = await labels(ws);
+    check(got === "H A a1 B b1", `mock-pending: a small init is queued past the limit (got ${got})`);
+    p.gone();
+    await tick();
+  }
+  {
+    // Of an init+media append over 1 MiB the small init part is queued.
+    const p = mkPort(13);
+    await tick();
+    const ws = sockets.at(-1);
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    const undo = fillPendingFull();
+    p.post(segMsg("B", { init: true, initLen: 100, size: 2 * 1024 * 1024 }));
+    await tick();
+    undo();
+    ws.open();
+    p.post(segMsg("b2"));
+    p.post(segMsg("b3"));
+    await tick();
+    const got = await labels(ws);
+    check(got === "H A a1 B b2 b3", `mock-pending: the init part is queued, the next media flows (got ${got})`);
+    const kept = linkOf(13).inits.get(1);
+    check(kept && kept.length === 1 && kept[0].size < 1024, "mock-pending: the init part is kept for a new socket");
+    p.gone();
+    await tick();
+  }
+
+  // mock-sbcap: a stalled socket, then inits and `lost` drops with new sb ids.
+  {
+    const p = mkPort(14);
+    await tick();
+    const ws = sockets.at(-1);
+    ws.open();
+    ws.bufferedAmount = 128 * 1024 * 1024;
+    for (let i = 0; i < 40; i++) p.post(segMsg("F", { init: true, sb: 100 + i }));
+    for (let i = 0; i < 40; i++) p.post({ t: "lost", header: { sb: 200 + i, drop: true } });
+    await tick();
+    const lost = (await labels(ws)).split(" ").filter((l) => l === "initlost").length;
+    const link = linkOf(14);
+    check(lost === 32 && link.lostInit.size === 32, `mock-sbcap: initlost for at most 32 sb ids (got ${lost}, ${link.lostInit.size} tracked)`);
+    ws.bufferedAmount = 0;
+    p.gone();
+    await tick();
+  }
+
+  // mock-backlog: init bytes dropped because too much waits for decoding.
+  const fillBacklog = (on) => vm.runInContext(`sinkBacklog ${on ? "+" : "-"}= 1024 * 1024 * 1024`, ctx);
+  {
+    // On an open socket at the backpressure limit: initlost still goes out.
+    const p = mkPort(8);
+    await tick();
+    const ws = sockets.at(-1);
+    ws.open();
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    ws.bufferedAmount = 64 * 1024 * 1024;
+    fillBacklog(true);
+    p.post(segMsg("B", { init: true }));
+    fillBacklog(false);
+    await tick();
+    ws.bufferedAmount = 0;
+    p.post(segMsg("b1"));
+    p.post(segMsg("C", { init: true }));
+    p.post(segMsg("c1"));
+    await tick();
+    const got = await labels(ws);
+    check(got === "H A a1 initlost C c1", `mock-backlog: initlost past the limit on an open socket (got ${got})`);
+    p.gone();
+    await tick();
+  }
+  {
+    // While reconnecting with a2 queued: a2 still goes out under the kept A.
+    const p = mkPort(9);
+    await tick();
+    const first = sockets.at(-1);
+    first.open();
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    first.close();
+    await tick();
+    linkOf(9).nextRetryAt = 0;
+    p.post(segMsg("a2"));
+    await tick();
+    fillBacklog(true);
+    p.post(segMsg("B", { init: true }));
+    fillBacklog(false);
+    p.post(segMsg("b1"));
+    p.post(segMsg("C", { init: true }));
+    p.post(segMsg("c1"));
+    await tick();
+    const ws = sockets.at(-1);
+    if (ws !== first) ws.open();
+    await tick();
+    const got = ws === first ? "(no second socket)" : await labels(ws);
+    check(got === "H A a2 initlost C c1", `mock-backlog: queued media under its kept init, then initlost (got ${got})`);
+    p.gone();
+    await tick();
+  }
+
+  // mock-gone: a socket that starts or still connects when the port's cleanup
+  // runs replays the kept init in front of what it sends.
+  {
+    // The sink closes the open socket while a2 still decodes after the port
+    // closed; a2 then starts a new socket.
+    const p = mkPort(10);
+    await tick();
+    const first = sockets.at(-1);
+    first.open();
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    let release;
+    const a2 = segMsg("a2");
+    gates.set(a2.payload, new Promise((r) => (release = r)));
+    p.post(a2);
+    p.gone();
+    first.close();
+    await tick();
+    linkOf(10).nextRetryAt = 0;
+    release();
+    await tick();
+    const ws = sockets.at(-1);
+    if (ws !== first) ws.open();
+    await tick();
+    const got = ws === first ? "(no second socket)" : await labels(ws);
+    check(got === "H A a2" && ws.readyState === 3, `mock-gone: a socket started after the port closed replays the init (got ${got}, state ${ws.readyState})`);
+    check(linkOf(10) === undefined && vm.runInContext("sinkKeptTotal", ctx) === 0, "mock-gone: then nothing is kept for that link");
+  }
+  {
+    // A reconnect still connecting when the port goes.
+    const p = mkPort(11);
+    await tick();
+    const first = sockets.at(-1);
+    first.open();
+    p.post(segMsg("A", { init: true }));
+    p.post(segMsg("a1"));
+    await tick();
+    first.close();
+    await tick();
+    linkOf(11).nextRetryAt = 0;
+    p.post(segMsg("a2"));
+    await tick();
+    p.gone();
+    await tick();
+    const ws = sockets.at(-1);
+    if (ws !== first) ws.open();
+    await tick();
+    const got = ws === first ? "(no second socket)" : await labels(ws);
+    check(got === "H A a2" && ws.readyState === 3, `mock-gone: a reconnect still connecting at the cleanup replays the init (got ${got}, state ${ws.readyState})`);
+    check(linkOf(11) === undefined && vm.runInContext("sinkKeptTotal", ctx) === 0, "mock-gone: then nothing is kept for that link");
+  }
+
+  // mock-drain: the port closes while the socket connects and a1 still decodes.
+  {
+    const p = mkPort(5);
+    await tick();
+    const ws = sockets.at(-1);
+    p.post(segMsg("A", { init: true }));
+    await tick();
+    let release;
+    const a1 = segMsg("a1");
+    gates.set(a1.payload, new Promise((r) => (release = r)));
+    p.post(a1);
+    p.gone();
+    await tick();
+    ws.open();
+    release();
+    await tick();
+    const got = await labels(ws);
+    check(got === "H A a1", `mock-drain: the decoding payload is still sent (got ${got})`);
+    check(linkOf(5) === undefined && ws.readyState >= 2, `mock-drain: then the cleanup closes the socket (state ${ws.readyState})`);
+  }
+  {
+    // A socket still connecting when the port's cleanup ran closes after its queue.
+    const p = mkPort(6);
+    await tick();
+    const ws = sockets.at(-1);
+    p.post(segMsg("A", { init: true }));
+    p.gone();
+    await tick();
+    ws.open();
+    await tick();
+    const got = await labels(ws);
+    check(got === "H A" && ws.readyState === 3, `mock-drain: a socket opened after the cleanup sends its queue and closes (got ${got}, state ${ws.readyState})`);
+  }
+}
+if (!live) {
+  console.log("live scenarios skipped (no sink given)");
+  console.log(failures.length ? `FAILED: ${failures.length} check(s)` : "ok: all checks passed");
+  process.exit(failures.length ? 1 : 0);
+}
 
 // --- chrome mock ---------------------------------------------------------
 let onConnect = null;

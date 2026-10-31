@@ -69,6 +69,8 @@ jobs:
       - run: node extension/scripts/test-hook.mjs
       # The content script's replay for a new port, also without a browser.
       - run: node extension/scripts/test-content.mjs
+      # The sink link's lost-init and drain paths with a fake WebSocket (no arguments: mock mode, no sink).
+      - run: node desktop/scripts/test-sink-link.mjs
 
   # A control or invisible character in a tracked text file (a backspace in a path, a bidirectional override in
   # source) is refused (NREL-14); the tool tests itself.

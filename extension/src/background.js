@@ -117,12 +117,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sbState(msState(t, frameUrl, e.msId), e.sbId, cut(e.mime, 256));
       break;
     case "changetype": {
-      for (const m of t.ms.values()) {
-        const s = m.sb.get(e.sbId);
-        if (s) {
-          if (s.mimes.length < MAX_MIMES) s.mimes.push(s.mime);
-          s.mime = cut(e.mime, 256);
-        }
+      // SourceBuffer ids count per frame: only the sending frame's MediaSource
+      // (msId null for one created before the hook, as its appends).
+      const m = t.ms.get(msKey(frameUrl, e.msId));
+      const s = m && m.sb.get(e.sbId);
+      if (s) {
+        if (s.mimes.length < MAX_MIMES) s.mimes.push(s.mime);
+        s.mime = cut(e.mime, 256);
       }
       break;
     }
@@ -131,8 +132,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       s.appends++;
       s.bytes += Number(e.bytes) || 0;
       s.kind = cut(e.kind, 16);
+      // The rest of a split init belongs to that init: no media segment.
       if (e.isInit) s.inits++;
-      else s.media++;
+      else if (!e.initCont) s.media++;
       if (Number.isFinite(e.startSec)) {
         if (s.firstSec === null || e.startSec < s.firstSec) s.firstSec = e.startSec;
         if (s.lastSec === null || e.startSec > s.lastSec) {

@@ -22,6 +22,7 @@ const SINK_MAX_KEPT_TOTAL = 64 * 1024 * 1024; // kept init bytes of all links (p
 const SINK_MAX_LINKS = 16; // tapping ports of the whole worker
 const SINK_MAX_BACKLOG = 128 * 1024 * 1024; // data: URL chars received, not yet decoded
 const SINK_STABLE_MS = 5000; // a socket open this long resets the backoff
+const SINK_MAX_SB = 32; // distinct SourceBuffer ids per link (background.js MAX_SB_PER_MS)
 const sinkEnc = new TextEncoder();
 
 // The header fields the sink understands; everything else is dropped.
@@ -167,7 +168,14 @@ const sinkSettings = () =>
 // also drops the old one, so the old quality's init is never replayed in
 // front of the new quality's media.
 // An init+media append keeps only its init part (item.keep).
+// A lost-init marker (linkInitLost) drops the kept init at its place in the
+// stream; the link's next socket says initlost.
 const linkConsumed = (link, item) => {
+  if (item.lostMark) {
+    linkKeep(link, item.sb, null);
+    link.evicted.add(item.sb);
+    return;
+  }
   const keep = item.keep || item.blob;
   if (item.initCont) {
     const chunks = link.inits.get(item.sb);
@@ -197,11 +205,59 @@ const linkWrite = (link, ws, item) => {
   linkConsumed(link, item);
 };
 
+const initLostFrame = (sb) =>
+  Number.isSafeInteger(sb) && sb >= 0 ? sinkFrame({ type: "event", name: "initlost", sb }) : null;
+
+// Init bytes of sb were dropped (here or in content.js) while the stream
+// goes on: media after them would be filed under the previous init. In
+// stream order, that SourceBuffer takes nothing until its next init, its
+// kept init is not replayed, and the sink is told (initlost; mux names the
+// SourceBuffer). Returns false when nothing of sb is in flight, so the
+// caller decides what is in effect for the next socket.
+const linkInitLost = (link, sb) => {
+  const ws = link.ws;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    // A few bytes: past the backpressure limit, so the sink always learns it.
+    const frame = link.lostInit.has(sb) ? null : initLostFrame(sb);
+    if (frame) linkWrite(link, ws, { blob: frame, sb: null, isInit: false, initCont: false, keep: null });
+    link.lostInit.add(sb);
+    linkKeep(link, sb, null);
+    return true;
+  }
+  // Items of sb queued on a connecting socket still belong to the previous
+  // init (kept or queued): a marker behind them drops it once they are out.
+  let last = null;
+  for (let i = link.pending.length - 1; i >= 0 && !last; i--) if (link.pending[i].sb === sb) last = link.pending[i];
+  if (!last) return false;
+  link.lostInit.add(sb);
+  // Outside the byte limits; one per run of sb's items, so it stays bounded.
+  if (!last.lostMark) link.pending.push({ lostMark: true, blob: initLostFrame(sb), sb, isInit: false, initCont: false, keep: null });
+  return true;
+};
+
+// A socket of the link is being set up: its onopen replays the kept inits
+// in front of what is queued.
+const linkInFlight = (link) =>
+  link.connecting || link.pending.length > 0 || !!(link.ws && link.ws.readyState === WebSocket.CONNECTING);
+
+// The port is gone and its cleanup ran (`gone`): once no socket is being set
+// up any more, it keeps nothing and leaves the registry. Until then its kept
+// inits stay, so a socket that opens after the cleanup still sends media
+// under its init.
+const linkRelease = (link) => {
+  if (!link.gone || linkInFlight(link)) return;
+  for (const sb of [...link.inits.keys()]) linkKeep(link, sb, null);
+  const m = sinkLinks.get(link.tabId);
+  if (m) {
+    m.delete(link.portId);
+    if (!m.size) sinkLinks.delete(link.tabId);
+  }
+};
+
 const linkConnect = async (link) => {
-  // A closed port still gets its queue delivered; it just opens no new socket
-  // once that is done.
+  // A gone link is never admitted again (overflow), so it opens no new
+  // socket; its late items reach linkSend before its cleanup runs.
   if (link.overflow || link.ws || link.connecting || Date.now() < link.nextRetryAt || !link.hello) return;
-  if (link.closed && !link.pending.length) return;
   // Segments arriving while the settings are read are queued, not dropped.
   link.connecting = true;
   const settings = await sinkSettings();
@@ -219,6 +275,7 @@ const linkConnect = async (link) => {
     linkDropPending(link);
     link.nextRetryAt = Date.now() + link.retryDelay;
     link.retryDelay = Math.min(link.retryDelay * 2, 10000);
+    linkRelease(link);
     return;
   }
   ws.binaryType = "arraybuffer";
@@ -252,6 +309,19 @@ const linkConnect = async (link) => {
     link.pending = [];
     link.pendingBytes = 0;
     for (const item of queued) {
+      if (item.lostMark) {
+        // Init bytes dropped while this was queued: what came before belongs
+        // to the previous init, what follows waits for the next one.
+        if (item.blob && !resume.has(item.sb)) {
+          ws.send(item.blob);
+          link.sent++;
+          link.sentBytes += item.blob.size;
+        }
+        linkKeep(link, item.sb, null);
+        resume.add(item.sb);
+        link.lostInit.add(item.sb);
+        continue;
+      }
       // Queued media of such a SourceBuffer has no init on this socket.
       if (resume.has(item.sb)) {
         if (!item.isInit) {
@@ -264,12 +334,18 @@ const linkConnect = async (link) => {
       }
       linkWrite(link, ws, item);
     }
-    // WebSocket.close() still sends what is buffered.
-    if (link.closed) ws.close();
+    // WebSocket.close() still sends what is buffered. A closed port whose
+    // messages are still being decoded keeps the socket until they are out
+    // (its cleanup closes it).
+    if (link.gone) {
+      ws.close();
+      linkRelease(link);
+    }
   };
   ws.onclose = () => {
     if (link.ws === ws) link.ws = null;
     linkDropPending(link);
+    linkRelease(link);
     // A sink that closes right after the hello (wrong token, refused) must
     // not be hammered: only a socket that stayed open resets the backoff.
     if (openedAt && Date.now() - openedAt >= SINK_STABLE_MS) link.retryDelay = 1000;
@@ -294,8 +370,16 @@ const linkSend = (link, item) => {
     const initBytes = (item.isInit || item.initCont) && item.blob.size <= SINK_MAX_INIT_BYTES;
     const limit = initBytes ? 2 * SINK_MAX_BUFFERED_BYTES : SINK_MAX_BUFFERED_BYTES;
     if (ws.bufferedAmount + item.blob.size > limit) {
-      linkConsumed(link, item);
       link.dropped++;
+      // Of an init+media append the small init part still goes out (as
+      // content.js does): the rendition's next media is not lost with it.
+      const part = item.keep;
+      if (part && part.size <= SINK_MAX_INIT_BYTES && ws.bufferedAmount + part.size <= 2 * SINK_MAX_BUFFERED_BYTES) {
+        linkWrite(link, ws, { blob: part, sb: item.sb, isInit: true, initCont: false, keep: null });
+        return;
+      }
+      // Dropped init bytes are not the init in effect: initlost now.
+      if (item.isInit || item.initCont) linkInitLost(link, item.sb);
       return;
     }
     linkWrite(link, ws, item);
@@ -306,20 +390,31 @@ const linkSend = (link, item) => {
   // synchronously).
   if (!ws) linkConnect(link);
   const connecting = (link.ws && link.ws.readyState === WebSocket.CONNECTING) || (!link.ws && link.connecting);
-  const size = item.blob.size;
-  if (
-    connecting &&
-    link.pendingBytes + size <= SINK_MAX_PENDING_BYTES &&
-    sinkPendingTotal + size <= SINK_MAX_PENDING_TOTAL
-  ) {
-    link.pending.push(item);
+  // Small init bytes may be queued up to twice the limits, as above.
+  const queue = (q) => {
+    const size = q.blob.size;
+    const n = (q.isInit || q.initCont) && size <= SINK_MAX_INIT_BYTES ? 2 : 1;
+    if (link.pendingBytes + size > n * SINK_MAX_PENDING_BYTES || sinkPendingTotal + size > n * SINK_MAX_PENDING_TOTAL) return false;
+    link.pending.push(q);
     link.pendingBytes += size;
     sinkPendingTotal += size;
-    return;
-  }
+    return true;
+  };
+  if (connecting && queue(item)) return;
   // Not connected: never buffer unboundedly. Count and drop.
-  linkConsumed(link, item);
   link.dropped++;
+  // Of an init+media append the small init part is still queued (as on an
+  // open socket): the rendition's next media is not lost with it.
+  const part = item.keep;
+  if (connecting && part && part.size <= SINK_MAX_INIT_BYTES) {
+    if (queue({ blob: part, sb: item.sb, isInit: true, initCont: false, keep: null })) return;
+  }
+  // Dropped init bytes behind queued items of the same SourceBuffer must not
+  // be replayed in front of them (linkInitLost). With nothing of it queued
+  // (no socket, retry window) the dropped init is the one in effect for the
+  // next socket and is kept.
+  if ((item.isInit || item.initCont) && linkInitLost(link, item.sb)) return;
+  linkConsumed(link, item);
 };
 
 const decodePayload = async (dataUrl) => {
@@ -349,18 +444,19 @@ chrome.runtime.onConnect.addListener((port) => {
   const portId = nextPortId++;
   const link = {
     tabId,
+    portId,
     frameId: port.sender.frameId,
     top: port.sender.frameId === 0,
     hello: null,
     ws: null,
     connecting: false,
-    closed: false,
     overflow: true, // until linkAdmit gives it a slot
     inits: new Map(), // sb -> [framed init, continuation...] in effect, replayed on every new socket
     lostInit: new Set(), // sb whose init was dropped: nothing until the next init
-    gone: false, // the port's cleanup ran: nothing is kept any more
+    gone: false, // the port's cleanup ran: nothing new is kept (linkRelease)
     evicted: new Set(), // sb whose kept init made room for another tab's
-    pending: [], // { blob, sb, isInit, initCont } while connecting
+    sbs: new Set(), // sb ids seen, at most SINK_MAX_SB
+    pending: [], // { blob, sb, isInit, initCont, keep, lostMark? } while connecting
     pendingBytes: 0,
     sent: 0,
     sentBytes: 0,
@@ -378,6 +474,18 @@ chrome.runtime.onConnect.addListener((port) => {
   let chain = Promise.resolve();
   port.onMessage.addListener((msg) => {
     if (!msg || typeof msg !== "object") return;
+    // Each sb has its own kept init and initlost frames: a page forging
+    // records with new ids gets no more than SINK_MAX_SB of them per link.
+    if ((msg.t === "segment" || msg.t === "lost") && msg.header && typeof msg.header === "object") {
+      const sb = msg.header.sb;
+      if (!link.sbs.has(sb)) {
+        if (link.sbs.size >= SINK_MAX_SB) {
+          link.dropped++;
+          return;
+        }
+        link.sbs.add(sb);
+      }
+    }
     let held = 0;
     if (msg.t === "segment") {
       held = typeof msg.payload === "string" ? msg.payload.length : 0;
@@ -394,12 +502,13 @@ chrome.runtime.onConnect.addListener((port) => {
         if (initBytes) {
           const sb = h.sb;
           chain = chain.then(() => {
-            if (!link.lostInit.has(sb) && Number.isSafeInteger(sb) && sb >= 0 && linkAdmit(link)) {
-              // The sink notes it, and mux says the capture of sb ends here.
-              linkSend(link, { blob: sinkFrame({ type: "event", name: "initlost", sb }), sb: null, isInit: false, initCont: false });
-            }
-            link.lostInit.add(sb);
+            // As for any other dropped init bytes (linkInitLost): initlost at
+            // once on an open socket, behind what is queued of sb while
+            // connecting, else on the next socket.
+            if (Number.isSafeInteger(sb) && sb >= 0 && linkAdmit(link) && linkInitLost(link, sb)) return;
             linkKeep(link, sb, null);
+            if (Number.isSafeInteger(sb) && sb >= 0) link.evicted.add(sb);
+            link.lostInit.add(sb);
           });
         }
         return;
@@ -454,10 +563,20 @@ chrome.runtime.onConnect.addListener((port) => {
           return;
         }
         if (msg.t === "lost" && msg.header && typeof msg.header === "object") {
+          const sb = msg.header.sb;
+          if (!Number.isSafeInteger(sb) || sb < 0) return;
+          if (msg.header.drop === true) {
+            // content.js dropped init bytes of the running stream: the init
+            // kept here is stale from this point on.
+            if (!linkAdmit(link) || !linkInitLost(link, sb)) {
+              linkKeep(link, sb, null);
+              link.evicted.add(sb);
+            }
+            return;
+          }
           // content.js could not keep this SourceBuffer's init for a new
           // port (a restarted worker): handled like an evicted one.
-          const sb = msg.header.sb;
-          if (!Number.isSafeInteger(sb) || sb < 0 || link.inits.has(sb)) return;
+          if (link.inits.has(sb)) return;
           if (link.ws && link.ws.readyState === WebSocket.OPEN) {
             if (!link.lostInit.has(sb) && linkAdmit(link)) {
               linkSend(link, { blob: sinkFrame({ type: "event", name: "initlost", sb }), sb: null, isInit: false, initCont: false });
@@ -486,22 +605,19 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 
   port.onDisconnect.addListener(() => {
-    link.closed = true;
-    // Let the queued messages drain before the socket closes. A socket still
-    // connecting closes itself after flushing its queue (onopen).
+    // Let the queued messages drain before the socket closes: this closes an
+    // open one; a socket still connecting then closes itself after flushing
+    // its queue (onopen, once `gone`).
     chain.then(() => {
       if (link.ws && link.ws.readyState === WebSocket.OPEN) link.ws.close();
       if (!link.overflow) sinkLinkCount--;
       link.overflow = true; // never admitted again
-      for (const sb of [...link.inits.keys()]) linkKeep(link, sb, null);
       // Items still queued on a connecting socket are consumed later; they
-      // must not be kept for a link that is gone.
+      // must not be kept for a link that is gone. The inits kept so far are
+      // dropped once no socket is being set up any more (that socket replays
+      // them first), else now.
       link.gone = true;
-      const m = sinkLinks.get(tabId);
-      if (m) {
-        m.delete(portId);
-        if (!m.size) sinkLinks.delete(tabId);
-      }
+      linkRelease(link);
     });
   });
 });

@@ -49,6 +49,8 @@
           bytes: isU64(d.bytes) ? d.bytes : 0,
           kind: str(d.kind, 16),
           isInit: d.isInit === true,
+          // The rest of a split init: neither an init nor media in the counts.
+          initCont: d.initCont === true && d.isInit !== true,
           boxes: Array.isArray(d.boxes) ? d.boxes.slice(0, 16).map((b) => str(b, 8)) : [],
           startSec: optNum(d.startSec),
           durationSec: optNum(d.durationSec),
@@ -158,6 +160,9 @@
         // sb whose init in effect could not be kept (too large, or more
         // than MAX_KEPT_INITS): a new port is told, so it waits for the next
         unkept: new Set(),
+        // sb whose init was dropped at this point of the chain: its media is
+        // not handed on until its next init
+        lost: new Set(),
         chain: Promise.resolve(),
         closed: false,
       };
@@ -256,26 +261,68 @@
     }
   };
 
+  // Init bytes of sb did not reach the port (in chain order): media after
+  // them would be filed under the previous init. The kept init is stale, a
+  // new port is told (`unkept`), the service worker is told now (`lost` with
+  // drop: it says initlost and drops its kept init), and this SourceBuffer's
+  // media waits for its next init.
+  const initLost = (link, sb) => {
+    link.inits.delete(sb);
+    link.unkept.add(sb);
+    link.lost.add(sb);
+    if (!link.port) return;
+    try {
+      link.port.postMessage({ t: "lost", header: { sb, drop: true } });
+    } catch (e) {
+      // The port is going: the next one is told (`unkept`).
+    }
+  };
+
+  // `payload` null: an init held before tapping started that did not fit
+  // (tap), noted at its place in the stream.
   const sendSegment = (header, payload) => {
-    const size = payload.byteLength;
     const link = linkFor(header.ms);
+    if (!link || link.closed || stats.dead) {
+      if (payload) stats.dropped++;
+      return;
+    }
+    const initBytes = header.isInit || header.initCont;
+    if (!payload) {
+      link.chain = link.chain.then(() => initLost(link, header.sb)).catch(() => {});
+      return;
+    }
+    let size = payload.byteLength;
     // A full queue drops media, not small init bytes: media after a lost init
     // would be filed under the previous one.
-    const smallInit = (header.isInit || header.initCont) && size <= MAX_INIT_BYTES;
-    const full = stats.queuedBytes + size > (smallInit ? 2 * MAX_QUEUED_BYTES : MAX_QUEUED_BYTES);
-    if (!link || link.closed || stats.dead || full) {
+    const room = (n, init) => stats.queuedBytes + n <= (init && n <= MAX_INIT_BYTES ? 2 * MAX_QUEUED_BYTES : MAX_QUEUED_BYTES);
+    if (!room(size, initBytes) && header.isInit && header.initLen && header.initLen < size && room(header.initLen, true)) {
+      // An init+media append: its init part alone still goes, its media part
+      // is dropped like any media.
       stats.dropped++;
+      payload = payload.slice(0, header.initLen);
+      header = { ...header, tfdt: null, dur: null, initLen: null };
+      size = payload.byteLength;
+    } else if (!room(size, initBytes)) {
+      stats.dropped++;
+      if (initBytes) link.chain = link.chain.then(() => initLost(link, header.sb)).catch(() => {});
       return;
     }
     stats.queuedBytes += size;
     link.chain = link.chain
-      .then(() => toDataUrl(payload))
-      .then((dataUrl) => post(link, { t: "segment", header, payload: dataUrl }))
-      .then((sent) => {
+      .then(async () => {
+        if (header.isInit) link.lost.delete(header.sb);
+        else if (link.lost.has(header.sb)) {
+          // Media (or the rest) of a lost init.
+          stats.dropped++;
+          return;
+        }
+        const sent = await post(link, { t: "segment", header, payload: await toDataUrl(payload) });
         if (sent) keepInit(link, header, payload);
+        else if (initBytes) initLost(link, header.sb);
       })
       .catch(() => {
         stats.dropped++;
+        if (initBytes) initLost(link, header.sb);
       })
       .finally(() => {
         stats.queuedBytes -= size;
@@ -312,6 +359,7 @@
   let tapping = inExtension ? null : false;
   let held = [];
   let heldBytes = 0;
+  const HELD_MARK_BYTES = 64; // what a held lost-init mark counts
 
   const setTapping = (on) => {
     tapping = on;
@@ -341,6 +389,12 @@
       heldBytes += payload.byteLength;
     } else if (tapping === null) {
       stats.dropped++;
+      // A dropped init is noted at its place once tapping starts; the marks
+      // have a small budget of their own.
+      if ((header.isInit || header.initCont) && heldBytes + HELD_MARK_BYTES <= MAX_QUEUED_BYTES + MAX_INIT_BYTES) {
+        held.push([header, null]);
+        heldBytes += HELD_MARK_BYTES;
+      }
     }
   };
 
