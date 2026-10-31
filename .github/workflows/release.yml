@@ -76,6 +76,14 @@ jobs:
             echo "::error::the tag says $version but desktop/crates/streamtap-app/tauri.conf.json says $tauri"
             exit 1
           fi
+          # The zip also carries the sink and the host: their versions are the tag's too.
+          for member in streamtap-sink streamtap-host; do
+            other="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "desktop/crates/$member/Cargo.toml" | head -n 1)"
+            if [ "$version" != "$other" ]; then
+              echo "::error::the tag says $version but desktop/crates/$member/Cargo.toml says $other"
+              exit 1
+            fi
+          done
           # A release comes from main, never from a side branch.
           git fetch --quiet origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
@@ -87,9 +95,16 @@ jobs:
             echo "::error::no green CI run for $GITHUB_SHA: wait for it, or fix main, then tag again"
             exit 1
           fi
-          # A published release is never cut again: stop before anything is built.
-          if draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" && [ "$draft" != "true" ]; then
-            echo "::error::the release $tag is published: it is never cut again (NREL-10), make a patch release"
+          # A published release is never cut again: stop before anything is built. "release not found" is the
+          # good answer (a draft is invisible to this read-only token, and fine); any other failure of gh
+          # (token, rate limit, network) is not taken for it.
+          if answer="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>&1)"; then
+            if [ "$answer" != "true" ]; then
+              echo "::error::the release $tag is published: it is never cut again (NREL-10), make a patch release"
+              exit 1
+            fi
+          elif ! printf '%s' "$answer" | grep -qi 'release not found'; then
+            echo "::error::cannot ask GitHub about the release $tag: $answer"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"

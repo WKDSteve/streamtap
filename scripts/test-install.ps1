@@ -406,6 +406,30 @@ try {
     Write-Check (-not (Test-Path -LiteralPath $uninstallKey) -and -not (Get-ChildItem -LiteralPath $install -Force)) 'and the files and the Settings > Apps entry are gone'
     Remove-Item -LiteralPath $install
 
+    # 8c. A folder that is not an install of this program (a checkout, a work folder) is neither
+    # installed into nor emptied: a wrong -InstallDir must not cost it its extension\, README.md or LICENSE.
+    $foreign = Join-Path $tmp 'somebody elses'
+    New-Item -ItemType Directory -Force -Path (Join-Path $foreign 'extension\src') | Out-Null
+    $foreignFiles = 'extension\src\work.js', 'README.md', 'LICENSE', 'uninstall.ps1'
+    foreach ($rel in $foreignFiles) { Set-Content -LiteralPath (Join-Path $foreign $rel) -Value 'mine' }
+    $foreignPlaces = @('-InstallDir', $foreign, '-StartMenuDir', $startMenu, '-RegistryRoot', $regRoot)
+    $before = (@(Get-Tree $foreign) -join '|')
+    $r = Invoke-Script $uninstallSrc $foreignPlaces
+    Write-Check ($r.Code -eq 0 -and $r.Text -match 'nothing to do' -and $r.Text -match 'not an install of this program') 'uninstall of a folder that is not an install says so and removes nothing'
+    Write-Check ((@(Get-Tree $foreign) -join '|') -ceq $before) 'and its extension folder, README.md, LICENSE and uninstall.ps1 are all still there'
+    $r = Invoke-Script $installer ($installArgs + $foreignPlaces)
+    Write-Check ($r.Code -ne 0 -and $r.Text -match 'holds files but no streamtap install') 'install into a folder with somebody else''s files is refused'
+    Write-Check ((@(Get-Tree $foreign) -join '|') -ceq $before) 'and it is unchanged'
+    Remove-Item -LiteralPath $foreign -Recurse -Force
+    # An empty folder, and one with only the leftovers of an install that was cut short, are fine.
+    New-Item -ItemType Directory -Force -Path (Join-Path $foreign 'bin') | Out-Null
+    Set-Content -LiteralPath (Join-Path $foreign 'bin\streamtap-app.exe.new') -Value 'half'
+    $r = Invoke-Script $installer ($installArgs + $foreignPlaces)
+    Write-Check ($r.Code -eq 0 -and (Test-Path -LiteralPath (Join-Path $foreign 'bin\streamtap-app.exe'))) 'a folder with the leftovers of a cut short install is installed into'
+    $r = Invoke-Script $uninstallSrc $foreignPlaces
+    Write-Check ($r.Code -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $foreign 'bin'))) 'and an install is still removed'
+    Remove-Item -LiteralPath $foreign -Recurse -Force -ErrorAction SilentlyContinue
+
     # 9. A program file that cannot be removed is an error, not a "removed", and the entry stays.
     $r = Invoke-Script $installer $installArgs
     $lock = [IO.File]::Open((Join-Path $bin 'streamtap-host.exe'), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)

@@ -133,6 +133,9 @@ function Test-Archive([string] $Path, [string] $Programs, [string] $Label, [stri
     Write-Check (@($names | Where-Object { $_ -match '\\' -or $_ -match '^/' -or $_ -match '\.\.' }).Count -eq 0) "$Title uses forward slashes and no path that leaves its folder"
     Write-Check (@($names | Where-Object { $_ -match '^extension/(scripts|README)' -or $_ -match '\.(pem|key|crx|map)$|test' }).Count -eq 0) "$Title ships no test, no README and no key of the extension"
     Write-Check ($names -cnotcontains 'SHA256SUMS') "$Title does not hold the checksums of itself"
+    $ordered = @($names)
+    [Array]::Sort($ordered, [StringComparer]::Ordinal)
+    Write-Check (($names -join '|') -ceq ($ordered -join '|')) "$Title lists its entries in ordinal order"
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $dir = Join-Path $tmp ('unpacked-' + [Guid]::NewGuid().ToString('N'))
     [IO.Compression.ZipFile]::ExtractToDirectory($Path, $dir)
@@ -142,12 +145,14 @@ function Test-Archive([string] $Path, [string] $Programs, [string] $Label, [stri
     }
     Write-Check $same "$Title carries the bytes of the programs"
     $sources = @{ 'install.ps1' = (Join-Path $here 'install.ps1'); 'uninstall.ps1' = (Join-Path $here 'uninstall.ps1'); 'LICENSE' = (Join-Path $root 'LICENSE')
-        'extension\manifest.json' = (Join-Path $root 'extension\manifest.json'); 'extension\src\hook.js' = (Join-Path $root 'extension\src\hook.js') }
+        'README.md' = (Join-Path $here 'release-readme.md') }
+    # Every file of the extension, not just two of them.
+    foreach ($rel in Get-ExtensionShipped (Join-Path $root 'extension')) { $sources[$rel.Replace('/', '\')] = Join-Path $root $rel.Replace('/', '\') }
     $sameSources = $true
     foreach ($key in $sources.Keys) {
         if ((Get-Sha (Join-Path $dir $key)) -ne (Get-Sha $sources[$key])) { $sameSources = $false }
     }
-    Write-Check $sameSources "$Title carries the scripts, LICENSE and extension files of the checkout unchanged"
+    Write-Check $sameSources "$Title carries the scripts, LICENSE, README.md and every extension file of the checkout unchanged"
     Write-Check ((Get-Content -LiteralPath (Join-Path $dir 'VERSION') -Raw) -ceq "$Label`n") "$Title says its version is $Label"
     $script:archiveDir = $dir
 }
@@ -173,6 +178,10 @@ function Copy-FakeRoot([string] $Name) {
     foreach ($file in 'Cargo.toml', 'tauri.conf.json') {
         Copy-Item -LiteralPath (Join-Path $root "desktop\crates\streamtap-app\$file") -Destination (Join-Path $fake "desktop\crates\streamtap-app\$file")
     }
+    foreach ($member in 'streamtap-sink', 'streamtap-host') {
+        New-Item -ItemType Directory -Path (Join-Path $fake "desktop\crates\$member") | Out-Null
+        Copy-Item -LiteralPath (Join-Path $root "desktop\crates\$member\Cargo.toml") -Destination (Join-Path $fake "desktop\crates\$member\Cargo.toml")
+    }
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $fake 'LICENSE')
     Copy-Item -LiteralPath (Join-Path $root 'extension') -Destination (Join-Path $fake 'extension') -Recurse
     return $fake
@@ -196,6 +205,10 @@ try {
         New-Item -ItemType Directory -Path $BuildDir | Out-Null
         foreach ($name in 'streamtap-app', 'streamtap-sink', 'streamtap-host') {
             Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\cmd.exe') -Destination (Join-Path $BuildDir "$name.exe")
+            # Three different programs, so a zip that packs one for another is seen.
+            $extra = [Text.Encoding]::ASCII.GetBytes("stand-in $name")
+            $exeStream = [IO.File]::Open((Join-Path $BuildDir "$name.exe"), [IO.FileMode]::Append)
+            try { $exeStream.Write($extra, 0, $extra.Length) } finally { $exeStream.Dispose() }
         }
     }
     $cargo = Get-Content -LiteralPath (Join-Path $root 'desktop\crates\streamtap-app\Cargo.toml') -Raw
@@ -283,6 +296,55 @@ try {
     Copy-Item -LiteralPath (Join-Path $root 'extension\popup\popup.js') -Destination (Join-Path $ext 'popup\popup.js')
     $r = Invoke-Package @{ BuildDir = $BuildDir; OutDir = (Join-Path $tmp 'dist e5') } $pkg
     Write-Check $r.Ok 'the fake root packs when nothing is broken (the refusals above are the breaks)'
+
+    # 6b. Everything the manifest names, not just the scripts and the popup, must be in the folder.
+    function Test-ExtensionVariant([string] $Name, [scriptblock] $Edit, [string] $Pattern, [string] $Title) {
+        $fake = Copy-FakeRoot $Name
+        & $Edit (Join-Path $fake 'extension')
+        $r = Invoke-Package @{ BuildDir = $BuildDir; OutDir = (Join-Path $tmp "dist $Name") } (Join-Path $fake 'scripts\package-release.ps1')
+        if ($Pattern) { Write-Check (-not $r.Ok -and $r.Text -match $Pattern) $Title }
+        else { Write-Check $r.Ok $Title; if (-not $r.Ok) { Write-Output $r.Text } }
+    }
+    function Edit-Text([string] $Path, [string] $Old, [string] $New) {
+        $text = [IO.File]::ReadAllText($Path)
+        if (-not $text.Contains($Old)) { throw "no '$Old' in $Path" }
+        [IO.File]::WriteAllText($Path, $text.Replace($Old, $New), (New-Object Text.UTF8Encoding($false)))
+    }
+    Test-ExtensionVariant 'ext icons' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"manifest_version": 3,' '"manifest_version": 3, "icons": {"16": "icons/16.png"},' } "names 'icons/16.png'" 'an icon the manifest names but the folder lacks is refused'
+    Test-ExtensionVariant 'ext default icon' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"default_title": "streamtap",' '"default_title": "streamtap", "default_icon": "icons/a.png",' } "names 'icons/a.png'" 'so is the action icon'
+    Test-ExtensionVariant 'ext css' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"src/hook.js"' '"src/hook.js"], "css": ["styles/missing.css"' } "names 'styles/missing.css'" 'so is a content script style'
+    Test-ExtensionVariant 'ext war' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"manifest_version": 3,' '"manifest_version": 3, "web_accessible_resources": [{"resources": ["assets/x.js"], "matches": ["<all_urls>"]}],' } "names 'assets/x.js'" 'so is a web accessible resource'
+    Test-ExtensionVariant 'ext war glob' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"manifest_version": 3,' '"manifest_version": 3, "web_accessible_resources": [{"resources": ["assets/*"], "matches": ["<all_urls>"]}],' } 'pattern .assets/\*.' 'and a pattern that points outside popup and src'
+    Test-ExtensionVariant 'ext locale' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"manifest_version": 3,' '"manifest_version": 3, "default_locale": "en",' } 'default_locale' 'a default locale (its _locales is not shipped) is refused'
+    Test-ExtensionVariant 'ext import' { param($e) Edit-Text (Join-Path $e 'src\background.js') '"native-pairing.js"' '"missing-pairing.js"' } 'missing-pairing\.js' 'a script the service worker imports but the folder lacks is refused'
+    Test-ExtensionVariant 'ext icon ok' {
+        param($e)
+        Set-Content -LiteralPath (Join-Path $e 'src\icon.png') -Value 'png'
+        Edit-Text (Join-Path $e 'manifest.json') '"manifest_version": 3,' '"manifest_version": 3, "icons": {"16": "src/icon.png"},'
+    } '' 'an icon inside src packs'
+
+    # 6c. The sink and the host are the app's version too.
+    foreach ($member in 'streamtap-sink', 'streamtap-host') {
+        $fake = Copy-FakeRoot "fake $member"
+        $toml = Join-Path $fake "desktop\crates\$member\Cargo.toml"
+        [IO.File]::WriteAllText($toml, ([IO.File]::ReadAllText($toml) -replace '(?m)^version\s*=\s*"[^"]+"', 'version = "9.9.9"'), (New-Object Text.UTF8Encoding($false)))
+        $r = Invoke-Package @{ BuildDir = $BuildDir; OutDir = (Join-Path $tmp "dist $member") } (Join-Path $fake 'scripts\package-release.ps1')
+        Write-Check (-not $r.Ok -and $r.Text -match "$member/Cargo.toml says 9.9.9") "a $member with another version than the app is refused"
+    }
+
+    # 6d. SHA256SUMS keeps one line per zip of the folder, and never the hash of a zip that was not made.
+    $both = Join-Path $tmp 'dist both'
+    $null = Invoke-Package @{ BuildDir = $BuildDir; OutDir = $both }
+    $null = Invoke-Package @{ BuildDir = $BuildDir; OutDir = $both; Rolling = $true; Sha = $sha }
+    $null = Invoke-Package @{ BuildDir = $BuildDir; OutDir = $both; Rolling = $true; Sha = $sha }
+    $lines = @((Get-Content -LiteralPath (Join-Path $both 'SHA256SUMS')) | Where-Object { $_ })
+    $want = @("$(Get-Sha (Join-Path $both 'streamtap-windows-x86_64.zip'))  streamtap-windows-x86_64.zip", "$(Get-Sha (Join-Path $both $zipName))  $zipName") | Sort-Object { $_.Substring(66) }
+    Write-Check (($lines -join '|') -ceq ($want -join '|')) 'a release and a rolling zip in one folder give two lines in SHA256SUMS (packing again replaces a line)'
+    $locked = [IO.File]::Open((Join-Path $both $zipName), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    try { $r = Invoke-Package @{ BuildDir = $BuildDir; OutDir = $both } }
+    finally { $locked.Dispose() }
+    $left = (Get-Content -LiteralPath (Join-Path $both 'SHA256SUMS') -Raw)
+    Write-Check (-not $r.Ok -and $left -notmatch [regex]::Escape($zipName) -and $left -match 'streamtap-windows-x86_64.zip') 'a zip that cannot be written leaves no hash of its old self in SHA256SUMS'
 
     # 7. -StageDir / -NoZip, as build-install.ps1 uses them.
     $stage = Join-Path $tmp 'stage'

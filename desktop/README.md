@@ -434,6 +434,11 @@ the installed host. (A non-interactive re-register flag in the app was not added
 browser keeps working with the checkout's host until you press the button, and the
 registration code stays in one place.)
 
+A wrong `-InstallDir` costs nothing: `install.ps1` refuses a folder that holds files and no streamtap
+install (no streamtap program, no `VERSION` with `uninstall.ps1`), and `uninstall.ps1` leaves such a
+folder alone ("not an install of this program") instead of removing its `extension\`, `README.md`
+or `LICENSE`.
+
 Places for tests: `-InstallDir`, `-StartMenuDir`, `-RegistryRoot` (the key that stands
 for `HKCU\Software`, below which the uninstall entry is written and the browser keys are
 read), and for `uninstall.ps1` also `-DataDir`, `-LocalDataDir`; each defaults to
@@ -458,9 +463,12 @@ SmartScreen like the programs, and the scripts already do the per-user install).
 `scripts/package-release.ps1` packs `streamtap-<version>-x86_64-pc-windows-msvc.zip` from built
 programs (`-BuildDir`, default `desktop\target\release`; it builds nothing unless `-Build`): `bin\` with
 the three programs, `extension\`, `install.ps1`, `uninstall.ps1`, `LICENSE`, `README.md` (how to
-install) and `VERSION`. The zip is reproducible (sorted entries, fixed timestamp), a `SHA256SUMS`
-is written next to it, and the version must be the one of `streamtap-app/Cargo.toml` and
-`tauri.conf.json`. `-Rolling -Sha <commit>` packs the rolling build: the fixed name
+install) and `VERSION`. The zip is reproducible (sorted entries, fixed timestamp): the same programs
+give the same bytes when the same PowerShell/.NET packs them (the compressed bytes depend on the
+runtime's deflate, so Windows PowerShell 5.1 and PowerShell 7 give different zips with the same
+content). A `SHA256SUMS` with one line per zip of that folder is written next to it, and the version
+must be the one of `streamtap-app/Cargo.toml`, `tauri.conf.json`, `streamtap-sink` and `streamtap-host`.
+The script packs what is in the build folder and does not know whether it is fresh: build first. `-Rolling -Sha <commit>` packs the rolling build: the fixed name
 `streamtap-windows-x86_64.zip` and the version label `<version>+<short commit>`.
 
 `.github/workflows/release.yml` (tag `v*`): checks that the tag is the version of `Cargo.toml` and
@@ -469,7 +477,9 @@ already; builds; packs; runs `scripts/test-release.ps1` on the zip; and makes a 
 with the zip and `SHA256SUMS` through the publish action of appkit's release-kit. It never publishes;
 a person opens the draft, installs from it and publishes it. `.github/workflows/rolling.yml`:
 after a green `ci` on `main` the pre-release `latest` gets the zip of that commit (the tip of
-`main` only) and `SHA256SUMS`, replaced each time. Both run on the self-hosted Windows runner
+`main` only) and `SHA256SUMS`, replaced each time. A newer build cancels an older one, but a running
+publish is never cancelled (it would leave `latest` without a file); a publish that waited behind a newer one
+publishes nothing when `main` has moved on. Both run on the self-hosted Windows runner
 (the repository is private). The kit's own stamped `install.ps1` is not used (it needs a program
 with an `install` command or a setup); `install.ps1` is in the zip. streamtap has no appkit crate,
 so `tools/check-workflows.py` (CI, job `hygiene`; `--online` asks GitHub whether each action's tag

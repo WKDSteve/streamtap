@@ -107,7 +107,7 @@ function Test-Under([string] $Path, [string] $Dir) {
     return $p.StartsWith($d, [StringComparison]::OrdinalIgnoreCase)
 }
 
-# An absolute folder that is not a drive root, without a trailing backslash (as build-install.ps1).
+# An absolute folder that is not a drive root, without a trailing backslash (as install.ps1).
 function Get-Place([string] $Dir) {
     if (-not $Dir -or $Dir.Contains('"') -or -not [IO.Path]::IsPathRooted($Dir)) { Exit-Uninstall "not an absolute path: '$Dir'" }
     $full = [IO.Path]::GetFullPath($Dir)
@@ -148,6 +148,19 @@ function Invoke-EmptyFolderRemoval([string] $Dir) {
     if (-not (Test-Path -LiteralPath $Dir -PathType Container) -or (Get-ChildItem -LiteralPath $Dir -Force)) { return }
     try { Remove-Item -LiteralPath $Dir -Force }
     catch { Write-Output "kept the empty folder $Dir (in use: $($_.Exception.Message))" }
+}
+
+# Whether $Dir holds a streamtap install: a program of ours (also a .new/.old left by a cut short
+# install), in bin\ or in the older layout beside it, or the VERSION and uninstall.ps1 of a release.
+function Test-Installation([string] $Dir) {
+    foreach ($name in $programs) {
+        foreach ($rel in "bin\$name.exe", "$name.exe") {
+            foreach ($suffix in '', '.new', '.old') {
+                if (Test-Path -LiteralPath (Join-Path $Dir "$rel$suffix") -PathType Leaf) { return $true }
+            }
+        }
+    }
+    return (Test-Path -LiteralPath (Join-Path $Dir 'uninstall.ps1') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $Dir 'VERSION') -PathType Leaf)
 }
 
 if ($env:CLAUDECODE) {
@@ -214,19 +227,27 @@ if (Test-Path -LiteralPath $link -PathType Leaf) {
 # is wholly the install's own (the browser loads it from there): it goes with everything in it.
 # The .new and .old files are what an install that was cut short leaves. The programs of the layout
 # before bin\ (directly in the install folder) go too.
+#
+# Only a folder that is a streamtap install gets this: a wrong -InstallDir (a checkout, a work folder)
+# must not lose its extension\, README.md or LICENSE.
 $extensionDir = Join-Path $InstallDir 'extension'
-if (Test-Path -LiteralPath $extensionDir) {
-    Invoke-Removal $extensionDir -Recurse
-    $removed += $extensionDir
-}
 $binDir = Join-Path $InstallDir 'bin'
 $installed = @($programs | ForEach-Object { "bin\$_.exe"; "$_.exe" }) + @('uninstall.ps1', 'LICENSE', 'README.md', 'VERSION')
-foreach ($name in $installed | ForEach-Object { $_; "$_.new"; "$_.old" }) {
-    $file = Join-Path $InstallDir $name
-    if (Test-Path -LiteralPath $file) {
-        Invoke-Removal $file
-        if ($installed -contains $name) { $removed += $file }
+if (Test-Installation $InstallDir) {
+    if (Test-Path -LiteralPath $extensionDir) {
+        Invoke-Removal $extensionDir -Recurse
+        $removed += $extensionDir
     }
+    foreach ($name in $installed | ForEach-Object { $_; "$_.new"; "$_.old" }) {
+        $file = Join-Path $InstallDir $name
+        if (Test-Path -LiteralPath $file) {
+            Invoke-Removal $file
+            if ($installed -contains $name) { $removed += $file }
+        }
+    }
+}
+elseif (Test-Path -LiteralPath $InstallDir) {
+    Write-Output "kept $InstallDir (no streamtap program and no VERSION with uninstall.ps1 in it: it is not an install of this program)"
 }
 Invoke-EmptyFolderRemoval $binDir
 Invoke-EmptyFolderRemoval $InstallDir

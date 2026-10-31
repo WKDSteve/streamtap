@@ -12,9 +12,15 @@ scripts\install.ps1 installs, in the layout it installs it:
   uninstall.ps1, LICENSE, README.md (how to install), VERSION
 
 The zip is reproducible: entries are sorted, use forward slashes and a fixed timestamp, so the
-same programs give the same bytes (and the same checksum). SHA256SUMS ("<hash>  <file>") is written
-next to it for a local check; the release workflow does not upload that file, the publish action
-of appkit's release-kit makes the one of the release.
+same programs give the same bytes (and the same checksum) when packed by the same PowerShell/.NET
+runtime (the compressed bytes of an entry depend on the runtime's deflate, so Windows PowerShell 5.1
+and PowerShell 7 give different zips with the same content). SHA256SUMS ("<hash>  <file>", one line
+per zip packed into that folder) is written next to it for a local check; the release workflow does
+not upload that file, the publish action of appkit's release-kit makes the one of the release.
+
+It packs the programs that are in -BuildDir; it does not know whether they are fresh. Build first
+(-Build, or scripts\build.ps1, which also refuses while a streamtap program runs from the build
+folder); the release workflow builds from a clean checkout first.
 
 The release is a zip plus scripts, not a setup.exe: an unsigned setup would be stopped by
 SmartScreen exactly like the programs, and the scripts already do the per-user install
@@ -94,6 +100,14 @@ $cargoText = Get-Content -LiteralPath (Join-Path $root 'desktop\crates\streamtap
 if ($cargoText -notmatch '(?m)^version\s*=\s*"([^"]+)"') { Exit-Package 'no version in streamtap-app/Cargo.toml' }
 $appVersion = $Matches[1]
 if ($appVersion -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { Exit-Package "the version '$appVersion' is not X.Y.Z" }
+# The zip also carries the sink and the host: they are the app's version too.
+foreach ($member in 'streamtap-sink', 'streamtap-host') {
+    $memberText = Get-Content -LiteralPath (Join-Path $root "desktop\crates\$member\Cargo.toml") -Raw
+    if ($memberText -notmatch '(?m)^version\s*=\s*"([^"]+)"') { Exit-Package "no version in $member/Cargo.toml" }
+    if ($Matches[1] -ne $appVersion) {
+        Exit-Package "streamtap-app says $appVersion but $member/Cargo.toml says $($Matches[1]): make them one version"
+    }
+}
 $tauriVersion = [string](Get-Content -LiteralPath (Join-Path $root 'desktop\crates\streamtap-app\tauri.conf.json') -Raw |
         ConvertFrom-Json).version
 if ($tauriVersion -ne $appVersion) {
@@ -172,17 +186,59 @@ try {
     # Everything the manifest and the popup name must be in the folder, or Chrome loads half an extension.
     $manifest = Get-Content -LiteralPath (Join-Path $ExtensionDir 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     $refs = @()
-    if ($manifest.PSObject.Properties['background'] -and $manifest.background.PSObject.Properties['service_worker']) {
-        $refs += [string]$manifest.background.service_worker
+    # The value of a manifest property by its path (names separated by '.'), or nothing.
+    function Get-ManifestValue($Node, [string[]] $Path) {
+        foreach ($part in $Path) {
+            if ($null -eq $Node -or -not $Node.PSObject.Properties[$part]) { return @() }
+            $Node = $Node.$part
+        }
+        return @($Node | Where-Object { $null -ne $_ })
     }
-    if ($manifest.PSObject.Properties['content_scripts']) {
-        foreach ($cs in $manifest.content_scripts) {
-            if ($cs.PSObject.Properties['js']) { $refs += @($cs.js) }
+    # A path value, or the values of an object (icons: size -> file).
+    function Get-ManifestFile($Value) {
+        foreach ($v in $Value) {
+            if ($v -is [string]) { $v }
+            elseif ($null -ne $v) { foreach ($p in $v.PSObject.Properties) { [string]$p.Value } }
+        }
+    }
+    $workerDir = ''
+    $worker = @(Get-ManifestValue $manifest @('background', 'service_worker'))
+    if ($worker.Count) {
+        $refs += [string]$worker[0]
+        $workerDir = Split-Path -Parent ([string]$worker[0])
+    }
+    foreach ($cs in @(Get-ManifestValue $manifest @('content_scripts'))) {
+        $refs += @(Get-ManifestValue $cs @('js'))
+        $refs += @(Get-ManifestValue $cs @('css'))
+    }
+    $refs += @(Get-ManifestFile (Get-ManifestValue $manifest @('icons')))
+    $refs += @(Get-ManifestFile (Get-ManifestValue $manifest @('action', 'default_icon')))
+    $refs += @(Get-ManifestValue $manifest @('options_page'))
+    $refs += @(Get-ManifestValue $manifest @('options_ui', 'page'))
+    $refs += @(Get-ManifestValue $manifest @('side_panel', 'default_path'))
+    foreach ($war in @(Get-ManifestValue $manifest @('web_accessible_resources'))) {
+        foreach ($resource in @(Get-ManifestValue $war @('resources'))) {
+            if ([string]$resource -match '[*?]') {
+                # A pattern cannot be looked up; it must at least point into a folder that is shipped.
+                if ([string]$resource -notmatch '^(popup|src)/') { Exit-Package "the extension names the pattern '$resource' but only popup\ and src\ are shipped" }
+            }
+            else { $refs += [string]$resource }
+        }
+    }
+    if ($manifest.PSObject.Properties['default_locale']) { Exit-Package 'the extension has a default_locale: _locales\ is not shipped' }
+    # What the service worker pulls in with importScripts("a.js", ...) (relative to the worker).
+    if ($worker.Count -and (Test-Path -LiteralPath (Join-Path $stage ('extension\' + ([string]$worker[0] -replace '/', '\'))) -PathType Leaf)) {
+        $workerText = Get-Content -LiteralPath (Join-Path $stage ('extension\' + ([string]$worker[0] -replace '/', '\'))) -Raw -Encoding UTF8
+        foreach ($call in [regex]::Matches($workerText, 'importScripts\(([^)]*)\)')) {
+            foreach ($m in [regex]::Matches($call.Groups[1].Value, '["'']([^"'']+)["'']')) {
+                $refs += $(if ($workerDir) { Join-Path $workerDir $m.Groups[1].Value } else { $m.Groups[1].Value })
+            }
         }
     }
     $popup = ''
-    if ($manifest.PSObject.Properties['action'] -and $manifest.action.PSObject.Properties['default_popup']) {
-        $popup = [string]$manifest.action.default_popup
+    $popupRef = @(Get-ManifestValue $manifest @('action', 'default_popup'))
+    if ($popupRef.Count) {
+        $popup = [string]$popupRef[0]
         $refs += $popup
     }
     if ($popup -and (Test-Path -LiteralPath (Join-Path $stage "extension\$popup"))) {
@@ -211,6 +267,15 @@ try {
     # The zip: entries sorted by ordinal comparison, forward slashes, one fixed timestamp.
     New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
     $zipPath = Join-Path (Resolve-Path -LiteralPath $OutDir).ProviderPath $zipName
+    # SHA256SUMS keeps one line per zip of this folder. The line of this zip goes first: a zip that
+    # fails halfway must not leave the old hash beside it (or beside no zip at all).
+    $sumsPath = Join-Path (Split-Path -Parent $zipPath) 'SHA256SUMS'
+    $sumLines = @()
+    if (Test-Path -LiteralPath $sumsPath) {
+        $sumLines = @([IO.File]::ReadAllText($sumsPath) -split "\r?\n" | Where-Object { $_ -and -not $_.EndsWith("  $zipName", [StringComparison]::Ordinal) })
+        if ($sumLines.Count) { [IO.File]::WriteAllText($sumsPath, (($sumLines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false))) }
+        else { Remove-Item -LiteralPath $sumsPath -Force }
+    }
     if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
     $stageFull = (Resolve-Path -LiteralPath $stage).ProviderPath.TrimEnd('\') + '\'
     $names = @(Get-ChildItem -LiteralPath $stage -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($stageFull.Length) })
@@ -237,7 +302,10 @@ try {
     finally { $stream.Dispose() }
 
     $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    [IO.File]::WriteAllText((Join-Path (Split-Path -Parent $zipPath) 'SHA256SUMS'), "$hash  $zipName`n", (New-Object Text.UTF8Encoding($false)))
+    $allLines = @($sumLines) + @("$hash  $zipName")
+    $sortKeys = @($allLines | ForEach-Object { $_.Substring($_.IndexOf('  ') + 2) })
+    [Array]::Sort($sortKeys, $allLines, [StringComparer]::Ordinal)
+    [IO.File]::WriteAllText($sumsPath, (($allLines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
     Write-Output "packaged $label"
     Write-Output $zipPath
     Write-Output "$hash  $zipName"

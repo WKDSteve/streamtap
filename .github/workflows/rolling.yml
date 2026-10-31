@@ -25,16 +25,12 @@ on:
     branches: [main]
 
 # Only the run of the TIP of main may build, and a newer tip replaces a build that is still running: the
-# pre-release must end on the newest commit. The group tells the two kinds of run apart before any step runs:
-# for a `workflow_run` event `github.sha` is the tip of main when the run started, `head_sha` is the commit the
-# CI run was about. A CI run of an OLDER commit that finishes late is not the tip: it lands in a group of its own
-# (it builds nothing, `prepare` says so), so it can neither cancel the build of the tip nor push the waiting
-# build of the tip out of the queue (a waiting run is replaced by a newer one of the SAME group, even without
-# `cancel-in-progress`). The runs that do nothing (a failed CI, a pull request) share that group too.
-concurrency:
-  group: rolling-${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_sha == github.sha }}
-  cancel-in-progress: true
-
+# pre-release must end on the newest commit. This is kept per job, never for the whole workflow: a
+# workflow-level `cancel-in-progress` would also kill a `publish` that is halfway through replacing the
+# zip and the checksums, and the pre-release would be left without a file. So `build` is cancelled by a
+# newer build (group `rolling-build-true`; a run that is not the tip has `current` false and lands in a
+# group of its own, it builds nothing), and `publish` is never cancelled: a newer publish waits for it,
+# and a late older one finds that main has moved on and does nothing (step "Is it still the tip").
 permissions:
   contents: read
 
@@ -69,6 +65,9 @@ jobs:
   build:
     needs: prepare
     if: ${{ needs.prepare.outputs.current == 'true' }}
+    concurrency:
+      group: rolling-build-${{ needs.prepare.outputs.current }}
+      cancel-in-progress: true
     runs-on: [self-hosted, windows]
     timeout-minutes: 40
     steps:
@@ -113,24 +112,47 @@ jobs:
   # commit.
   publish:
     needs: [prepare, build]
+    # Never cancelled once running (see above); a newer publish waits for this one.
+    concurrency:
+      group: rolling-publish
+      cancel-in-progress: false
     runs-on: [self-hosted, windows]
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+      # A publish that waited behind a newer one must not put its older commit over it.
+      - name: Is it still the tip
+        id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -eu
+          tip="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          if [ "$tip" = "$SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main has moved on to $tip: $SHA is not published"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: ${{ steps.tip.outputs.current == 'true' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
       # The folder must hold the one downloaded zip and nothing from an earlier job of this runner.
       - name: Empty dist
+        if: ${{ steps.tip.outputs.current == 'true' }}
         run: rm -rf dist
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - if: ${{ steps.tip.outputs.current == 'true' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: rolling-*
           path: dist
           merge-multiple: true
-      - uses: WKDSteve/appkit/release-kit/publish@518092716d00fb3fc18ce1b418032f71c3414817 # v0.27.0
+      - if: ${{ steps.tip.outputs.current == 'true' }}
+        uses: WKDSteve/appkit/release-kit/publish@518092716d00fb3fc18ce1b418032f71c3414817 # v0.27.0
         with:
           token: ${{ github.token }}
           tag: latest

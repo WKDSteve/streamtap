@@ -1,6 +1,7 @@
 # Node / extension build output (none yet, reserved for a later bundler step)
 node_modules/
 dist/
+__pycache__/
 
 # Rust (desktop app, later)
 target/

@@ -52,25 +52,41 @@ setup.exe**, and nothing in it is code-signed.
 1. Get the zip from the repository's *Releases* (the repository is private: sign in, or
    `gh release download <tag>`): `streamtap-<version>-x86_64-pc-windows-msvc.zip` for a release, or
    `streamtap-windows-x86_64.zip` from the pre-release **latest** (the rolling build of the newest
-   green commit of `main`). Check it against `SHA256SUMS` of the same release:
-   `(Get-FileHash .\streamtap-*.zip).Hash` must equal the hash listed there.
+   green commit of `main`). In the folder you downloaded it to, **before you unpack it**, check it against
+   `SHA256SUMS` of the same release and unblock it:
+   `(Get-FileHash .\streamtap-*.zip -Algorithm SHA256).Hash.ToLower()` must equal the hash listed there;
+   `Unblock-File .\streamtap-*.zip` removes the Mark-of-the-Web, which otherwise ends up on the
+   installed programs too (the installer copies it along).
 2. Install **ffmpeg** first; it is a prerequisite and not in the zip: `scoop install ffmpeg`, or put
-   `ffmpeg.exe` on the `PATH`. The app shows "ffmpeg not found" until it can start it.
-3. Unpack the zip, open a normal (not elevated) PowerShell in the unpacked folder and run
+   `ffmpeg.exe` on the `PATH`. The app looks on the `PATH` it was started with, so after installing
+   ffmpeg later, restart the app; until then it shows "ffmpeg not found".
+3. Unpack the zip into a **new, empty folder**, open a normal (not elevated) PowerShell in it and run
    `powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1`. It installs for you only, without
    administrator rights, to `%LOCALAPPDATA%\streamtap` (programs in `bin\`, the extension in
    `extension\`), and adds a Start menu entry and an entry in *Settings > Apps* (uninstall).
 4. **Load the extension unpacked** (Chrome has no store entry for it): `chrome://extensions`, turn on
-   *Developer mode*, *Load unpacked*, pick `%LOCALAPPDATA%\streamtap\extension`. Then open *streamtap*
-   from the Start menu and use *Connect browser*; no command line is needed from here on.
+   *Developer mode*, *Load unpacked*, pick `%LOCALAPPDATA%\streamtap\extension`.
+5. Open *streamtap* from the Start menu, *Connect browser*, **Register** your browser (once), press
+   **Start** (the sink; a capture needs it) and **Approve** the pairing the app shows. If no prompt
+   comes within a few seconds, press *Reload* on the extension's card or *pair now* in its popup. Then
+   **Capture** a tab with a video, and **Mux** the capture and open the result in the app. No command
+   line is needed from here on.
 
-**SmartScreen.** The programs and scripts are unsigned, so Windows may stop a file that came from the
-internet ("Windows protected your PC": *More info*, then *Run anyway*), or refuse the script under
-a strict execution policy (hence `-ExecutionPolicy Bypass`; `Get-ChildItem -Recurse | Unblock-File`
-in the unpacked folder removes the mark). The checksum above is how you know the zip is the
-release's; it is no signature. Uninstall: *Settings > Apps > streamtap*, or the `uninstall.ps1`
-the install put in `%LOCALAPPDATA%\streamtap` (your settings and captures stay; `-RemoveData`
-also removes settings, token and pairings). Details: [desktop/README.md](desktop/README.md#install).
+**SmartScreen.** The programs and scripts are unsigned, so Windows may stop the first start of a file
+that came from the internet ("Windows protected your PC": *More info*, then *Run anyway*; hence the
+unblock in step 1). `-ExecutionPolicy Bypass` runs the scripts under a strict execution policy. The
+checksum above is how you know the zip is the release's; it is no signature.
+
+**Update and uninstall.** Update: close the app, run the new zip's `install.ps1`, then press *Reload* on
+the extension's card at `chrome://extensions`. Uninstall: *Settings > Apps > streamtap*, or the
+`uninstall.ps1` the install put in `%LOCALAPPDATA%\streamtap` (your settings and captures stay;
+`-RemoveData` also removes settings, token and pairings); then remove the extension's card at
+`chrome://extensions`, which stays in the browser. Details: [desktop/README.md](desktop/README.md#install).
+
+**Not yet published.** The release and rolling workflows have not run yet: until the first `v*` tag and the
+first green `main` after `rolling.yml` was added, there is no release and no `latest` pre-release to download.
+The scripts are tested against stand-in programs in temp folders (`scripts/test-install.ps1`,
+`scripts/test-release.ps1`), not yet with a real release.
 
 A release is cut by pushing a `v*` tag whose version is the one in
 `desktop/crates/streamtap-app/Cargo.toml`; the workflow only makes a **draft**, which is published by hand.

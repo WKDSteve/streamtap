@@ -132,6 +132,19 @@ function Get-RunningFrom([string] $Dir) {
             Where-Object { $_.Path -and (Test-Under $_.Path $Dir) })
 }
 
+# Whether $Dir holds a streamtap install: a program of ours (also a .new/.old left by a cut short
+# install), in bin\ or in the older layout beside it, or the VERSION and uninstall.ps1 of a release.
+function Test-Installation([string] $Dir) {
+    foreach ($name in $programs) {
+        foreach ($rel in "bin\$name.exe", "$name.exe") {
+            foreach ($suffix in '', '.new', '.old') {
+                if (Test-Path -LiteralPath (Join-Path $Dir "$rel$suffix") -PathType Leaf) { return $true }
+            }
+        }
+    }
+    return (Test-Path -LiteralPath (Join-Path $Dir 'uninstall.ps1') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $Dir 'VERSION') -PathType Leaf)
+}
+
 if ($env:CLAUDECODE) {
     Exit-Install 'install in a normal terminal, not in a Claude session (the app redirects AppData and the registry)'
 }
@@ -174,6 +187,13 @@ $running = @(Get-RunningFrom $InstallDir)
 if ($running) {
     $names = ($running | ForEach-Object { "$($_.Name) (PID $($_.Id))" }) -join ', '
     Exit-Install "running from ${InstallDir}: $names; close the app (it stops its sink), then run this again"
+}
+
+# The install folder is new, empty or an earlier install of this program: files of somebody else's (an
+# `extension` folder of a checkout, a README.md) are neither replaced nor swept away.
+if ((Test-Path -LiteralPath $InstallDir -PathType Container) -and -not (Test-Installation $InstallDir) -and
+    (Get-ChildItem -LiteralPath $InstallDir -Recurse -File -Force | Select-Object -First 1)) {
+    Exit-Install "$InstallDir holds files but no streamtap install: nothing was installed; use an empty folder (-InstallDir) or none"
 }
 
 # Everything in the payload but this script goes, with its place relative to the install folder.
