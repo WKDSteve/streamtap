@@ -124,6 +124,8 @@ const linkKeep = (link, sb, chunks) => {
   const old = blobsSize(link.inits.get(sb));
   let size = blobsSize(chunks);
   if (link.gone || size > SINK_MAX_INIT_BYTES) {
+    // Too large to replay: the next socket says so, like for an evicted one.
+    if (!link.gone && chunks) link.evicted.add(sb);
     chunks = null;
     size = 0;
   }

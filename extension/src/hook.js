@@ -393,6 +393,27 @@
 
   const initEnd = (u8, kind) => (kind === "webm" ? webmInitEnd(u8) : mp4InitEnd(u8));
 
+  // Whether media bytes hold samples: a moof or mdat at the top level, also
+  // when it is cut off (MP4); not only boxes in front of them (styp, sidx,
+  // emsg, prft). Other kinds always count as samples.
+  const hasSamples = (u8, kind) => {
+    if (kind !== "mp4") return true;
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    let off = 0;
+    while (off + 8 <= u8.byteLength) {
+      const type = ascii(u8, off + 4);
+      if (type === "moof" || type === "mdat") return true;
+      let size = dv.getUint32(off);
+      if (size === 1) {
+        if (off + 16 > u8.byteLength) return false;
+        size = Number(dv.getBigUint64(off + 8));
+      }
+      if (size < 8) return false;
+      off += size;
+    }
+    return false;
+  };
+
   // An open init that holds only its head (MP4: no moov yet, it would not be
   // open otherwise; WebM: exactly the EBML header) continues with an append
   // that starts with the missing part (moov; Segment), not a new init.
@@ -617,11 +638,15 @@
     } catch (e) {
       tso = null;
     }
-    // The player set timestampOffset since the last append with media: in
-    // sequence mode the browser starts this media at that offset. An init
-    // appended on its own in between does not use it up; an init+media
-    // append (initLen) does, its media starts there.
-    const media = (!isInit || initLen !== null) && !initCont;
+    // The player set timestampOffset since the last append with samples: in
+    // sequence mode the browser starts those samples at that offset. An init
+    // appended on its own in between does not use it up, nor do boxes in
+    // front of the samples appended on their own (an init+styp chunk); an
+    // init+media append (initLen) with samples does.
+    const media =
+      (!isInit || initLen !== null) &&
+      !initCont &&
+      hasSamples(initLen !== null ? u8.subarray(initLen) : u8, kind);
     const tsoSet = media && !!info.tsoSet;
     if (media) info.tsoSet = false;
 

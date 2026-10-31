@@ -77,10 +77,15 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   it): an init+index range of a single-file stream (`ftyp moov sidx`) stays
   one init. The init is
   decided right there, so the media part never counts as its continuation
-  (also without a `tfdt`). A media part without samples (the append ended
-  after its `styp`; at most 64 KiB) is not a row of its own: it goes in
-  front of the next media append of that SourceBuffer, which also takes the
-  append's `tsoSet`; an init in between drops it.
+  (also without a `tfdt`). Boxes in front of the samples appended without
+  them (a media part that ends after its `styp`, or an append of complete
+  `styp`/`sidx`/`ssix`/`emsg`/`prft` boxes only; at most 64 KiB, and not
+  while an init is still incomplete) are not a row of their own: they go in
+  front of the next media append of that SourceBuffer, which also takes
+  their append's `tsoSet`. Only the append right after them (`seq` + 1)
+  takes them; an init or a missing append in between drops them, and next
+  to samples that already fill a message (64 MiB) their bytes are left
+  out.
 - An init is decided once it is complete: its chunks (an init split across
   appends: chunks the extension flags `initCont`, or untimed chunks while the
   init has no complete `moov` / `Tracks` yet) are held, up to 4 MiB with
@@ -224,7 +229,7 @@ Headers:
 | `type` | fields | payload |
 |---|---|---|
 | `hello` | `token`, `session`, `url`, `title` | none; must be the first message |
-| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append that carried media; an init-only append does not use it up) | the segment bytes exactly as passed to `appendBuffer` |
+| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append that carried samples; an init, or boxes in front of samples, appended without samples do not use it up) | the segment bytes exactly as passed to `appendBuffer` |
 | `event` | `name` (`endofstream`, `changetype`, `initlost`), `sb` | none |
 ## Test without a browser
 

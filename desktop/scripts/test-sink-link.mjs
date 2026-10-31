@@ -300,11 +300,15 @@ const half = Math.ceil(segments.length / 2);
     const ad = mk(302, 9);
     for (let i = 0; i < 80; i++) linkKeep(ad, i, bytes(1024 * 1024));
     const sameTab = player.inits.has(1) && player.evicted.size === 0;
+    // An init too large to keep cannot be replayed either: marked.
+    linkKeep(player, 2, bytes(1024 * 1024 + 1));
+    const tooLarge = !player.inits.has(2) && player.evicted.has(2);
     const total = sinkKeptTotal;
     for (const l of [victim, page, player, ad]) for (const sb of [...l.inits.keys()]) linkKeep(l, sb, null);
     for (const t of [300, 301, 302]) sinkLinks.delete(t);
-    return { crossTab, sameTab, total, after: sinkKeptTotal };
+    return { crossTab, sameTab, tooLarge, total, after: sinkKeptTotal };
   })()`);
+  check(r.tooLarge, "kept inits: an init too large to keep is marked for initlost");
   check(r.crossTab, "kept inits: a page filling the budget loses its own inits, not another tab's");
   check(r.sameTab, "kept inits: an ad frame filling the budget loses its own, not the player frame's");
   check(r.total <= 64 * 1024 * 1024 && r.after === 0, `kept inits: budget held and released (${r.total}, ${r.after})`);

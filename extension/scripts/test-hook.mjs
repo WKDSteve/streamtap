@@ -315,6 +315,15 @@ const sb12b = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
 const ini12b = init("avc1");
 sb12b.appendBuffer(ab(Buffer.concat([ini12b, box("styp", Buffer.from("msdh"))])));
 check(last().initLen === ini12b.length, "a lone styp after the moov still ends the init");
+// A set offset belongs to the samples: neither that init+styp chunk nor a
+// styp appended on its own uses it up.
+sb12b.timestampOffset = 4;
+sb12b.appendBuffer(ab(Buffer.concat([init("avc1"), box("styp", Buffer.from("msdh"))])));
+check(last().tsoSet === false, "an init+styp chunk without samples keeps the set offset");
+sb12b.appendBuffer(ab(box("styp", Buffer.from("msdh"))));
+check(last().tsoSet === false, "so does a styp on its own");
+sb12b.appendBuffer(ab(media(0)));
+check(last().tsoSet === true, "the samples after them carry it");
 
 // The head of a new split init does not carry the previous init's timescale.
 sb8.appendBuffer(ab(clear8.subarray(0, 20)));

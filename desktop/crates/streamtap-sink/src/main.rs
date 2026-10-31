@@ -10,6 +10,7 @@
 //!   u32 little-endian header length | JSON header | payload bytes
 //! The first message of a connection is a `hello` header carrying the token.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
@@ -309,9 +310,8 @@ struct TrackState {
     /// The last timed chunk was a duplicate: the untimed chunks that follow
     /// it (its continuation) are duplicates too.
     skip_tail: bool,
-    /// Segment boxes without samples that ended an init+media append, and
-    /// whether that append came after a set offset (`has_samples`).
-    segment_head: Option<(Vec<u8>, bool)>,
+    /// Boxes in front of the samples appended without them.
+    segment_head: Option<SegmentHead>,
     /// The current init segment is encrypted (EME/DRM): nothing is written
     /// until a clear init segment arrives.
     refused: bool,
@@ -497,6 +497,27 @@ fn has_samples(kind: &str, media: &[u8]) -> bool {
 
 /// Segment boxes without samples held for the next media append (bytes).
 const MAX_SEGMENT_HEAD: usize = 64 * 1024;
+/// Boxes that go in front of a segment's samples.
+const HEAD_BOXES: [&[u8; 4]; 5] = [b"styp", b"sidx", b"ssix", b"emsg", b"prft"];
+
+/// A media append made only of complete boxes that go in front of samples
+/// (a `styp` appended on its own).
+fn is_segment_head(payload: &[u8]) -> bool {
+    let boxes = boxes_in(payload, 0, payload.len());
+    boxes
+        .last()
+        .is_some_and(|(_, _, end)| *end == payload.len())
+        && boxes.iter().all(|(k, _, _)| HEAD_BOXES.contains(&k))
+}
+
+/// Boxes in front of the samples appended without them, held for the next
+/// media append of the `SourceBuffer` (`Session::join_segment_head`).
+struct SegmentHead {
+    bytes: Vec<u8>,
+    /// The append came after a set offset (older extensions flag it there).
+    tso_set: bool,
+    seq: u64,
+}
 
 /// The init bytes so far hold a complete `moov` (MP4) or `Tracks` (`WebM`):
 /// nothing more of this init is to come.
@@ -1222,12 +1243,8 @@ impl Session {
         // media part (a moof without tfdt) is not taken for its continuation.
         self.flush_init(h.sb)?;
         // Only the boxes in front of the samples (the append ended after its
-        // styp): they go with the next media append, which also takes the set
-        // offset, instead of a row of their own without samples or tfdt.
-        if !has_samples(&h.kind, media) && media.len() <= MAX_SEGMENT_HEAD {
-            if let Some(track) = self.tracks.get_mut(&h.sb) {
-                track.segment_head = Some((media.to_vec(), h.tso_set));
-            }
+        // styp): held for the next media append.
+        if !has_samples(&h.kind, media) && self.hold_segment_head(h, media) {
             return Ok(());
         }
         let mut hm = h.clone();
@@ -1236,21 +1253,47 @@ impl Session {
         self.write_segment(&hm, media)
     }
 
-    /// The held segment head (`write_init_and_media`) in front of this media
-    /// append, which also takes its set offset; an init in between drops it.
-    fn join_segment_head(
+    /// Holds boxes that go in front of samples (`SegmentHead`) instead of
+    /// writing a row of their own without samples or tfdt, which would end
+    /// the sequence-mode group. Not when too large, or while an init is
+    /// still incomplete (then they are its continuation).
+    fn hold_segment_head(&mut self, h: &SegmentHeader, bytes: &[u8]) -> bool {
+        let Some(track) = self.tracks.get_mut(&h.sb) else {
+            return false;
+        };
+        if bytes.len() > MAX_SEGMENT_HEAD || (!track.pending.is_empty() && !track.pending_done) {
+            return false;
+        }
+        track.segment_head = Some(SegmentHead {
+            bytes: bytes.to_vec(),
+            tso_set: h.tso_set,
+            seq: h.seq,
+        });
+        true
+    }
+
+    /// The held segment head in front of this media append, which also takes
+    /// its set offset. Only for the append right after it: an init, or an
+    /// append in between that did not arrive, drops it. A row stays within
+    /// one message: past that the head's bytes are left out, not the
+    /// samples.
+    fn join_segment_head<'a>(
         &mut self,
         h: &SegmentHeader,
-        payload: &[u8],
-    ) -> Option<(SegmentHeader, Vec<u8>)> {
-        let (mut joined, tso_set) = self.tracks.get_mut(&h.sb)?.segment_head.take()?;
-        if h.is_init || h.init_cont {
+        payload: &'a [u8],
+    ) -> Option<(SegmentHeader, Cow<'a, [u8]>)> {
+        let head = self.tracks.get_mut(&h.sb)?.segment_head.take()?;
+        if h.is_init || h.init_cont || h.seq != head.seq.wrapping_add(1) {
             return None;
         }
-        joined.extend_from_slice(payload);
         let mut hj = h.clone();
-        hj.tso_set |= tso_set;
-        Some((hj, joined))
+        hj.tso_set |= head.tso_set;
+        if head.bytes.len() + payload.len() > MAX_MESSAGE {
+            return Some((hj, Cow::Borrowed(payload)));
+        }
+        let mut joined = head.bytes;
+        joined.extend_from_slice(payload);
+        Some((hj, Cow::Owned(joined)))
     }
 
     fn write_segment(&mut self, h: &SegmentHeader, payload: &[u8]) -> io::Result<()> {
@@ -1266,6 +1309,13 @@ impl Session {
         }
         if let Some((hj, joined)) = self.join_segment_head(h, payload) {
             return self.write_segment(&hj, &joined);
+        }
+        if !h.is_init
+            && !h.init_cont
+            && is_segment_head(payload)
+            && self.hold_segment_head(h, payload)
+        {
+            return Ok(());
         }
         let dir = self.dir.clone();
         if !self.ensure_track(h.sb)? {
@@ -2168,7 +2218,7 @@ fn write_sorted(
         },
         sorted.display()
     );
-    Ok((sorted, first_moved.unwrap_or(true)))
+    Ok((sorted, first_moved.unwrap_or(false)))
 }
 
 fn run_mux(args: &[String], tools: &Tools) -> Result<(), SinkError> {
@@ -3643,6 +3693,7 @@ mod tests {
         write(&mut s, &h, &first);
         let mut m = seg(1, false, Some(0), Some(4.0));
         m.seq_mode = true;
+        m.seq = h.seq + 1;
         write(&mut s, &m, &moof(0));
         let rows = index_rows(&s.dir);
         assert_eq!(rows.len(), 2, "init and one media row: {rows:?}");
@@ -3651,6 +3702,86 @@ mod tests {
         want.extend_from_slice(&styp);
         want.extend(moof(0));
         assert_eq!(fs::read(s.dir.join("sb1.p0.bin")).expect("part"), want);
+    }
+
+    /// A styp appended on its own (no samples, no tfdt) is held the same way:
+    /// no row that would end the sequence-mode group.
+    #[test]
+    fn a_styp_on_its_own_goes_with_the_next_append() {
+        let mut s = session("stypalone");
+        let init = init_with_traks(1);
+        write(&mut s, &seg(1, true, None, None), &init);
+        let styp = mp4_box(*b"styp", b"msdh");
+        let mut h = seg(1, false, None, Some(4.0));
+        h.seq = 2;
+        h.seq_mode = true;
+        write(&mut s, &h, &styp);
+        let mut m = seg(1, false, Some(0), Some(4.0));
+        m.seq = 3;
+        m.seq_mode = true;
+        write(&mut s, &m, &moof(0));
+        let rows = index_rows(&s.dir);
+        assert_eq!(rows.len(), 2, "init and one media row: {rows:?}");
+        assert_eq!(rows[1]["len"], styp.len() + moof(0).len());
+    }
+
+    /// The head goes only to the append right after it: when that one did
+    /// not arrive, a later one neither gets its bytes nor its set offset.
+    #[test]
+    fn a_held_head_is_dropped_when_the_next_append_is_missing() {
+        let mut s = session("stypgap");
+        let mut first = init_with_traks(1);
+        first.extend(mp4_box(*b"styp", b"msdh"));
+        let mut h = seg(1, true, None, Some(4.0));
+        h.seq_mode = true;
+        h.tso_set = true;
+        write(&mut s, &h, &first);
+        let mut m = seg(1, false, Some(1000), Some(-0.08));
+        m.seq_mode = true;
+        m.seq = h.seq + 2;
+        write(&mut s, &m, &moof(1000));
+        let rows = index_rows(&s.dir);
+        assert_eq!(rows[1]["tso_set"], false, "{rows:?}");
+        assert_eq!(rows[1]["len"], moof(1000).len());
+    }
+
+    /// A row stays within one message: next to samples that fill it, the
+    /// held head's bytes are left out (its set offset still counts).
+    #[test]
+    fn a_held_head_never_makes_a_row_too_large() {
+        let mut s = session("stypbig");
+        let mut first = init_with_traks(1);
+        first.extend(mp4_box(*b"styp", b"msdh"));
+        let mut h = seg(1, true, None, None);
+        h.tso_set = true;
+        write(&mut s, &h, &first);
+        let mut m = seg(1, false, Some(0), None);
+        m.seq = h.seq + 1;
+        let big = vec![0u8; MAX_MESSAGE];
+        let (hj, joined) = s.join_segment_head(&m, &big).expect("joined");
+        assert_eq!(joined.len(), MAX_MESSAGE);
+        assert!(hj.tso_set);
+    }
+
+    /// A part where no media row has a tfdt (every append cut inside its
+    /// moof) moves no bytes, so it does not carry the lift.
+    #[test]
+    fn an_all_untimed_part_does_not_carry_the_lift() {
+        let dir = temp_dir("liftallcut");
+        let init = init_with_traks(1);
+        let rows = write_part(
+            &dir,
+            &[
+                (&init, true, None, None),
+                (b"piece", false, None, None),
+                (b"other", false, None, None),
+            ],
+        );
+        let refs: Vec<&IndexRow> = rows.iter().collect();
+        let lifted = ordered_part(&dir, 1, 0, &refs, Some(&SeqMoves::new()), 1_000_000_000)
+            .expect("ordered")
+            .3;
+        assert!(!lifted, "nothing moved");
     }
 
     /// The lift is in the bytes when the first segment with a tfdt moved; a
