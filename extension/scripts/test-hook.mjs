@@ -213,6 +213,57 @@ const sbw4 = ms.addSourceBuffer('video/webm; codecs="vp9"');
 sbw4.appendBuffer(ab(clearWebm));
 check(last().encrypted === false && last().timescale === 1000, "clear WebM init: tapped, TimecodeScale read (1 ms -> 1000/s)");
 
+// WebM init split at an element boundary: the second append starts with Tracks.
+const tracksAt = webmInit.indexOf(Buffer.from([0x16, 0x54, 0xae, 0x6b]));
+const sbw5 = ms.addSourceBuffer('video/webm; codecs="vp9"');
+sbw5.appendBuffer(ab(webmInit.subarray(0, tracksAt)));
+sbw5.appendBuffer(ab(webmInit.subarray(tracksAt)));
+check(last().initCont === true && last().encrypted === true, "WebM split before Tracks: continuation, encryption read");
+
+// TimecodeScale 500 us survives a later Cluster-only append.
+const ts500 = Buffer.concat([
+  ebml(0x1a45dfa3, Buffer.from([0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d])),
+  ebml(0x1549a966, ebml(0x2ad7b1, Buffer.from([0x07, 0xa1, 0x20]))), // 500,000 ns
+  ebml(0x1654ae6b, ebml(0xae, Buffer.from([0x86, 0x82, 0x56, 0x39]))),
+]);
+const sbw6 = ms.addSourceBuffer('video/webm; codecs="vp9"');
+sbw6.appendBuffer(ab(ts500));
+sbw6.appendBuffer(ab(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x84, 0xe7, 0x82, 0x07, 0xd0])));
+check(last().timescale === 2000 && last().startSec === 1, "WebM TimecodeScale kept for Cluster appends (2000 ticks = 1 s)");
+
+// Split inside ftyp: the first chunk has not even a complete box.
+const sb6 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const enc6 = init("encv");
+sb6.appendBuffer(ab(enc6.subarray(0, 6)));
+check(last().encrypted === false, "6 bytes cannot be told apart yet; they are held");
+sb6.appendBuffer(ab(enc6.subarray(6)));
+check(last().initCont === true && last().encrypted === true, "init split inside the ftyp header: the rest is caught");
+const sb6b = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+sb6b.appendBuffer(ab(enc6.subarray(0, 10)));
+check(last().isInit === true, "a cut-off ftyp box still starts an init");
+sb6b.appendBuffer(ab(enc6.subarray(10)));
+check(last().initCont === true && last().encrypted === true, "init split inside the ftyp body: the rest is caught");
+
+// After a complete init, a media chunk without box header that contains "encv" is not DRM.
+const sb7 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+sb7.appendBuffer(ab(init("avc1")));
+sb7.appendBuffer(ab(Buffer.from("xxxxencvxxxxxxxxxxxx")));
+check(last().encrypted === false && last().initCont === false, "media bytes after a complete init are never scanned as init");
+
+// A split clear init: its timescale is read once it is complete.
+const sb8 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const clear8 = init("avc1");
+sb8.appendBuffer(ab(clear8.subarray(0, 20)));
+sb8.appendBuffer(ab(clear8.subarray(20)));
+sb8.appendBuffer(ab(media(90000)));
+check(last().timescale === 90000 && last().startSec === 1, "a split init still gives the timescale");
+
+// A combined init + media append reports where the init ends.
+const sb9 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const ini9 = init("avc1");
+sb9.appendBuffer(ab(Buffer.concat([ini9, media(0)])));
+check(last().isInit === true && last().initLen === ini9.length, "initLen marks the init part of an init+media append");
+
 // The MediaSource closing is reported for the content script.
 ms.handlers.sourceclose();
 check(posted.some((p) => p.data.type === "msclose"), "sourceclose posts msclose");

@@ -87,6 +87,7 @@
     if (m.timescale != null && !isId(m.timescale)) return null;
     if (m.dur != null && !isU64(m.dur)) return null;
     if (m.tso != null && !isNum(m.tso)) return null;
+    if (m.initLen != null && !(isU64(m.initLen) && m.initLen > 0)) return null;
     return {
       sb: m.sbId,
       seq: m.seq,
@@ -94,6 +95,8 @@
       mime: str(m.mime, 256),
       isInit: m.isInit === true,
       initCont: m.initCont === true && m.isInit !== true,
+      // The init part of an init+media append (for keeping only the init).
+      initLen: m.isInit === true && m.initLen != null ? m.initLen : null,
       kind: str(m.kind, 16),
       tfdt: m.tfdt ?? null,
       timescale: m.timescale ?? null,
@@ -224,15 +227,27 @@
     }
     if (!header.isInit) return;
     link.inits.delete(header.sb);
-    if (payload.byteLength > MAX_INIT_BYTES) return;
-    link.inits.set(header.sb, [{ header, payload }]);
+    // An init+media append (video.js VHS) keeps only its init part.
+    let init = { header, payload };
+    if (header.initLen && header.initLen < payload.byteLength) {
+      init = {
+        header: { ...header, tfdt: null, dur: null, initLen: null },
+        payload: payload.slice(0, header.initLen),
+      };
+    }
+    if (init.payload.byteLength > MAX_INIT_BYTES) return;
+    link.inits.set(header.sb, [init]);
     while (link.inits.size > MAX_KEPT_INITS) link.inits.delete(link.inits.keys().next().value);
   };
 
   const sendSegment = (header, payload) => {
     const size = payload.byteLength;
     const link = linkFor(header.ms);
-    if (!link || link.closed || stats.dead || stats.queuedBytes + size > MAX_QUEUED_BYTES) {
+    // A full queue drops media, not small init bytes: media after a lost init
+    // would be filed under the previous one.
+    const smallInit = (header.isInit || header.initCont) && size <= MAX_INIT_BYTES;
+    const full = stats.queuedBytes + size > (smallInit ? 2 * MAX_QUEUED_BYTES : MAX_QUEUED_BYTES);
+    if (!link || link.closed || stats.dead || full) {
       stats.dropped++;
       return;
     }

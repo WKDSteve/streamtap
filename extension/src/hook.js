@@ -216,7 +216,7 @@
   };
 
   const parseWebm = (u8) => {
-    const out = { boxes: [], isInit: false, tfdt: null, timescale: 1000, samples: 0, duration: 0, encrypted: false };
+    const out = { boxes: [], isInit: false, tfdt: null, timescale: null, samples: 0, duration: 0, encrypted: false };
     let off = 0;
     while (off < u8.byteLength) {
       const id = readVint(u8, off, true);
@@ -312,24 +312,103 @@
     return "unknown";
   };
 
-  // Scans one chunk of a still-open init for protection markers; `state`
-  // carries the last 3 bytes over chunk borders and the WebM pair halves.
-  const INIT_SCAN_MAX = 4 * 1024 * 1024;
-  const initScan = (state, u8) => {
-    if (state.found) return;
-    const n = Math.min(u8.byteLength, INIT_SCAN_MAX);
-    const joined = new Uint8Array(state.tail.byteLength + n);
-    joined.set(state.tail, 0);
-    joined.set(u8.subarray(0, n), state.tail.byteLength);
-    if (hasAnyFourcc(joined, 0, joined.byteLength, ENCRYPTION_FOURCCS)) state.found = true;
-    // A split WebM init cannot be walked as structure: all three element IDs
-    // (ContentEncodings 0x6D80, ContentEncryption 0x5035, ContentEncKeyID
-    // 0x47E2) must appear, which clear data practically never has.
-    state.webmA = state.webmA || hasPair(joined, 0, joined.byteLength, 0x6d, 0x80);
-    state.webmB = state.webmB || hasPair(joined, 0, joined.byteLength, 0x50, 0x35);
-    state.webmC = state.webmC || hasPair(joined, 0, joined.byteLength, 0x47, 0xe2);
-    if (state.webmA && state.webmB && state.webmC) state.found = true;
-    state.tail = joined.slice(Math.max(0, joined.byteLength - 3));
+  // ---------------------------------------------------------------------------
+  // Init assembly: an init segment may arrive in several appends
+  // ---------------------------------------------------------------------------
+
+  const INIT_MAX = 4 * 1024 * 1024;
+  const EBML_ID = 0x1a45dfa3;
+  const SEGMENT_ID = 0x18538067;
+  const CLUSTER_ID = 0x1f43b675;
+
+  // Does this append start an init segment? MP4: a first box ftyp or moov
+  // (also when the box itself is cut off); WebM: an EBML header or Segment.
+  const startsInit = (u8, kind) => {
+    if (kind === "mp4") return u8.byteLength >= 8 && ["ftyp", "moov"].includes(ascii(u8, 4));
+    if (kind === "webm") {
+      const id = ((u8[0] << 24) | (u8[1] << 16) | (u8[2] << 8) | u8[3]) >>> 0;
+      return id === EBML_ID || id === SEGMENT_ID;
+    }
+    return false;
+  };
+
+  // Where the init part of these bytes ends and whether it is still open:
+  // { end, open }. end is the offset of the first media (moof/mdat, Cluster),
+  // or the length; open means the last box/element runs past the bytes.
+  // An init is complete only with its moov (MP4) or Tracks (WebM): bytes that
+  // end right after ftyp or Info are still an open init.
+  const mp4InitEnd = (u8) => {
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    let off = 0;
+    let sawMoov = false;
+    while (off + 8 <= u8.byteLength) {
+      let size = dv.getUint32(off);
+      const type = ascii(u8, off + 4);
+      let header = 8;
+      if (size === 1) {
+        if (off + 16 > u8.byteLength) return { end: u8.byteLength, open: true };
+        size = Number(dv.getBigUint64(off + 8));
+        header = 16;
+      } else if (size === 0) {
+        size = u8.byteLength - off;
+      }
+      if (type === "moof" || type === "mdat") return { end: off, open: false };
+      if (size < header) return { end: off, open: false };
+      if (off + size > u8.byteLength) return { end: u8.byteLength, open: true };
+      if (type === "moov") sawMoov = true;
+      off += size;
+    }
+    return { end: u8.byteLength, open: off < u8.byteLength || !sawMoov };
+  };
+
+  const webmInitEnd = (u8) => {
+    let off = 0;
+    let sawTracks = false;
+    while (off < u8.byteLength) {
+      const id = readVint(u8, off, true);
+      if (!id || off + id.len > u8.byteLength) return { end: u8.byteLength, open: true };
+      const size = readVint(u8, off + id.len, false);
+      if (!size || off + id.len + size.len > u8.byteLength) return { end: u8.byteLength, open: true };
+      if (id.value === CLUSTER_ID) return { end: off, open: false };
+      const bodyStart = off + id.len + size.len;
+      const unknown = size.value === Math.pow(2, 7 * size.len) - 1;
+      if (id.value === SEGMENT_ID || unknown) {
+        off = bodyStart; // descend: Info, Tracks ... then the first Cluster
+        continue;
+      }
+      if (bodyStart + size.value > u8.byteLength) return { end: u8.byteLength, open: true };
+      if (id.value === 0x1654ae6b) sawTracks = true;
+      off = bodyStart + size.value;
+    }
+    return { end: u8.byteLength, open: !sawTracks };
+  };
+
+  const initEnd = (u8, kind) => (kind === "webm" ? webmInitEnd(u8) : mp4InitEnd(u8));
+
+  // Protection markers in init bytes that cannot be parsed yet (still open).
+  // MP4: the ISO fourccs. WebM: all three element IDs (ContentEncodings
+  // 0x6D80, ContentEncryption 0x5035, ContentEncKeyID 0x47E2), which clear
+  // init bytes practically never hold together. Only init bytes are scanned,
+  // never media.
+  const openInitEncrypted = (u8, kind) =>
+    kind === "webm"
+      ? hasPair(u8, 0, u8.byteLength, 0x6d, 0x80) &&
+        hasPair(u8, 0, u8.byteLength, 0x50, 0x35) &&
+        hasPair(u8, 0, u8.byteLength, 0x47, 0xe2)
+      : hasAnyFourcc(u8, 0, u8.byteLength, ENCRYPTION_FOURCCS);
+
+  // A complete init: protection and timescale from its structure.
+  const finishInit = (info, initBytes, kind) => {
+    const p = kind === "webm" ? parseWebm(initBytes) : parseIsoBmff(initBytes);
+    if (p.encrypted) info.encrypted = true;
+    if (p.timescale) info.timescale = p.timescale;
+  };
+
+  const concat = (a, b) => {
+    const out = new Uint8Array(a.byteLength + b.byteLength);
+    out.set(a, 0);
+    out.set(b, a.byteLength);
+    return out;
   };
 
   const toU8 = (data) => {
@@ -438,27 +517,59 @@
     const parsed = kind === "mp4" ? parseIsoBmff(u8) : kind === "webm" ? parseWebm(u8) : null;
     if (parsed && parsed.timescale) info.timescale = parsed.timescale;
 
-    // DRM: protection markers mark the SourceBuffer as protected for good; its
-    // bytes are never copied (streamtap detects DRM and leaves it alone).
-    // - parsed markers: pssh, senc, encv/enca/tenc inside a complete moov;
-    // - an init that is still open: from an init append without media (no
-    //   moof/mdat/Cluster) until media arrives, every append is the init's
-    //   continuation (an init split anywhere, even inside a box header). Each
-    //   one is scanned whole, across chunk borders (the last 3 bytes carry
-    //   over), for the ISO fourccs and the WebM ContentEncryption pair.
+    // DRM: protection marks the SourceBuffer as protected for good; its bytes
+    // are never copied (streamtap detects DRM and leaves it alone).
+    // - media: pssh / senc in a moof (parsed);
+    // - init: read from its structure once complete (encv/enca/tenc/pssh in
+    //   the moov, ContentEncryption in WebM Tracks). An init split across
+    //   appends, anywhere (even inside a box header), is assembled: from an
+    //   append that starts an init until the init's end, appends that do not
+    //   start a new init are its continuation (initCont). While it is still
+    //   open, its bytes (init bytes only) are scanned for the markers.
     let encryptedHere = !!(parsed && parsed.encrypted);
-    const hasMedia = !!(parsed && parsed.media);
     let initCont = false;
-    if (parsed && parsed.isInit && !hasMedia) {
-      info.initOpen = { tail: new Uint8Array(0), webmA: false, webmB: false, webmC: false };
-      if (!parsed.moovComplete || kind === "webm") initScan(info.initOpen, u8);
-    } else if (info.initOpen && !hasMedia && !(parsed && parsed.isInit)) {
+    let isInit = false;
+    let initLen = null; // set when init and media share this append
+    if (startsInit(u8, kind)) {
+      isInit = true;
+      const r = initEnd(u8, kind);
+      if (r.open && r.end === u8.byteLength) {
+        info.initBuf = u8.byteLength <= INIT_MAX ? { kind, bytes: u8.slice() } : null;
+        if (openInitEncrypted(u8, kind)) encryptedHere = true;
+      } else {
+        info.initBuf = null;
+        finishInit(info, u8.subarray(0, r.end), kind);
+        if (r.end < u8.byteLength) initLen = r.end;
+      }
+    } else if (info.initBuf && info.initBuf.kind === null) {
+      // Fewer than 8 bytes came first: only now can they be told apart.
+      const joined = concat(info.initBuf.bytes, u8);
+      const k = sniff(joined);
+      info.initBuf = null;
+      if (startsInit(joined, k)) {
+        initCont = true;
+        const r = initEnd(joined, k);
+        if (r.open && r.end === joined.byteLength && joined.byteLength <= INIT_MAX) {
+          info.initBuf = { kind: k, bytes: joined };
+          if (openInitEncrypted(joined, k)) encryptedHere = true;
+        } else {
+          finishInit(info, joined.subarray(0, r.end), k);
+        }
+      }
+    } else if (!info.initBuf && kind === "unknown" && u8.byteLength < 8) {
+      info.initBuf = { kind: null, bytes: u8.slice() };
+    } else if (info.initBuf) {
       initCont = true;
-      initScan(info.initOpen, u8);
-    } else if (hasMedia) {
-      info.initOpen = null;
+      const joined = concat(info.initBuf.bytes, u8);
+      const r = initEnd(joined, info.initBuf.kind);
+      if (r.open && r.end === joined.byteLength && joined.byteLength <= INIT_MAX) {
+        info.initBuf.bytes = joined;
+        if (openInitEncrypted(joined, info.initBuf.kind)) encryptedHere = true;
+      } else {
+        finishInit(info, joined.subarray(0, r.end), info.initBuf.kind);
+        info.initBuf = null;
+      }
     }
-    if (info.initOpen && info.initOpen.found) encryptedHere = true;
     if (encryptedHere) info.encrypted = true;
     if (info.encrypted && !info.encryptedReported) {
       info.encryptedReported = true;
@@ -476,7 +587,9 @@
       tso = null;
     }
 
-    const ts = info.timescale;
+    // WebM Cluster timecodes count in the init's TimecodeScale (1 ms when the
+    // init did not say otherwise).
+    const ts = info.timescale ?? (kind === "webm" ? 1000 : null);
     const tfdtNum = parsed && parsed.tfdt !== null ? Number(parsed.tfdt) : null;
     const rec = {
       sbId: info.id,
@@ -486,8 +599,9 @@
       api,
       bytes: u8.byteLength,
       kind,
-      isInit: parsed ? parsed.isInit : false,
+      isInit,
       initCont,
+      initLen,
       boxes: parsed ? parsed.boxes : [],
       tfdt: parsed ? parsed.tfdt : null,
       timescale: ts,

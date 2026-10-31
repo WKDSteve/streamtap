@@ -40,6 +40,22 @@ const sinkSegmentHeader = (h) => ({
   seqMode: h.seqMode === true,
 });
 
+// The item for one segment; an init+media append also carries a framed copy
+// of its init part alone, which is what a new socket replays.
+const sinkItem = (header, payload, initLen) => {
+  const item = {
+    blob: sinkFrame(header, payload),
+    sb: header.sb,
+    isInit: header.isInit,
+    initCont: header.initCont,
+    keep: null,
+  };
+  if (header.isInit && Number.isSafeInteger(initLen) && initLen > 0 && initLen < payload.byteLength) {
+    item.keep = sinkFrame({ ...header, tfdt: null, dur: null }, payload.slice(0, initLen));
+  }
+  return item;
+};
+
 // tabId -> Map<portId, link>; read by the popup through "vc-link-status".
 const sinkLinks = new Map();
 let nextPortId = 1;
@@ -67,19 +83,21 @@ const sinkSettings = () =>
 // Continuation chunks of a split init join it. An init too large to keep
 // also drops the old one, so the old quality's init is never replayed in
 // front of the new quality's media.
+// An init+media append keeps only its init part (item.keep).
 const linkConsumed = (link, item) => {
+  const keep = item.keep || item.blob;
   if (item.initCont) {
     const chunks = link.inits.get(item.sb);
     if (!chunks) return;
     const kept = chunks.reduce((n, b) => n + b.size, 0);
-    if (kept + item.blob.size > SINK_MAX_INIT_BYTES) link.inits.delete(item.sb);
-    else chunks.push(item.blob);
+    if (kept + keep.size > SINK_MAX_INIT_BYTES) link.inits.delete(item.sb);
+    else chunks.push(keep);
     return;
   }
   if (!item.isInit) return;
   link.inits.delete(item.sb);
-  if (item.blob.size > SINK_MAX_INIT_BYTES) return;
-  link.inits.set(item.sb, [item.blob]);
+  if (keep.size > SINK_MAX_INIT_BYTES) return;
+  link.inits.set(item.sb, [keep]);
   while (link.inits.size > SINK_MAX_KEPT_INITS) link.inits.delete(link.inits.keys().next().value);
 };
 
@@ -258,7 +276,11 @@ chrome.runtime.onConnect.addListener((port) => {
     let held = 0;
     if (msg.t === "segment") {
       held = typeof msg.payload === "string" ? msg.payload.length : 0;
-      if (sinkBacklog + held > SINK_MAX_BACKLOG) {
+      // Small init bytes may go up to twice the cap: media after a lost init
+      // would be filed under the previous one.
+      const h = msg.header || {};
+      const smallInit = (h.isInit === true || h.initCont === true) && held <= 2 * SINK_MAX_INIT_BYTES;
+      if (sinkBacklog + held > (smallInit ? 2 * SINK_MAX_BACKLOG : SINK_MAX_BACKLOG)) {
         link.dropped++;
         return;
       }
@@ -278,7 +300,11 @@ chrome.runtime.onConnect.addListener((port) => {
         }
         if (!link.hello) return;
         if (msg.t === "segment" && msg.header && typeof msg.header === "object") {
-          if (!linkAdmit(link)) {
+          const admitted = linkAdmit(link);
+          const initBytes = msg.header.isInit === true || msg.header.initCont === true;
+          // A parked link still keeps its init bytes, so it can replay them
+          // once it is admitted; its media is dropped.
+          if (!admitted && !initBytes) {
             link.dropped++;
             return;
           }
@@ -293,12 +319,13 @@ chrome.runtime.onConnect.addListener((port) => {
             return;
           }
           const header = sinkSegmentHeader(msg.header);
-          linkSend(link, {
-            blob: sinkFrame(header, payload),
-            sb: header.sb,
-            isInit: header.isInit,
-            initCont: header.initCont,
-          });
+          const item = sinkItem(header, payload, msg.header.initLen);
+          if (!admitted) {
+            linkConsumed(link, item);
+            link.dropped++;
+            return;
+          }
+          linkSend(link, item);
           return;
         }
         if (msg.t === "event" && msg.header && typeof msg.header === "object") {
