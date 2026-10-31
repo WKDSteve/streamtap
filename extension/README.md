@@ -21,10 +21,10 @@ The concept and the DRM primer live in the nvim-config vault under
 
 | File | Runs where | Purpose |
 |---|---|---|
-| `src/hook.js` | page main world, `document_start`, all frames | Patches `MediaSource`, `SourceBuffer`, `URL.createObjectURL`, `Navigator.requestMediaKeySystemAccess`; parses fMP4 / WebM headers; posts records via `window.postMessage`. |
-| `src/content.js` | isolated world | Forwards the records to the service worker. On the first segment it opens a runtime port `vc-sink` and posts `hello`, then every segment as a `data:` URL (extension messaging is JSON, it cannot carry an `ArrayBuffer`) in append order. At most 64 MiB wait for encoding; beyond that segments are counted as dropped. |
+| `src/hook.js` | page main world, `document_start`, all frames | Patches `MediaSource`, `SourceBuffer`, `URL.createObjectURL`, `Navigator.requestMediaKeySystemAccess`; parses fMP4 / WebM headers; posts records (with `timestampOffset` and MediaSource id) via `window.postMessage`. A SourceBuffer whose init segment declares encryption (`encv`/`enca`/`tenc`/`pssh`, `senc` in media, WebM ContentEncryption) is marked: its bytes are never copied, only metadata goes out, plus one `encrypted` record. Copies only while the content script taps (a sink token is set). |
+| `src/content.js` | isolated world | Forwards the records to the service worker and tells the hook whether to tap. Type-checks every field of a record before it can reach the sink (pages can forge records). On the first segment it opens a runtime port `vc-sink` and posts `hello`, then every segment as a `data:` URL (extension messaging is JSON, it cannot carry an `ArrayBuffer`) in append order. Keeps the last init segment per SourceBuffer and replays it on a new port (restarted service worker). At most 64 MiB wait for encoding; beyond that segments are counted as dropped. |
 | `src/background.js` | service worker | Per-tab registry (in memory), badge with the number of SourceBuffers that received media. Red badge when a DRM key system was requested. Loads `sink-link.js`. |
-| `src/sink-link.js` | service worker | One WebSocket to `ws://127.0.0.1:<port>/` per port: `hello` with the token and the frame URL from the browser (not from the page), then one binary message per segment. Queues at most 64 MiB, only while connecting; when the sink is down segments are dropped and counted, never queued. Answers the popup's link status. |
+| `src/sink-link.js` | service worker | One WebSocket to `ws://127.0.0.1:<port>/` per port: `hello` with the token and the frame URL from the browser (not from the page), then one binary message per segment, header fields whitelisted. Queues at most 64 MiB while connecting and stops sending when 64 MiB are unsent on an open socket (a stalled sink); dropped segments are counted. After a reconnect it sends the kept init segments first, because the sink starts a new capture directory. Answers the popup's link status. |
 | `popup/` | action popup | Shows the registry for the current tab. |
 
 ## Load it (Chrome / Edge / Brave)
@@ -71,8 +71,13 @@ origin; start the sink with `--allow-origin <that origin>` to capture there.
   `t=` values and a stable duration (typically 2–10 s).
 - A seek shows up as a jump in `t=`; `remove` events show the player evicting
   old ranges (ignored for capture purposes).
-- `DRM requested: com.widevine.alpha` means the site uses EME; the badge turns
-  red and the capture concept stops there by design.
+- `DRM (not captured): com.widevine.alpha` means the site asked for EME; the
+  badge turns red. `encrypted media in SourceBuffer #N` means the segments
+  themselves are encrypted: those are never copied or sent (and the sink
+  refuses them too). A site that only probes EME but plays clear media is
+  still captured. The capture concept stops at DRM by design.
+- Without a sink token in the popup the hook copies nothing (metadata only).
+- Test the hook without a browser: `node scripts/test-hook.mjs`.
 
 ## Result of the first live run (2026-10-30)
 

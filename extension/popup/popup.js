@@ -19,7 +19,7 @@ const render = (state) => {
   }
   let html = "";
   if (state.drm.length) {
-    html += `<div class="drm">DRM requested: ${state.drm.map((d) => esc(d.keySystem) + (d.robustness.length ? " (" + esc(d.robustness.join(", ")) + ")" : "")).join("; ")}</div>`;
+    html += `<div class="drm">DRM (not captured): ${state.drm.map((d) => esc(d.keySystem) + (d.robustness.length ? " (" + esc(d.robustness.join(", ")) + ")" : "")).join("; ")}</div>`;
   }
   if (!state.mediaSources.length) {
     html += '<div class="muted">No MediaSource created yet.</div>';

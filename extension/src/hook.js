@@ -20,6 +20,18 @@
 
   let nextMsId = 1;
   let nextSbId = 1;
+
+  // Whether segment bytes are copied at all. content.js turns this off when
+  // no sink is configured (metadata-only mode). On by default so the first
+  // init segment is not lost while the setting is still being read. A page
+  // can forge this message too; it can only switch off its own capture or
+  // cost itself a copy.
+  let tapping = true;
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const d = event.data;
+    if (d && d.__vcCtl === 1 && typeof d.tap === "boolean") tapping = d.tap;
+  });
   const msInfo = new WeakMap(); // MediaSource -> { id, blobUrl }
   const sbInfo = new WeakMap(); // SourceBuffer -> { id, msId, mime, timescale, seq }
 
@@ -64,15 +76,30 @@
 
   const CONTAINERS = new Set(["moov", "trak", "mdia", "moof", "traf", "mvex"]);
 
+  const ENCRYPTION_FOURCCS = ["encv", "enca", "tenc", "pssh"].map((s) => [...s].map((c) => c.charCodeAt(0)));
+
+  // True when one of the byte patterns occurs in u8[start, end).
+  const hasAnyFourcc = (u8, start, end, patterns) => {
+    for (let i = start; i + 4 <= end; i++) {
+      for (const p of patterns) {
+        if (u8[i] === p[0] && u8[i + 1] === p[1] && u8[i + 2] === p[2] && u8[i + 3] === p[3]) return true;
+      }
+    }
+    return false;
+  };
+
   // Returns { boxes: [...top-level types], isInit, tfdt, timescale, samples, duration }
   const parseIsoBmff = (u8) => {
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-    const out = { boxes: [], isInit: false, tfdt: null, timescale: null, samples: 0, duration: 0 };
+    const out = { boxes: [], isInit: false, tfdt: null, timescale: null, samples: 0, duration: 0, encrypted: false };
 
     const walk = (start, end, depth) => {
       eachBox(u8, dv, start, end, (type, header, bodyStart, bodyEnd) => {
         if (depth === 0) out.boxes.push(type);
         if (type === "moov" || type === "ftyp") out.isInit = true;
+        if (type === "moov") out.moov = [bodyStart, bodyEnd];
+        // Protection markers: a pssh box anywhere, sample encryption in traf.
+        if (type === "pssh" || type === "senc") out.encrypted = true;
 
         if (type === "mdhd" && out.timescale === null) {
           const version = u8[bodyStart];
@@ -117,7 +144,13 @@
     } catch (e) {
       out.error = String(e);
     }
+    // Encrypted sample entries (encv/enca) and their tenc live deep inside
+    // moov/trak/mdia/minf/stbl/stsd; the init segment is small, so scan it.
+    if (out.moov && !out.encrypted) {
+      out.encrypted = hasAnyFourcc(u8, out.moov[0], out.moov[1], ENCRYPTION_FOURCCS);
+    }
     delete out._defaultDuration;
+    delete out.moov;
     return out;
   };
 
@@ -140,8 +173,15 @@
     return { value, len };
   };
 
+  // True when the two-byte sequence (a, b) occurs in u8[start, end).
+  const hasPair = (u8, start, end, a, b) => {
+    const stop = Math.min(end, u8.byteLength) - 1;
+    for (let i = start; i < stop; i++) if (u8[i] === a && u8[i + 1] === b) return true;
+    return false;
+  };
+
   const parseWebm = (u8) => {
-    const out = { boxes: [], isInit: false, tfdt: null, timescale: 1000, samples: 0, duration: 0 };
+    const out = { boxes: [], isInit: false, tfdt: null, timescale: 1000, samples: 0, duration: 0, encrypted: false };
     let off = 0;
     while (off < u8.byteLength) {
       const id = readVint(u8, off, true);
@@ -168,15 +208,23 @@
         const tc = readVint(u8, bodyStart, true);
         if (tc && tc.value === 0xe7) {
           const tcSize = readVint(u8, bodyStart + tc.len, false);
-          if (tcSize) {
+          const valueStart = tcSize ? bodyStart + tc.len + tcSize.len : 0;
+          // An unsigned integer element has at most 8 bytes; anything else is
+          // corrupt (and a loop over a huge size would freeze the page).
+          if (tcSize && tcSize.value >= 1 && tcSize.value <= 8 && valueStart + tcSize.value <= u8.byteLength) {
             let v = 0;
-            for (let i = 0; i < tcSize.value; i++) v = v * 256 + u8[bodyStart + tc.len + tcSize.len + i];
+            for (let i = 0; i < tcSize.value; i++) v = v * 256 + u8[valueStart + i];
             if (out.tfdt === null) out.tfdt = v;
           }
         }
       } else if (id.value === 0x1654ae6b) {
         out.boxes.push("Tracks");
         out.isInit = true;
+        // ContentEncryption (0x5035) with ContentEncKeyID (0x47E2): WebM
+        // encryption (Widevine/ClearKey on WebM).
+        if (hasPair(u8, bodyStart, bodyEnd, 0x50, 0x35) && hasPair(u8, bodyStart, bodyEnd, 0x47, 0xe2)) {
+          out.encrypted = true;
+        }
       } else if (id.value === 0x1549a966) {
         out.boxes.push("Info");
         out.isInit = true;
@@ -275,6 +323,25 @@
     const parsed = kind === "mp4" ? parseIsoBmff(u8) : kind === "webm" ? parseWebm(u8) : null;
     if (parsed && parsed.timescale) info.timescale = parsed.timescale;
 
+    // DRM: an encrypted init segment marks the SourceBuffer as protected until
+    // a clear init segment arrives; encrypted media (senc) marks it too. Its
+    // bytes are never copied: streamtap detects DRM and leaves it alone.
+    if (parsed && parsed.isInit) info.encrypted = !!parsed.encrypted;
+    else if (parsed && parsed.encrypted) info.encrypted = true;
+    if (info.encrypted && !info.encryptedReported) {
+      info.encryptedReported = true;
+      post("encrypted", { sbId: info.id, msId: info.msId, mime: info.mime });
+      log(`SourceBuffer #${info.id} carries encrypted media (DRM); not tapping it`);
+    }
+
+    let tso = null;
+    try {
+      tso = Number(sb.timestampOffset);
+      if (!Number.isFinite(tso)) tso = null;
+    } catch (e) {
+      tso = null;
+    }
+
     const ts = info.timescale;
     const rec = {
       sbId: info.id,
@@ -288,6 +355,8 @@
       boxes: parsed ? parsed.boxes : [],
       tfdt: parsed ? parsed.tfdt : null,
       timescale: ts,
+      tso,
+      encrypted: !!info.encrypted,
       startSec: parsed && parsed.tfdt !== null && ts ? +(parsed.tfdt / ts).toFixed(3) : null,
       durationSec: parsed && parsed.duration && ts ? +(parsed.duration / ts).toFixed(3) : null,
       samples: parsed ? parsed.samples : 0,
@@ -295,8 +364,14 @@
     };
     // One copy (the player keeps using the original), then hand the copy over
     // by transfer so no second copy is made on the way to the content script.
-    const copy = u8.slice().buffer;
-    post("append", { ...rec, payload: copy }, [copy]);
+    // Protected media and frames whose content script does not tap get
+    // metadata only.
+    if (info.encrypted || !tapping) {
+      post("append", rec);
+    } else {
+      const copy = u8.slice().buffer;
+      post("append", { ...rec, payload: copy }, [copy]);
+    }
 
     const where =
       rec.isInit ? "INIT" : rec.startSec !== null ? `t=${rec.startSec}s` : "t=?";

@@ -13,7 +13,24 @@
 "use strict";
 
 const SINK_MAX_PENDING_BYTES = 64 * 1024 * 1024; // per port, while CONNECTING only
+const SINK_MAX_BUFFERED_BYTES = 64 * 1024 * 1024; // per socket, unsent while OPEN
+const SINK_MAX_INIT_BYTES = 2 * 1024 * 1024; // init segments kept for a reconnect
+const SINK_MAX_KEPT_INITS = 32;
 const sinkEnc = new TextEncoder();
+
+// The header fields the sink understands; everything else is dropped.
+const sinkSegmentHeader = (h) => ({
+  type: "segment",
+  sb: h.sb,
+  seq: h.seq,
+  ms: h.ms ?? null,
+  mime: typeof h.mime === "string" ? h.mime.slice(0, 256) : "",
+  isInit: h.isInit === true,
+  kind: typeof h.kind === "string" ? h.kind.slice(0, 16) : "",
+  tfdt: h.tfdt ?? null,
+  timescale: h.timescale ?? null,
+  tso: h.tso ?? null,
+});
 
 // tabId -> Map<portId, link>; read by the popup through "vc-link-status".
 const sinkLinks = new Map();
@@ -60,6 +77,17 @@ const linkConnect = async (link) => {
   ws.onopen = () => {
     link.retryDelay = 1000;
     ws.send(sinkFrame({ type: "hello", token: settings.token, ...link.hello }));
+    // A reconnect starts a new capture directory on the sink; the player
+    // appended its init segments only once, so send the kept ones first
+    // (an identical init in the pending queue is deduped by the sink).
+    if (link.connections > 0) {
+      for (const b of link.inits.values()) {
+        ws.send(b);
+        link.sent++;
+        link.sentBytes += b.size;
+      }
+    }
+    link.connections++;
     for (const b of link.pending) {
       ws.send(b);
       link.sent++;
@@ -84,20 +112,36 @@ const linkConnect = async (link) => {
 const linkSend = (link, blob) => {
   const ws = link.ws;
   if (ws && ws.readyState === WebSocket.OPEN) {
+    // Backpressure: a stalled sink must not make the worker buffer without
+    // bound.
+    if (ws.bufferedAmount + blob.size > SINK_MAX_BUFFERED_BYTES) {
+      link.dropped++;
+      return;
+    }
     ws.send(blob);
     link.sent++;
     link.sentBytes += blob.size;
     return;
   }
-  const connecting = (ws && ws.readyState === WebSocket.CONNECTING) || (!ws && link.connecting);
+  // No socket and the retry window has passed: start connecting now and
+  // queue this blob instead of dropping it (linkConnect sets `connecting`
+  // synchronously).
+  if (!ws) linkConnect(link);
+  const connecting = (link.ws && link.ws.readyState === WebSocket.CONNECTING) || (!link.ws && link.connecting);
   if (connecting && link.pendingBytes + blob.size <= SINK_MAX_PENDING_BYTES) {
     link.pending.push(blob);
     link.pendingBytes += blob.size;
     return;
   }
-  // Not connected: never buffer unboundedly. Count, drop, try to reconnect.
+  // Not connected: never buffer unboundedly. Count and drop.
   link.dropped++;
-  linkConnect(link);
+};
+
+const linkKeepInit = (link, sb, blob) => {
+  if (blob.size > SINK_MAX_INIT_BYTES) return;
+  link.inits.delete(sb);
+  link.inits.set(sb, blob);
+  while (link.inits.size > SINK_MAX_KEPT_INITS) link.inits.delete(link.inits.keys().next().value);
 };
 
 const decodePayload = async (dataUrl) => {
@@ -120,6 +164,8 @@ chrome.runtime.onConnect.addListener((port) => {
     ws: null,
     connecting: false,
     closed: false,
+    connections: 0, // sockets opened so far
+    inits: new Map(), // sb -> framed init segment, replayed after a reconnect
     pending: [],
     pendingBytes: 0,
     sent: 0,
@@ -159,12 +205,19 @@ chrome.runtime.onConnect.addListener((port) => {
           link.dropped++;
           return;
         }
-        linkSend(link, sinkFrame({ ...msg.header, type: "segment" }, payload));
+        const header = sinkSegmentHeader(msg.header);
+        const blob = sinkFrame(header, payload);
+        if (header.isInit) linkKeepInit(link, header.sb, blob);
+        linkSend(link, blob);
         return;
       }
       if (msg.t === "event" && msg.header && typeof msg.header === "object") {
-        linkSend(link, sinkFrame({ ...msg.header, type: "event" }));
+        const name = msg.header.name === "endofstream" || msg.header.name === "changetype" ? msg.header.name : null;
+        if (name) linkSend(link, sinkFrame({ type: "event", name, sb: msg.header.sb ?? null }));
       }
+    }).catch(() => {
+      // One failed message must not stop the ones behind it.
+      link.dropped++;
     });
   });
 

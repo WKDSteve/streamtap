@@ -20,18 +20,28 @@ const tabState = (tabId, url) => {
 
 const msKey = (frameUrl, msId) => `${frameUrl}#${msId}`;
 
+// Pages can forge the hook's records, so the registry is bounded: beyond the
+// limits a record updates a throwaway entry that is not kept.
+const MAX_MS_PER_TAB = 64;
+const MAX_SB_PER_MS = 32;
+const MAX_FRAMES_PER_TAB = 100;
+const MAX_MIMES = 20;
+
 const msState = (t, frameUrl, msId) => {
   const key = msKey(frameUrl, msId);
   let m = t.ms.get(key);
   if (!m) {
     m = { msId, frameUrl, blobUrl: null, sb: new Map(), ended: false };
-    t.ms.set(key, m);
+    if (t.ms.size < MAX_MS_PER_TAB) t.ms.set(key, m);
   }
   return m;
 };
 
 const sbState = (m, sbId, mime) => {
   let s = m.sb.get(sbId);
+  if (!s && m.sb.size >= MAX_SB_PER_MS) {
+    return { sbId, mime, appends: 0, bytes: 0, inits: 0, media: 0, firstSec: null, lastSec: null, lastEndSec: null, kind: null, mimes: [] };
+  }
   if (!s) {
     s = {
       sbId,
@@ -85,7 +95,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const t = tabState(tabId, sender.tab.url);
 
   if (msg.kind === "vc-frame") {
-    t.frames.add(msg.frameUrl);
+    if (t.frames.size < MAX_FRAMES_PER_TAB) t.frames.add(String(msg.frameUrl));
     return false;
   }
   if (msg.kind !== "vc-event") return false;
@@ -107,7 +117,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       for (const m of t.ms.values()) {
         const s = m.sb.get(e.sbId);
         if (s) {
-          s.mimes.push(s.mime);
+          if (s.mimes.length < MAX_MIMES) s.mimes.push(s.mime);
           s.mime = e.mime;
         }
       }
@@ -116,15 +126,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "append": {
       const s = sbState(msState(t, e.frameUrl, e.msId), e.sbId, e.mime);
       s.appends++;
-      s.bytes += e.bytes;
+      s.bytes += Number(e.bytes) || 0;
       s.kind = e.kind;
       if (e.isInit) s.inits++;
       else s.media++;
-      if (e.startSec !== null) {
+      if (Number.isFinite(e.startSec)) {
         if (s.firstSec === null || e.startSec < s.firstSec) s.firstSec = e.startSec;
         if (s.lastSec === null || e.startSec > s.lastSec) {
           s.lastSec = e.startSec;
-          s.lastEndSec = e.durationSec ? +(e.startSec + e.durationSec).toFixed(3) : null;
+          s.lastEndSec = Number.isFinite(e.durationSec) ? +(e.startSec + e.durationSec).toFixed(3) : null;
         }
       }
       break;
@@ -133,7 +143,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       for (const m of t.ms.values()) if (m.msId === e.msId && m.frameUrl === e.frameUrl) m.ended = true;
       break;
     case "drm":
-      t.drm.push({ keySystem: e.keySystem, robustness: e.robustness, frameUrl: e.frameUrl });
+      if (t.drm.length < 50) {
+        t.drm.push({ keySystem: String(e.keySystem), robustness: Array.isArray(e.robustness) ? e.robustness : [], frameUrl: e.frameUrl });
+      }
+      break;
+    case "encrypted":
+      // Encrypted media seen in a SourceBuffer: not tapped (hook.js).
+      if (t.drm.length < 50) {
+        t.drm.push({ keySystem: `encrypted media in SourceBuffer #${e.sbId}`, robustness: [], frameUrl: e.frameUrl });
+      }
       break;
     default:
       break;
