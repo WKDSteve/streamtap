@@ -248,6 +248,9 @@ pub(crate) struct MuxHandle {
     /// `abort` ran: the exit status is then no outcome of the mux (killing a
     /// job ends its processes with exit code 0).
     aborted: AtomicBool,
+    /// Why the child could not be tied to the app (it then outlives a hard
+    /// kill of the app).
+    job_error: Option<String>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -255,6 +258,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl MuxHandle {
+    /// Why the mux is not tied to the app, if it is not.
+    pub(crate) fn job_error(&self) -> Option<&str> {
+        self.job_error.as_deref()
+    }
+
     /// Kills the mux and everything it started (ffmpeg), waits until the
     /// processes are gone and removes `out.part.mp4`, which the mux could not
     /// clean up itself because it was killed.
@@ -273,10 +281,13 @@ impl MuxHandle {
 
 /// Runs `cmd` (a `streamtap-sink mux` command) to its end; stdout is
 /// discarded, the end of stderr is kept. `register` gets the handle as soon
-/// as the child runs. The caller runs this on its own thread.
+/// as the child runs. `tie` puts the child into a kill-on-close job
+/// ([`KillOnClose::new`]); when it fails the handle says why. The caller runs
+/// this on its own thread.
 pub(crate) fn run_child(
     mut cmd: Command,
     part_file: Option<PathBuf>,
+    tie: impl FnOnce(&Child) -> std::io::Result<KillOnClose>,
     register: impl FnOnce(&Arc<MuxHandle>),
 ) -> MuxState {
     let mut child = match cmd
@@ -295,13 +306,17 @@ pub(crate) fn run_child(
             }
         }
     };
-    let job = KillOnClose::new(&child).ok();
+    let (job, job_error) = match tie(&child) {
+        Ok(job) => (Some(job), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
     let stderr = child.stderr.take();
     let handle = Arc::new(MuxHandle {
         child: Mutex::new(child),
         job: Mutex::new(job),
         part_file,
         aborted: AtomicBool::new(false),
+        job_error,
     });
     register(&handle);
     let mut stderr_text = String::new();
@@ -354,7 +369,12 @@ pub(crate) fn run_mux(sink: &Path, dir: &Path, register: impl FnOnce(&Arc<MuxHan
     let mut cmd = command(sink);
     cmd.arg("mux").arg(dir);
     // The sink writes the result to `out.part.mp4` first.
-    run_child(cmd, Some(dir.join("out.part.mp4")), register)
+    run_child(
+        cmd,
+        Some(dir.join("out.part.mp4")),
+        KillOnClose::new,
+        register,
+    )
 }
 
 /// Opens a file or folder with the system's default handler. The program is
@@ -377,7 +397,7 @@ pub(crate) fn open_path(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -546,7 +566,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let part2 = part.clone();
         let runner = std::thread::spawn(move || {
-            run_child(cmd, Some(part2), |h| tx.send(Arc::clone(h)).unwrap())
+            run_child(cmd, Some(part2), KillOnClose::new, |h| {
+                tx.send(Arc::clone(h)).unwrap();
+            })
         });
         let handle = rx
             .recv_timeout(Duration::from_secs(10))
@@ -561,6 +583,32 @@ mod tests {
         assert!(matches!(state, MuxState::Failed { .. }), "{state:?}");
         assert!(!part.exists(), "the half-written file is removed");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A command that ends at once with exit code 0 (the test exe listing
+    /// no tests).
+    pub(crate) fn quick_command() -> Command {
+        let mut cmd = command(env::current_exe().unwrap());
+        cmd.args(["--exact", "no-such-test-streamtap", "--test-threads=1"]);
+        cmd
+    }
+
+    #[test]
+    fn a_mux_that_cannot_be_tied_to_the_app_says_why() {
+        let mut job_error = None;
+        let state = run_child(
+            quick_command(),
+            None,
+            |_| Err(std::io::Error::other("job denied")),
+            |h| job_error = h.job_error().map(str::to_owned),
+        );
+        assert!(matches!(state, MuxState::Ok), "{state:?}");
+        assert_eq!(job_error.as_deref(), Some("job denied"));
+        let mut job_error = Some(String::new());
+        run_child(quick_command(), None, KillOnClose::new, |h| {
+            job_error = h.job_error().map(str::to_owned);
+        });
+        assert_eq!(job_error, None, "a tied mux has nothing to say");
     }
 
     #[test]

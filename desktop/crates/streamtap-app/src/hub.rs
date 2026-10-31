@@ -1,10 +1,11 @@
 //! The app's end of the browser link: the bridge the host connects to, the
 //! pairing decisions and the tab lists.
 //!
-//! A host connects to a loopback socket the app opens (its port is written to
-//! `bridge.json`), says who it is (`hello`) and then relays the extension's
-//! messages. The hub:
+//! A host connects to a loopback socket the app opens (its port and a random
+//! key, new at each start, are written to `bridge.json`), sends the key, says
+//! who it is (`hello`) and then relays the extension's messages. The hub:
 //!
+//! - gives a connection without the right key no slot and no prompt;
 //! - refuses any origin but the streamtap extension's;
 //! - sends port and token only to a browser the user approved (now, or at an
 //!   earlier time: `pairings.json`), and never anything but a state before that;
@@ -25,13 +26,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use streamtap_host::framing::read_line;
 use streamtap_host::proto::{
-    BridgeMsg, HostMsg, Pairing, TabInfo, ALLOWED_ORIGIN, BRIDGE_FILE, MAX_BRIDGE_LINE,
+    BridgeMsg, HostMsg, Pairing, TabInfo, ALLOWED_ORIGIN, BRIDGE_FILE, MAX_BRIDGE_KEY,
+    MAX_BRIDGE_LINE,
 };
 
 use crate::pairings::{Approval, Store};
 
 /// Hosts connected at once (one per browser profile, with room to spare).
 const MAX_CONNECTIONS: usize = 16;
+/// A connection that has not sent the bridge key by then is dropped.
+const KEY_TIMEOUT: Duration = Duration::from_secs(2);
 /// A connection that has not said hello by then is dropped.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest a write to a host may block.
@@ -184,6 +188,12 @@ impl Hub {
 
     pub(crate) fn is_attached(&self, id: u64) -> bool {
         self.lock().conns.contains_key(&id)
+    }
+
+    /// Connection slots in use (named or not).
+    #[cfg(test)]
+    fn slots(&self) -> usize {
+        self.lock().conns.len()
     }
 
     /// The host named itself. Any origin but the extension's is refused; a
@@ -404,23 +414,26 @@ pub(crate) struct Server {
 
 impl Server {
     /// Opens the bridge on a loopback port of the system's choosing and
-    /// writes the port into `dir/bridge.json`.
+    /// writes the port and a new random key into `dir/bridge.json`. Only a
+    /// connection that sends that key first gets a slot in the hub.
     pub(crate) fn start(hub: &Arc<Hub>, dir: &Path) -> Result<Self, String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| format!("cannot open the browser bridge: {e}"))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let key: Arc<str> = Arc::from(crate::config::random_token());
         let file = dir.join(BRIDGE_FILE);
         let tmp = file.with_extension("json.tmp");
-        std::fs::write(&tmp, format!("{{\"port\":{port}}}"))
+        let text = serde_json::json!({ "port": port, "key": &*key }).to_string();
+        std::fs::write(&tmp, text)
             .and_then(|()| std::fs::rename(&tmp, &file))
             .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
         let hub = Arc::clone(hub);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let hub = Arc::clone(&hub);
-                std::thread::spawn(move || serve_connection(&hub, stream));
+                let (hub, key) = (Arc::clone(&hub), Arc::clone(&key));
+                std::thread::spawn(move || serve_connection(&hub, stream, &key));
             }
         });
         Ok(Self { file })
@@ -437,8 +450,33 @@ impl Drop for Server {
     }
 }
 
-fn serve_connection(hub: &Hub, stream: TcpStream) {
+/// Compares two keys in time that depends on their length only.
+fn same_key(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a
+        .iter()
+        .zip(b)
+        .fold(0u8, |acc, (x, y)| std::hint::black_box(acc | (x ^ y)));
+    diff == 0
+}
+
+fn serve_connection(hub: &Hub, stream: TcpStream, key: &str) {
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    // The key comes first, read with a short timeout and a small bound;
+    // without it the connection gets no slot and no prompt.
+    let _ = stream.set_read_timeout(Some(KEY_TIMEOUT));
+    let mut lines = BufReader::new(stream);
+    let keyed = read_line(&mut lines, MAX_BRIDGE_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|k| same_key(&k, key.as_bytes()));
+    let stream = lines.get_ref();
+    if !keyed {
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
     let (Ok(writer), Ok(closer)) = (stream.try_clone(), stream.try_clone()) else {
         return;
     };
@@ -452,7 +490,6 @@ fn serve_connection(hub: &Hub, stream: TcpStream) {
         return;
     };
     let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT));
-    let mut lines = BufReader::new(stream);
     // The first line must be the hello.
     let first = read_line(&mut lines, MAX_BRIDGE_LINE)
         .ok()
@@ -666,6 +703,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// What the app does on a revoke: the approval goes, then the new token
+    /// is handed out. The revoked browser never sees it.
+    #[test]
+    fn a_token_set_after_a_revoke_reaches_the_others_only() {
+        let (h, dir) = hub("revoke-rotate");
+        let (a, wa) = connect(&h);
+        hello(&h, a, "profile-aaaa");
+        h.decide(a, true).unwrap();
+        let (b, wb) = connect(&h);
+        hello(&h, b, "profile-bbbb");
+        h.decide(b, true).unwrap();
+        h.revoke("profile-aaaa").unwrap();
+        let before = wa.sent().len();
+        h.set_credentials(17650, "fedcba9876543210fedcba9876543210");
+        assert_eq!(wa.sent().len(), before, "the revoked browser gets nothing");
+        assert_eq!(*wa.sent().last().unwrap(), HostMsg::state(Pairing::Revoked));
+        assert_eq!(
+            wb.sent().pop().unwrap(),
+            HostMsg::credentials(17650, "fedcba9876543210fedcba9876543210")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_tap_request_needs_an_approved_browser_and_a_reported_tab() {
         let (h, dir) = hub("tap");
@@ -728,6 +788,102 @@ mod tests {
         assert!(!format!("{c:?}").contains(SECRET));
     }
 
+    fn hello_line(origin: &str) -> Vec<u8> {
+        let hello = BridgeMsg::Hello {
+            v: 1,
+            origin: origin.into(),
+            instance: "profile-aaaa".into(),
+            browser: "edge".into(),
+            version: "0.3.0".into(),
+        };
+        let mut line = serde_json::to_vec(&hello).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    /// Sends `first` (the key line, or anything else) and a hello; returns
+    /// the first answer, or none when the bridge closed without one.
+    fn talk_raw(port: u16, first: &[u8]) -> Option<HostMsg> {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(first).unwrap();
+        // The bridge may already have closed after a bad first line.
+        let _ = s.write_all(&hello_line(ALLOWED_ORIGIN));
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut r = BufReader::new(s);
+        read_line(&mut r, 4096)
+            .ok()
+            .flatten()
+            .map(|l| HostMsg::parse(&l).unwrap())
+    }
+
+    #[test]
+    fn keys_compare_by_content_and_length() {
+        assert!(same_key(b"abcd", b"abcd"));
+        assert!(!same_key(b"abcd", b"abce"));
+        assert!(!same_key(b"abcd", b"abc"));
+        assert!(!same_key(b"", b"a"));
+    }
+
+    /// Without the key from `bridge.json` a connection gets no slot and no
+    /// pairing prompt: silent, wrong, missing or oversized keys.
+    #[test]
+    fn the_bridge_wants_its_key_before_anything_else() {
+        let (h, dir) = hub("key");
+        let hub = Arc::new(h);
+        let server = Server::start(&hub, &dir).unwrap();
+        let bridge = streamtap_host::relay::read_bridge(&dir).unwrap();
+        let key = bridge.key().to_string();
+        assert_eq!(key.len(), 64);
+
+        // More silent connections than there are slots: none takes one.
+        let silent: Vec<TcpStream> = (0..=MAX_CONNECTIONS)
+            .map(|_| TcpStream::connect(("127.0.0.1", bridge.port)).unwrap())
+            .collect();
+        let mut wrong = key.clone().into_bytes();
+        wrong[0] = if wrong[0] == b'0' { b'1' } else { b'0' };
+        wrong.push(b'\n');
+        for first in [
+            wrong,
+            hello_line(ALLOWED_ORIGIN),
+            b"\n".to_vec(),
+            format!("{key}{key}{key}\n").into_bytes(),
+            key.as_bytes()[..63].to_vec(),
+        ] {
+            assert_eq!(
+                talk_raw(bridge.port, &first),
+                None,
+                "{}",
+                String::from_utf8_lossy(&first)
+            );
+        }
+        assert_eq!(hub.slots(), 0, "no slot without the key");
+        assert!(hub.view().connections.is_empty(), "no prompt");
+
+        // The right key works, although the silent ones are still open.
+        let ok = talk_raw(bridge.port, format!("{key}\n").as_bytes());
+        assert_eq!(ok, Some(HostMsg::state(Pairing::Pending)));
+        drop(silent);
+        server.stop();
+        hub.close_all();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_start_writes_a_new_key() {
+        let (h, dir) = hub("newkey");
+        let hub = Arc::new(h);
+        let first = Server::start(&hub, &dir).unwrap();
+        let a = streamtap_host::relay::read_bridge(&dir).unwrap();
+        drop(first);
+        let second = Server::start(&hub, &dir).unwrap();
+        let b = streamtap_host::relay::read_bridge(&dir).unwrap();
+        assert_ne!(a.key(), b.key());
+        // The old key does not open the new bridge.
+        assert_eq!(talk_raw(b.port, format!("{}\n", a.key()).as_bytes()), None);
+        drop(second);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The real bridge over a socket: a host-like client says hello, is told
     /// it is pending, and its unknown origin is turned away.
     #[test]
@@ -735,10 +891,13 @@ mod tests {
         let (h, dir) = hub("server");
         let hub = Arc::new(h);
         let server = Server::start(&hub, &dir).unwrap();
-        let port = streamtap_host::relay::read_bridge_port(&dir).unwrap();
+        let bridge = streamtap_host::relay::read_bridge(&dir).unwrap();
+        let port = bridge.port;
+        let key_line = format!("{}\n", bridge.key());
 
         let talk = |origin: &str| {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(key_line.as_bytes()).unwrap();
             let hello = BridgeMsg::Hello {
                 v: 1,
                 origin: origin.into(),
@@ -759,15 +918,16 @@ mod tests {
             talk("chrome-extension://cccccccccccccccccccccccccccccccc/"),
             HostMsg::error("origin-not-allowed")
         );
-        // A line that is not a hello first is dropped without an answer.
+        // A line after the key that is not a hello is dropped without an answer.
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(key_line.as_bytes()).unwrap();
         s.write_all(b"{\"t\":\"ping\",\"v\":1}\n").unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut r = BufReader::new(s);
         assert!(read_line(&mut r, 4096).unwrap().is_none());
 
         server.stop();
-        assert!(streamtap_host::relay::read_bridge_port(&dir).is_err());
+        assert!(streamtap_host::relay::read_bridge(&dir).is_err());
         hub.close_all();
         std::fs::remove_dir_all(&dir).unwrap();
     }

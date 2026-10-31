@@ -441,7 +441,7 @@ Security:
   running muxes: the process tree is killed and the half-written
   `out.part.mp4` is removed (a mux killed by the OS after a hard kill of the
   app cannot clean it up; the next mux overwrites it). If the job cannot be set
-  up, the sink log says so. Other platforms have no such guard (Windows-only
+  up, the sink log says so (for a mux too, with the capture's id). Other platforms have no such guard (Windows-only
   for now).
 
 ## Connect browser (native messaging)
@@ -456,7 +456,8 @@ the extension. Three parts:
   Windows GUI-subsystem exe (the app) has no reliable stdio for the pipes; and
   it has no dependency but `serde`. It speaks the browser's framing on stdin and
   stdout (4 byte little-endian length + JSON) and a line protocol over a
-  loopback socket to the app. The host knows **no secret**: it checks the origin
+  loopback socket to the app. The host knows **no secret of the sink** (only the
+  bridge key, see below): it checks the origin
   the browser passes (only `chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia/`,
   else it answers `origin-not-allowed` and exits), forwards the extension's
   messages and hands the app's answers back. Port and token come only from the
@@ -464,10 +465,15 @@ the extension. Three parts:
   config; the app sends them instead, so that the approval is enforced in one
   place, the app, and the host needs no knowledge of the config file.)
 - **The bridge** (`hub.rs`): when the app starts it listens on a random
-  `127.0.0.1` port and writes `{"port":n}` into `bridge.json` in its config dir
-  (`%APPDATA%\io.github.wkdsteve.streamtap`; removed on exit). A host finds the
-  app there; without the file or the app, the extension is told
-  `app-not-running`.
+  `127.0.0.1` port and writes `{"port":n,"key":"<64 hex>"}` into `bridge.json` in
+  its config dir (`%APPDATA%\io.github.wkdsteve.streamtap`; temporary file and
+  rename; removed on exit). The key is new at every app start (the same
+  generator as the sink token). A host finds the app there and sends the key as
+  the first line; the app reads at most 128 bytes for it within 2 s, compares in
+  constant time and closes a connection without the right key before it takes
+  one of the 16 connection slots or can raise a pairing prompt. So only a process
+  that can read the app's config directory can talk to the bridge at all.
+  Without the file or the app, the extension is told `app-not-running`.
 - **Registration** (`registration.rs`): the *Connect browser* panel registers or
   removes the host for Chrome, Edge or Brave. That writes a manifest
   (`native-messaging/<browser>.json` in the config dir; `name`, `path` of
@@ -476,7 +482,11 @@ the extension. Three parts:
   `HKCU\Software\<vendor>\<browser>\NativeMessagingHosts\io.github.wkdsteve.streamtap`
   at it (Chrome `Google\Chrome`, Edge `Microsoft\Edge`, Brave
   `BraveSoftware\Brave-Browser`). Per user, no administrator rights. Remove deletes
-  key and manifest. A key that points elsewhere (an older install) shows as
+  key and manifest. The manifest is written to a temporary file and renamed before
+  the key is set; when the key cannot be written, an earlier manifest is put back
+  as it was (a working registration stays working). The host path is written in
+  plain form (`\\?\C:\...` becomes `C:\...`, `\\?\UNC\server\share\...` becomes
+  `\\server\share\...`), so the app may also live on a network share. A key that points elsewhere (an older install) shows as
   "registered for another location" with *Register again*. The registry access is
   the `winreg` crate (MIT, already in the tree through Tauri's build tooling)
   behind a trait: the tests use a fake, and one test uses a throw-away key under
@@ -494,9 +504,14 @@ browser profile, the browser it believes it is, its version). The app shows
 Approve it sends `credentials` (port and token) and the extension stores them. An
 approval is kept in `pairings.json` (origin + instance, at most 32), so the same
 profile pairs without a prompt next time and another profile asks again; the panel
-lists the approvals and *Revoke* removes one (the extension is told, drops the
-credentials it had been given and stops). A new token or port (Settings) is pushed
-to paired browsers. The browser name is what the extension reports (Edge and
+lists the approvals and *Revoke* removes one after a confirmation (the extension is
+told, drops the credentials it had been given and stops). Revoking also gives the
+sink a **new token** (the same generator as *New token*), saves it and pushes it to
+every browser that is still approved and connected; the revoked one was closed first
+and gets nothing, so a copy it kept is useless at once. A running sink is restarted
+with the new token, which ends captures in progress (the confirmation says so). A
+browser set up by hand in the popup needs the new token there. A new token or port
+(Settings) is pushed to paired browsers. The browser name is what the extension reports (Edge and
 Chrome are told apart by the browser's brands; Brave usually looks like Chrome); the
 profile is the instance id, not the profile's name, which the protocol does not
 show. An unknown origin is refused by the host and again by the app. A pairing the
@@ -520,20 +535,22 @@ characters removed, hosts only host-name characters, icons only small
 declares more than the limit is refused before anything is read. The token is
 never printed (`Debug` is written by hand; the tests check it).
 
-Tests: schema and framing (unit), the host against a fake app on a real socket,
-the hub (pending gets no credentials, deny, remember, revoke, tap only for
-reported tabs, foreign origin, bounds), the registry logic against a fake, the
+Tests: schema and framing (unit), the host against a fake app on a real socket
+(the key comes first), the bridge key (silent, wrong, missing and oversized keys get
+no slot and no prompt; a new key per start), the hub (pending gets no credentials,
+deny, remember, revoke, tap only for reported tabs, foreign origin, bounds), revoke
+with token rotation (the revoked browser gets nothing, the others the new token, the
+config is saved, a running real sink is restarted), the registry logic against a
+fake (a failed register keeps a working registration; verbatim UNC paths), the
 approvals file, and an end-to-end test that starts the real `streamtap-host.exe`
-against the real bridge.
+against the real bridge (also with a wrong key in `bridge.json`).
 
 Limits: a browser or profile is identified by the random id the extension
 generated, which the extension itself claims (any process of your user that can
-talk to the loopback bridge could claim another; you still approve every new
-one, and such a process could read `config.json` anyway). Such a process can also
-fill the bridge's 16 connection slots or the approval prompts (a nuisance, not a way
-to the token). Revoking does not change the sink token: a browser that was away
-keeps its stored copy until it connects next and is told the approval is gone, so
-set a new token in Settings when a revoked browser must be cut off at once. The hand run in a real
+read the app's config directory could claim another; you still approve every new
+one, and such a process could read `config.json` anyway). A process that cannot
+read `bridge.json` gets no slot and no prompt; one that only opens connections
+without sending anything holds a thread for 2 s each, not a slot. The hand run in a real
 Chrome is still to do (see the task); Firefox is out of scope.
 
 Limits: a hard kill of the app leaves a stale `out.part.mp4` in a capture

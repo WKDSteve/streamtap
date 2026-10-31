@@ -1,10 +1,12 @@
 //! The host's job: carry messages between the browser's pipe and the app's
 //! bridge, and refuse everything that does not fit the schema.
 //!
-//! The host knows no secret. It checks the origin the browser names (only the
-//! streamtap extension), forwards the extension's messages to the app, and
-//! hands the app's answers back. Port and token only ever arrive from the app,
-//! after the user approved the pairing there.
+//! The host knows no secret of the sink. It checks the origin the browser
+//! names (only the streamtap extension), opens the bridge with the key the app
+//! wrote next to the port (so only a process that can read the app's config
+//! directory gets a connection), forwards the extension's messages to the app,
+//! and hands the app's answers back. Port and token only ever arrive from the
+//! app, after the user approved the pairing there.
 
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
@@ -18,8 +20,8 @@ use serde::Deserialize;
 
 use crate::framing::{read_frame, read_line, write_frame};
 use crate::proto::{
-    BridgeMsg, ExtMsg, HostMsg, ALLOWED_ORIGIN, APP_IDENTIFIER, BRIDGE_FILE, MAX_BRIDGE_LINE,
-    MAX_FROM_EXTENSION, MAX_TO_EXTENSION,
+    BridgeMsg, ExtMsg, HostMsg, ALLOWED_ORIGIN, APP_IDENTIFIER, BRIDGE_FILE, MAX_BRIDGE_KEY,
+    MAX_BRIDGE_LINE, MAX_FROM_EXTENSION, MAX_TO_EXTENSION, MIN_BRIDGE_KEY,
 };
 
 /// Exit code: the browser named an origin other than the extension's.
@@ -45,37 +47,83 @@ pub fn app_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(APP_IDENTIFIER))
 }
 
+/// Longest wait for the key to be written to the app's bridge.
+const KEY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What `bridge.json` holds: where the app listens and the key it expects
+/// first on every connection (new at each app start).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BridgeFile {
-    port: u16,
+pub struct Bridge {
+    /// The app's loopback port.
+    pub port: u16,
+    key: String,
 }
 
-/// Reads the bridge port the app wrote into `dir`.
+impl Bridge {
+    /// The key the app expects as the first line.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl std::fmt::Debug for Bridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bridge(port {}, key hidden)", self.port)
+    }
+}
+
+/// Reads the bridge port and key the app wrote into `dir`.
 ///
 /// # Errors
-/// When the file is missing, too large or not `{"port": n}`.
-pub fn read_bridge_port(dir: &Path) -> io::Result<u16> {
+/// When the file is missing, too large or not `{"port": n, "key": "<hex>"}`.
+pub fn read_bridge(dir: &Path) -> io::Result<Bridge> {
     let mut text = String::new();
     fs::File::open(dir.join(BRIDGE_FILE))?
         .take(1024)
         .read_to_string(&mut text)?;
-    let file: BridgeFile = serde_json::from_str(&text)
+    let file: Bridge = serde_json::from_str(&text)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bridge file is not valid"))?;
     if file.port < 1024 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bridge port"));
     }
-    Ok(file.port)
+    if !(MIN_BRIDGE_KEY..=MAX_BRIDGE_KEY).contains(&file.key.len())
+        || !file.key.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bridge key"));
+    }
+    Ok(file)
 }
 
-/// Connects to the app's bridge (loopback only, by construction).
+/// Connects to the bridge named in `dir/bridge.json` (loopback only, by
+/// construction) and sends the key as the first line.
+///
+/// # Errors
+/// When the file is missing or stale, or the app does not accept.
+pub fn connect_with(dir: &Path) -> io::Result<TcpStream> {
+    let bridge = read_bridge(dir)?;
+    let mut stream = TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], bridge.port)),
+        CONNECT_TIMEOUT,
+    )?;
+    stream.set_write_timeout(Some(KEY_WRITE_TIMEOUT))?;
+    let mut line = Vec::with_capacity(bridge.key.len() + 1);
+    line.extend_from_slice(bridge.key.as_bytes());
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    stream.flush()?;
+    stream.set_write_timeout(None)?;
+    Ok(stream)
+}
+
+/// Connects to the app's bridge (see [`connect_with`]).
 ///
 /// # Errors
 /// When the app is not running or the file is stale.
 pub fn connect_to_app() -> io::Result<TcpStream> {
     let dir = app_dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no app dir"))?;
-    let port = read_bridge_port(&dir)?;
-    TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), CONNECT_TIMEOUT)
+    connect_with(&dir)
 }
 
 fn send<W: Write>(out: &Mutex<W>, msg: &HostMsg) -> io::Result<()> {
@@ -400,24 +448,72 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_bridge_port_comes_from_a_small_strict_file() {
-        let dir =
-            std::env::temp_dir().join(format!("streamtap-host-bridge-{}", std::process::id()));
+    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn bridge_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "streamtap-host-bridge-{}-{name}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        assert!(read_bridge_port(&dir).is_err(), "missing");
-        fs::write(dir.join(BRIDGE_FILE), br#"{"port":40123}"#).unwrap();
-        assert_eq!(read_bridge_port(&dir).unwrap(), 40123);
+        dir
+    }
+
+    #[test]
+    fn the_bridge_port_and_key_come_from_a_small_strict_file() {
+        let dir = bridge_dir("file");
+        assert!(read_bridge(&dir).is_err(), "missing");
+        fs::write(
+            dir.join(BRIDGE_FILE),
+            format!(r#"{{"port":40123,"key":"{KEY}"}}"#),
+        )
+        .unwrap();
+        let b = read_bridge(&dir).unwrap();
+        assert_eq!((b.port, b.key()), (40123, KEY));
+        assert!(!format!("{b:?}").contains(KEY), "the key is not printed");
         for bad in [
-            r#"{"port":80}"#,
-            r#"{"port":40123,"x":1}"#,
-            r#"{"port":"40123"}"#,
-            "nope",
+            format!(r#"{{"port":80,"key":"{KEY}"}}"#),
+            format!(r#"{{"port":40123,"key":"{KEY}","x":1}}"#),
+            format!(r#"{{"port":"40123","key":"{KEY}"}}"#),
+            r#"{"port":40123}"#.to_string(),
+            r#"{"port":40123,"key":"abc"}"#.to_string(),
+            format!(
+                r#"{{"port":40123,"key":"{}"}}"#,
+                "a".repeat(MAX_BRIDGE_KEY + 1)
+            ),
+            format!(r#"{{"port":40123,"key":"{}"}}"#, "g".repeat(64)),
+            format!(r#"{{"port":40123,"key":"{}\n"}}"#, &KEY[..63]),
+            "nope".to_string(),
         ] {
-            fs::write(dir.join(BRIDGE_FILE), bad).unwrap();
-            assert!(read_bridge_port(&dir).is_err(), "{bad}");
+            fs::write(dir.join(BRIDGE_FILE), &bad).unwrap();
+            assert!(read_bridge(&dir).is_err(), "{bad}");
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_key_is_the_first_line_on_the_bridge() {
+        let dir = bridge_dir("key");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        fs::write(
+            dir.join(BRIDGE_FILE),
+            format!(r#"{{"port":{port},"key":"{KEY}"}}"#),
+        )
+        .unwrap();
+        let app = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut lines = BufReader::new(s);
+            read_line(&mut lines, 1024).ok().flatten()
+        });
+        let s = connect_with(&dir).unwrap();
+        assert_eq!(app.join().unwrap().as_deref(), Some(KEY.as_bytes()));
+        drop(s);
+        // Without a usable file nothing is connected.
+        fs::write(dir.join(BRIDGE_FILE), format!(r#"{{"port":{port}}}"#)).unwrap();
+        assert!(connect_with(&dir).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

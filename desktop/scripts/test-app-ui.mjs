@@ -60,6 +60,10 @@ const html = read("index.html");
 for (const m of html.matchAll(/data-i18n(?:-aria-label|-title)?="([^"]+)"/g)) check(m[1] in en, `index.html uses unknown key ${m[1]}`);
 const app = read("app.js");
 for (const m of app.matchAll(/\bt\(\s*"([^"]+)"/g)) check(m[1] in en, `app.js uses unknown key ${m[1]}`);
+// The confirm dialog's heading and button keys (ask({ heading: "...", ok: "..." })).
+const askKeys = [...app.matchAll(/\b(?:heading|ok):\s*"([^"]+)"/g)];
+check(askKeys.length >= 4, "confirm dialog keys found");
+for (const m of askKeys) check(m[1] in en, `app.js uses unknown key ${m[1]}`);
 for (const m of app.matchAll(/\?\s*"(\w+)"\s*:\s*"(\w+)"\s*,\s*\{/g)) {
   check(m[1] in en && m[2] in en, `app.js uses unknown key ${m[1]} or ${m[2]}`);
 }

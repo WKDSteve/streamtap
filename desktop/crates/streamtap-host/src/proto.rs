@@ -26,8 +26,13 @@ pub const HOST_NAME: &str = "io.github.wkdsteve.streamtap";
 pub const ALLOWED_ORIGIN: &str = "chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia/";
 /// The app's identifier (Tauri names the config directory after it).
 pub const APP_IDENTIFIER: &str = "io.github.wkdsteve.streamtap";
-/// File in the app's config directory that names the bridge port.
+/// File in the app's config directory that names the bridge port and key.
 pub const BRIDGE_FILE: &str = "bridge.json";
+/// Shortest bridge key accepted (hex digits).
+pub const MIN_BRIDGE_KEY: usize = 32;
+/// Longest bridge key accepted (hex digits); also the bound of the key line
+/// the app reads before anything else.
+pub const MAX_BRIDGE_KEY: usize = 128;
 /// The protocol version in every message.
 pub const PROTOCOL_VERSION: u8 = 1;
 

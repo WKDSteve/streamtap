@@ -362,8 +362,12 @@ async fn start_sink(state: State<'_, AppState>) -> CmdResult<()> {
 
 /// Starts `exe serve` with the stored settings and reads its output.
 fn launch_sink(shared: &AppState, exe: &Path) -> CmdResult<()> {
-    let mut g = shared.lock();
-    require_stopped(&mut g)?;
+    launch_sink_locked(shared, &mut shared.lock(), exe)
+}
+
+/// `launch_sink` with the lock of `shared` already held as `g`.
+fn launch_sink_locked(shared: &AppState, g: &mut Inner, exe: &Path) -> CmdResult<()> {
+    require_stopped(g)?;
     g.settings.validate()?;
     let root = g.settings.captures_dir.clone();
     fs::create_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
@@ -473,17 +477,27 @@ async fn mux_capture(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     };
     let shared = state.inner().clone();
     std::thread::spawn(move || {
-        let result = sink::run_mux(&sink_exe, &dir, |handle| {
-            shared
-                .lock()
-                .mux_handles
-                .insert(id.clone(), Arc::clone(handle));
-        });
+        let result = sink::run_mux(&sink_exe, &dir, |handle| mux_started(&shared, &id, handle));
         let mut g = shared.lock();
         g.mux_handles.remove(&id);
         g.mux.insert(id, result);
     });
     Ok(())
+}
+
+/// A mux of capture `id` runs: its handle is kept (to abort it on exit), and
+/// a mux that could not be tied to the app is noted in the log, like the sink.
+fn mux_started(shared: &AppState, id: &str, handle: &Arc<sink::MuxHandle>) {
+    let mut g = shared.lock();
+    if let Some(e) = handle.job_error() {
+        sink::push_log(
+            &mut g.log,
+            format!(
+                "warning: the mux of {id} is not tied to the app and outlives a hard kill of it: {e}"
+            ),
+        );
+    }
+    g.mux_handles.insert(id.to_owned(), Arc::clone(handle));
 }
 
 #[tauri::command]
@@ -545,7 +559,36 @@ async fn browser_decide(state: State<'_, AppState>, conn: u64, approve: bool) ->
 
 #[tauri::command]
 async fn browser_revoke(state: State<'_, AppState>, instance: String) -> CmdResult<()> {
-    hub_of(state.inner()).revoke(&instance)
+    revoke_browser(state.inner(), &instance, sink::find_sink())
+}
+
+/// Takes the approval of `instance` back and cuts it off at once: the sink
+/// gets a new token (like *New token*), which is saved and pushed to every
+/// browser that is still approved and connected (the revoked one was closed
+/// first and gets nothing). A running sink is restarted with the new token,
+/// which ends its captures in progress; `sink_exe` is the program to start
+/// it again. Everything happens under one lock.
+fn revoke_browser(shared: &AppState, instance: &str, sink_exe: Option<PathBuf>) -> CmdResult<()> {
+    let mut g = shared.lock();
+    let hub = Arc::clone(&g.hub);
+    hub.revoke(instance)?;
+    let new = Settings {
+        token: config::random_token(),
+        ..g.settings.clone()
+    };
+    apply_settings(&mut g, new)
+        .map_err(|e| format!("revoked, but the sink token could not be changed: {e}"))?;
+    g.refresh_sink();
+    if !g.sink_running() {
+        return Ok(());
+    }
+    g.stop_sink();
+    let exe = sink_exe.ok_or(
+        "revoked and the token changed; the sink was stopped and cannot be started again (streamtap-sink not found)",
+    )?;
+    launch_sink_locked(shared, &mut g, &exe).map_err(|e| {
+        format!("revoked and the token changed, but the sink did not start again: {e}")
+    })
 }
 
 #[tauri::command]
@@ -717,6 +760,97 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), b"{ broken");
         drop(g);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What a hub connection was sent.
+    #[derive(Clone, Default)]
+    struct Wire(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Wire {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Wire {
+        /// The tokens this connection was given, in order.
+        fn tokens(&self) -> Vec<String> {
+            let data = self.0.lock().unwrap().clone();
+            String::from_utf8(data)
+                .unwrap()
+                .lines()
+                .filter_map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                    v["token"].as_str().map(str::to_owned)
+                })
+                .collect()
+        }
+    }
+
+    /// A connected browser profile the user approved.
+    fn paired(hub: &Hub, instance: &str) -> Wire {
+        let w = Wire::default();
+        let id = hub.attach(Box::new(w.clone()), Box::new(|| {})).unwrap();
+        hub.hello(
+            id,
+            streamtap_host::proto::ALLOWED_ORIGIN,
+            instance,
+            "chrome",
+            "0.3.0",
+        );
+        hub.decide(id, true).unwrap();
+        w
+    }
+
+    #[test]
+    fn revoking_a_browser_rotates_the_token_for_everyone_else() {
+        let (st, dir) = state("revoke-rotate");
+        let old = st.lock().settings.token.clone();
+        let hub = Arc::clone(&st.lock().hub);
+        let revoked = paired(&hub, "profile-a");
+        let kept = paired(&hub, "profile-b");
+        assert_eq!(revoked.tokens(), std::slice::from_ref(&old));
+
+        revoke_browser(&st, "profile-a", None).unwrap();
+        let new = st.lock().settings.token.clone();
+        assert_ne!(new, old, "a new token");
+        assert_eq!(new.len(), 64);
+        assert_eq!(
+            revoked.tokens(),
+            std::slice::from_ref(&old),
+            "the revoked one gets nothing"
+        );
+        assert_eq!(kept.tokens(), [old, new.clone()], "the others get it");
+        let stored = config::load_or_create(&dir.join("config.json"), &dir).unwrap();
+        assert_eq!(stored.token, new, "the new token is saved");
+        assert!(!st.lock().sink_running(), "a stopped sink stays stopped");
+        assert!(hub
+            .view()
+            .approvals
+            .iter()
+            .all(|a| a.instance != "profile-a"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A mux that could not be put into a job is noted in the app's log.
+    #[test]
+    fn an_untied_mux_is_noted_in_the_log() {
+        let (st, dir) = state("mux-untied");
+        let shared = st.clone();
+        sink::run_child(
+            sink::tests::quick_command(),
+            None,
+            |_| Err(std::io::Error::other("job denied")),
+            |h| mux_started(&shared, "1_x", h),
+        );
+        let log: Vec<String> = st.lock().log.iter().cloned().collect();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(log[0].starts_with("warning: the mux of 1_x is not tied"));
+        assert!(log[0].ends_with("job denied"));
+        assert!(st.lock().mux_handles.contains_key("1_x"));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -936,6 +1070,46 @@ mod tests {
         fs::remove_dir_all(&f.dir).unwrap();
     }
 
+    /// A revoke while the real sink runs: the sink is started again with the
+    /// new token (another process, the old one is gone).
+    #[test]
+    fn end_to_end_revoking_restarts_a_running_sink_with_the_new_token() {
+        let sink = built_sink();
+        let (st, dir) = state("e2e-revoke");
+        {
+            let mut g = st.lock();
+            g.settings.port = free_port();
+            g.settings.captures_dir = dir.join("captures");
+        }
+        launch_sink(&st, &sink).expect("start the sink");
+        let old_pid = st.lock().sink_run().unwrap().pid;
+        let hub = Arc::clone(&st.lock().hub);
+        let kept = paired(&hub, "profile-b");
+        let revoked = paired(&hub, "profile-a");
+
+        revoke_browser(&st, "profile-a", Some(sink.clone())).unwrap();
+        let (new_pid, token) = {
+            let g = st.lock();
+            (g.sink_run().map(|r| r.pid), g.settings.token.clone())
+        };
+        assert!(new_pid.is_some_and(|p| p != old_pid), "the sink restarted");
+        assert_eq!(kept.tokens().last(), Some(&token));
+        assert!(!revoked.tokens().contains(&token));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut g = st.lock();
+        g.refresh_sink();
+        assert!(g.sink_running(), "the new sink keeps running");
+        drop(g);
+        // Without the sink program the revoke still happens, the sink is
+        // stopped and the caller is told.
+        let _ = paired(&hub, "profile-c");
+        let err = revoke_browser(&st, "profile-c", None).unwrap_err();
+        assert!(err.contains("cannot be started again"), "{err}");
+        assert!(!st.lock().sink_running());
+        st.shutdown();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     // ---- end to end: the real host against the real bridge ----
 
     /// Frames read from a child's stdout, delivered through a channel so a
@@ -968,6 +1142,50 @@ mod tests {
             .expect("a frame from the host")
     }
 
+    /// A real host that read another key (a stale or forged `bridge.json`)
+    /// is turned away by the app before it gets a slot or a prompt. The file
+    /// is put back afterwards.
+    fn a_wrong_key_is_turned_away(
+        dir: &Path,
+        hub: &Hub,
+        launch: &dyn Fn(&str) -> std::process::Child,
+    ) {
+        use std::io::Write as _;
+        let bridge_file = dir.join(streamtap_host::proto::BRIDGE_FILE);
+        let real = fs::read_to_string(&bridge_file).unwrap();
+        let bridge = streamtap_host::relay::read_bridge(dir).unwrap();
+        fs::write(
+            &bridge_file,
+            serde_json::json!({"port": bridge.port, "key": "ab".repeat(32)}).to_string(),
+        )
+        .unwrap();
+        let mut forged = launch("chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia/");
+        let rx = frames_of(forged.stdout.take().unwrap());
+        let mut stdin = forged.stdin.take().unwrap();
+        let hello = serde_json::json!({
+            "t": "hello", "v": 1, "instance": "e2e-forged", "browser": "chrome", "version": "0.3.0",
+        });
+        stdin.write_all(&native_frame(&hello)).unwrap();
+        stdin.flush().unwrap();
+        // The app closes the bridge at once; the host leaves (it says
+        // `app-closed` unless its write of the hello failed first).
+        wait_for("the turned-away host to exit", || {
+            forged.try_wait().unwrap()
+        });
+        let said: Vec<serde_json::Value> = rx.try_iter().collect();
+        assert!(
+            said.iter()
+                .all(|m| m["t"] == "error" && m["code"] == "app-closed"),
+            "{said:?}"
+        );
+        assert!(
+            hub.view().connections.is_empty(),
+            "no prompt for a wrong key"
+        );
+        drop(stdin);
+        fs::write(&bridge_file, real).unwrap();
+    }
+
     #[test]
     fn end_to_end_the_real_host_pairs_through_the_bridge() {
         use std::io::Write as _;
@@ -995,6 +1213,8 @@ mod tests {
         assert_eq!(bad.wait().unwrap().code(), Some(2));
         assert!(hub.view().connections.is_empty());
 
+        a_wrong_key_is_turned_away(&dir, &hub, &launch);
+
         let mut child = launch("chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia/");
         let rx = frames_of(child.stdout.take().unwrap());
         let mut stdin = child.stdin.take().unwrap();
@@ -1007,10 +1227,12 @@ mod tests {
             next_frame(&rx),
             serde_json::json!({"t": "state", "v": 1, "pairing": "pending"})
         );
-        // Until the user approves, nothing else comes, least of all the token.
-        assert!(rx
-            .recv_timeout(std::time::Duration::from_millis(400))
-            .is_err());
+        // Until the user approves, nothing else comes, least of all the token
+        // (and the host is still there: a closed channel would prove nothing).
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_millis(400)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
         let conn = wait_for("the pending connection", || {
             hub.view().connections.first().map(|c| (c.id, c.approved))
         });

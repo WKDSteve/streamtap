@@ -95,11 +95,25 @@ pub(crate) fn manifest_json(host_exe: &Path) -> Result<String, String> {
     serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())
 }
 
-/// `\\?\C:\x` becomes `C:\x`: browsers do not all read the verbatim form.
+/// `\\?\C:\x` becomes `C:\x` and `\\?\UNC\server\share\x` becomes
+/// `\\server\share\x`: browsers do not all read the verbatim form.
 fn plain(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
     text.strip_prefix(r"\\?\")
         .map_or_else(|| path.to_path_buf(), PathBuf::from)
+}
+
+/// Writes `text` to `path` through a temporary file and a rename.
+fn write_atomic(path: &Path, text: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("cannot replace {}: {e}", path.display())
+    })
 }
 
 pub(crate) fn state(reg: &impl Registry, dir: &Path, browser: Browser) -> Result<State, String> {
@@ -111,7 +125,9 @@ pub(crate) fn state(reg: &impl Registry, dir: &Path, browser: Browser) -> Result
     }
 }
 
-/// Writes the manifest, then points the browser's key at it.
+/// Writes the manifest (temporary file, then rename), then points the
+/// browser's key at it. When that fails the earlier state stays: a manifest
+/// that was there before is put back as it was, a new one is removed.
 pub(crate) fn register(
     reg: &mut impl Registry,
     dir: &Path,
@@ -127,17 +143,25 @@ pub(crate) fn register(
     let manifest = manifest_path(dir, browser);
     let folder = manifest.parent().ok_or("manifest path has no directory")?;
     fs::create_dir_all(folder).map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
-    let tmp = manifest.with_extension("json.tmp");
-    fs::write(&tmp, manifest_json(&host_exe)?)
-        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, &manifest)
-        .map_err(|e| format!("cannot replace {}: {e}", manifest.display()))?;
     let value = manifest
         .to_str()
         .ok_or("the manifest path is not valid text")?;
+    let text = manifest_json(&host_exe)?;
+    let before = match fs::read(&manifest) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("cannot read {}: {e}", manifest.display())),
+    };
+    write_atomic(&manifest, text.as_bytes())?;
     if let Err(e) = reg.set_default(&browser.key_path(), value) {
-        let _ = fs::remove_file(&manifest);
-        return Err(e);
+        let undo = match &before {
+            Some(old) => write_atomic(&manifest, old),
+            None => fs::remove_file(&manifest).map_err(|e| e.to_string()),
+        };
+        return Err(match undo {
+            Ok(()) => e,
+            Err(u) => format!("{e}; the earlier manifest could not be put back: {u}"),
+        });
     }
     Ok(())
 }
@@ -407,6 +431,64 @@ mod tests {
         assert!(register(&mut Failing, &d, Browser::Chrome, &host).is_err());
         assert!(!manifest_path(&d, Browser::Chrome).exists());
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A registry whose writes fail but which still shows the key an earlier
+    /// registration set.
+    struct ReadOnly(FakeRegistry);
+    impl Registry for ReadOnly {
+        fn get_default(&self, key: &str) -> Result<Option<String>, String> {
+            self.0.get_default(key)
+        }
+        fn set_default(&mut self, _: &str, _: &str) -> Result<(), String> {
+            Err("denied".into())
+        }
+        fn delete_key(&mut self, _: &str) -> Result<(), String> {
+            Err("denied".into())
+        }
+    }
+
+    #[test]
+    fn a_failed_register_keeps_a_working_registration() {
+        let d = dir("keep");
+        let host = fake_host(&d);
+        let mut reg = FakeRegistry::default();
+        register(&mut reg, &d, Browser::Edge, &host).unwrap();
+        let manifest = manifest_path(&d, Browser::Edge);
+        let before = fs::read(&manifest).unwrap();
+        // Register again for another host location; the key cannot be written.
+        let other = d.join("other");
+        fs::create_dir_all(&other).unwrap();
+        let mut ro = ReadOnly(reg);
+        assert!(register(&mut ro, &d, Browser::Edge, &fake_host(&other)).is_err());
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            before,
+            "the old manifest is back"
+        );
+        assert_eq!(state(&ro, &d, Browser::Edge).unwrap(), State::Registered);
+        assert!(
+            !manifest.with_extension("json.tmp").exists(),
+            "no temporary file is left"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_verbatim_unc_path_becomes_a_plain_unc_path() {
+        assert_eq!(
+            plain(Path::new(r"\\?\UNC\server\share\apps\h.exe")),
+            PathBuf::from(r"\\server\share\apps\h.exe")
+        );
+        assert_eq!(
+            plain(Path::new(r"\\server\share\apps\h.exe")),
+            PathBuf::from(r"\\server\share\apps\h.exe")
+        );
+        #[cfg(windows)]
+        assert!(plain(Path::new(r"\\?\UNC\server\share\apps\h.exe")).is_absolute());
+        let json = manifest_json(&plain(Path::new(r"\\?\UNC\server\share\h.exe"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["path"], r"\\server\share\h.exe");
     }
 
     #[test]

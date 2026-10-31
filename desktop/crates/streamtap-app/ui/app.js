@@ -98,7 +98,7 @@ const applyPrefs = () => {
   I18N.applyStatic(document);
   $("pref-language").value = state.prefs.language;
   $("pref-theme").value = state.prefs.theme;
-  if (pendingCapture) $("confirm-text").textContent = confirmText(pendingCapture);
+  fillConfirm();
   state.signature = "";
   if (state.snap) render(state.snap);
 };
@@ -345,7 +345,7 @@ const renderBrowser = (snap) => {
           el("strong", { text: profileLabel(a) }),
           el("span", { class: a.connected ? "ok" : "muted", text: a.connected ? t("connected") : t("notConnected") }),
           el("span", { class: "grow" }),
-          el("button", { type: "button", class: "danger", "data-fid": `rev:${a.instance}`, text: t("revoke"), onclick: () => run(t("revoke"), () => invoke("browser_revoke", { instance: a.instance })) })))
+          el("button", { type: "button", class: "danger", "data-fid": `rev:${a.instance}`, text: t("revoke"), onclick: () => askRevoke(a) })))
       : [el("li", { class: "muted", text: t("noPaired") })]),
   );
 
@@ -416,21 +416,47 @@ const refresh = async () => {
   }
 };
 
-// The capture the delete dialog asks about (its text is redone on a language change).
-let pendingCapture = null;
-const confirmText = (c) => t("confirmText", { title: c.title || c.id, size: fmtBytes(c.bytes), id: c.id });
+// What the confirm dialog asks about: { heading, ok, text(), action() } (its texts
+// are redone on a language change).
+let pendingConfirm = null;
 
-const askDelete = (c) => {
-  pendingCapture = c;
-  $("confirm-text").textContent = confirmText(c);
+const fillConfirm = () => {
+  if (!pendingConfirm) return;
+  $("confirm-h").textContent = t(pendingConfirm.heading);
+  $("confirm-ok").textContent = t(pendingConfirm.ok);
+  $("confirm-text").textContent = pendingConfirm.text();
+};
+
+const ask = (question) => {
+  pendingConfirm = question;
+  fillConfirm();
   $("confirm").showModal();
   $("confirm-cancel").focus();
 };
 
+const askDelete = (c) =>
+  ask({
+    heading: "deleteCaptureQ",
+    ok: "delete",
+    text: () => t("confirmText", { title: c.title || c.id, size: fmtBytes(c.bytes), id: c.id }),
+    action: () => run(t("delete"), () => invoke("delete_capture", { id: c.id })),
+  });
+
+// Revoking also gives the sink a new token (pushed to the other paired browsers)
+// and restarts a running sink, which ends its captures in progress.
+const askRevoke = (a) =>
+  ask({
+    heading: "revokeQ",
+    ok: "revoke",
+    text: () =>
+      `${t("revokeText", { name: profileLabel(a) })}${state.snap?.sink.state === "running" ? ` ${t("revokeRunning")}` : ""}`,
+    action: () => run(t("revoke"), () => invoke("browser_revoke", { instance: a.instance })),
+  });
+
 $("confirm").addEventListener("close", () => {
-  const id = pendingCapture?.id;
-  pendingCapture = null;
-  if ($("confirm").returnValue === "ok" && id) run(t("delete"), () => invoke("delete_capture", { id }));
+  const question = pendingConfirm;
+  pendingConfirm = null;
+  if ($("confirm").returnValue === "ok" && question) question.action();
 });
 
 $("sink-toggle").addEventListener("click", async () => {
