@@ -41,7 +41,8 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
 - Every connection becomes one capture directory
   `captures/<unix-seconds>_<session-prefix>[-n]/` (a suffix when the name is
   taken, e.g. a reconnect within the same second) with `session.json` (page
-  URL from the browser, title; written atomically), `sbN.pM.bin` (one file
+  URL from the browser, title, plus `state` and `sink_pid`; written atomically,
+  see "Connection state" below), `sbN.pM.bin` (one file
   per SourceBuffer `N` and init-segment part `M`) and `index.jsonl` (one line
   per written segment, written in one call: offset, length, MediaSource,
   `tfdt`, timescale, duration, `timestampOffset`, sequence mode, MIME). The
@@ -364,9 +365,9 @@ What it does:
   sink names them, `<unix seconds>_<session>[-n]`; other folders are ignored),
   newest first, refreshed
   every 2 s: title, page host, start time, duration, size, segments,
-  SourceBuffers (kind, MIME, size), and badges: `live` (the sink runs and wrote
-  into it within 10 s; the sink keeps no connection flag on disk, so a paused
-  video shows `done` after a pause), `DRM refused` (see below), `muxed` (an
+  SourceBuffers (kind, MIME, size), and badges: `live` (the connection that
+  writes the capture is open; exact, a paused video stays `live`, see
+  "Connection state"), `DRM refused` (see below), `muxed` (an
   `out.mp4` exists). `index.jsonl` is read incrementally (only the lines
   appended since the last poll).
 - **Per capture:** Mux (runs `streamtap-sink mux <dir>`, shows running, ok or
@@ -403,15 +404,43 @@ Security:
   local processes of the same user can read it there. That limit stays until
   the sink takes it another way (pairing).
 
-Limits: closing the app stops the sink, but if the app is killed the sink
-keeps running (no job object yet; stop it in the task manager). A mux in
-progress is not stopped on exit (it ends by its own timeout). The sink's
-`session.json` has no end marker, hence the 10 s heuristic for `live`.
+- **Connection state:** the sink writes `"state":"open"` and its own `sink_pid`
+  into `session.json` when a connection starts and rewrites it atomically with
+  `"state":"ended"` and `"ended"` (unix seconds) when the connection is over
+  (end of stream, closed socket, write error, even a panic: it runs in `Drop`).
+  The app lists a capture as `live` only while it is `open`, written by the
+  sink process the app runs (`sink_pid`) and that sink is running. A sink that
+  was killed hard cannot write the end; its captures stay `open` on disk but
+  are not live, because that process is gone. Captures of older sinks have no
+  `state`: for those the app keeps the old rule (live = the sink runs and wrote
+  into the capture within 10 s). Readers that do not know the fields ignore them.
+- **Children die with the app:** on Windows the app puts the sink and every
+  mux (with the ffmpeg it starts) into a job object with kill-on-close
+  (`win32job` crate, a safe wrapper; this crate stays `unsafe`-free). Windows
+  ends them when the app exits, also when the app is killed hard
+  (Task Manager, crash). On a normal exit the app stops the sink and aborts
+  running muxes: the process tree is killed and the half-written
+  `out.part.mp4` is removed (a mux killed by the OS after a hard kill of the
+  app cannot clean it up; the next mux overwrites it). If the job cannot be set
+  up, the sink log says so. Other platforms have no such guard (Windows-only
+  for now).
+
+Limits: a hard kill of the app leaves a stale `out.part.mp4` in a capture
+whose mux was running (harmless, replaced by the next mux).
 
 Checks in CI and locally: the unit tests cover the capture scanner (incremental
 index reading, partial lines, replaced files, state flags), id and path
 validation (traversal, separators, drive syntax, junction), settings and token,
-DRM line parsing, exit-code mapping and the log scrubbing. `cargo deny` checks
-the Windows target graph only (`targets` in `deny.toml`); the two Linux-only
-advisories of Tauri's GTK backend are ignored for `cargo audit` in
-`.cargo/audit.toml` with their reasons.
+DRM line parsing, exit-code mapping and the log scrubbing. Two tests start the
+real sink: one sends an encrypted init (`encv`/`tenc`/`pssh`) over a
+WebSocket and checks that the app's scanner flags the capture `DRM refused`
+and that `live` ends with the connection; the other kills an owner process and
+checks that its job-tied child is gone. `cargo deny` checks the Windows target
+graph only (`targets` in `deny.toml`).
+
+Linux and macOS: the project is Windows-only for now and has no Linux CI. Two
+advisories only exist in Tauri's Linux backend (GTK3): RUSTSEC-2024-0370
+(`proc-macro-error`, unmaintained, build-time) and RUSTSEC-2024-0429 (`glib`
+unsoundness). `cargo deny` never sees them (Windows graph); `cargo audit`
+scans the whole `Cargo.lock` and ignores them in `.cargo/audit.toml`. A Linux
+build needs a decision first (newer Tauri/GTK4 backend), not the ignore.

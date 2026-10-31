@@ -1,6 +1,8 @@
 # cargo-audit scans every crate in Cargo.lock, including the ones only the Linux backend of Tauri (wry/gtk3) pulls
 # in. The app ships for Windows only (see targets in deny.toml, which checks the Windows graph and needs no ignore).
-# Revisit when a Linux build is added: then these need a decision, not an ignore.
+# DECISION: the project is Windows-only for now (no Linux build, no Linux CI), so both advisories are ignored on
+# purpose and stay ignored until a Linux build is planned. That is the moment to decide (newer Tauri with a GTK4
+# backend, or accept per advisory), not to keep the ignore. See "Linux and macOS" in desktop/README.md.
 [advisories]
 ignore = [
     # proc-macro-error is unmaintained: a build-time dependency of gtk3-macros, Linux only.

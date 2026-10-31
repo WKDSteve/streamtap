@@ -5,7 +5,9 @@
 all-features = false
 # The app is built and shipped for Windows only (self-hosted Windows CI). Tauri's Linux backend (gtk3, glib,
 # proc-macro-error) is not in the Windows build; without this its unmaintained crates fail the check.
-# Add targets here when a Linux or macOS build is added.
+# Windows-only is a decision, not an omission: RUSTSEC-2024-0370 and RUSTSEC-2024-0429 (GTK3 backend) are therefore
+# not ignored here (they are not in this graph) but in .cargo/audit.toml, because cargo-audit reads all of Cargo.lock.
+# Add targets here, and decide those two advisories, when a Linux or macOS build is added. No Linux CI until then.
 targets = ["x86_64-pc-windows-msvc"]
 
 [advisories]
