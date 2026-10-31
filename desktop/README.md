@@ -469,7 +469,8 @@ the extension. Three parts:
   its config dir (`%APPDATA%\io.github.wkdsteve.streamtap`; temporary file and
   rename; removed on exit). The key is new at every app start (the same
   generator as the sink token). A host finds the app there and sends the key as
-  the first line; the app reads at most 128 bytes for it within 2 s, compares in
+  the first line; the app reads at most 128 bytes for it within 2 s in total (a
+  client that trickles in a byte now and then is cut off as well), compares in
   constant time and closes a connection without the right key before it takes
   one of the 16 connection slots or can raise a pairing prompt. So only a process
   that can read the app's config directory can talk to the bridge at all.
@@ -510,7 +511,9 @@ sink a **new token** (the same generator as *New token*), saves it and pushes it
 every browser that is still approved and connected; the revoked one was closed first
 and gets nothing, so a copy it kept is useless at once. A running sink is restarted
 with the new token, which ends captures in progress (the confirmation says so). A
-browser set up by hand in the popup needs the new token there. A new token or port
+browser set up by hand in the popup needs the new token there; the Settings panel
+reads the token again after every revoke (also one that reports an error), so *Show*
+and *Copy* give the new one. A new token or port
 (Settings) is pushed to paired browsers. The browser name is what the extension reports (Edge and
 Chrome are told apart by the browser's brands; Brave usually looks like Chrome); the
 profile is the instance id, not the profile's name, which the protocol does not
@@ -537,7 +540,8 @@ never printed (`Debug` is written by hand; the tests check it).
 
 Tests: schema and framing (unit), the host against a fake app on a real socket
 (the key comes first), the bridge key (silent, wrong, missing and oversized keys get
-no slot and no prompt; a new key per start), the hub (pending gets no credentials,
+no slot and no prompt; a key trickled in byte by byte is cut off after 2 s; a new
+key per start), the hub (pending gets no credentials,
 deny, remember, revoke, tap only for reported tabs, foreign origin, bounds), revoke
 with token rotation (the revoked browser gets nothing, the others the new token, the
 config is saved, a running real sink is restarted), the registry logic against a
@@ -550,7 +554,8 @@ generated, which the extension itself claims (any process of your user that can
 read the app's config directory could claim another; you still approve every new
 one, and such a process could read `config.json` anyway). A process that cannot
 read `bridge.json` gets no slot and no prompt; one that only opens connections
-without sending anything holds a thread for 2 s each, not a slot. The hand run in a real
+without sending anything, or only a byte now and then, holds a thread for 2 s each,
+not a slot. The hand run in a real
 Chrome is still to do (see the task); Firefox is out of scope.
 
 Limits: a hard kill of the app leaves a stale `out.part.mp4` in a capture
@@ -568,7 +573,9 @@ graph only (`targets` in `deny.toml`). `node desktop/scripts/test-app-ui.mjs`
 checks the UI without a webview: both language tables have the same keys and
 placeholders, every key `index.html` and `app.js` use exists, and both themes
 in `style.css` keep WCAG contrast (4.5:1 for text, 3:1 for focus ring and
-status dot) for every colour pair the UI uses.
+status dot) for every colour pair the UI uses; then it runs `app.js` against a
+fake DOM and fake commands and checks that after a revoke (also one that fails
+after the token changed) the token field and *Copy* give the new token.
 
 Linux and macOS: the project is Windows-only for now and has no Linux CI. Two
 advisories only exist in Tauri's Linux backend (GTK3): RUSTSEC-2024-0370

@@ -443,14 +443,24 @@ const askDelete = (c) =>
   });
 
 // Revoking also gives the sink a new token (pushed to the other paired browsers)
-// and restarts a running sink, which ends its captures in progress.
+// and restarts a running sink, which ends its captures in progress. The settings
+// are read again afterwards, also when the revoke reports an error (the token may
+// have changed before the sink failed to start again): Show and Copy must give the
+// new token, which a browser set up by hand needs.
 const askRevoke = (a) =>
   ask({
     heading: "revokeQ",
     ok: "revoke",
     text: () =>
       `${t("revokeText", { name: profileLabel(a) })}${state.snap?.sink.state === "running" ? ` ${t("revokeRunning")}` : ""}`,
-    action: () => run(t("revoke"), () => invoke("browser_revoke", { instance: a.instance })),
+    action: () =>
+      run(t("revoke"), async () => {
+        try {
+          await invoke("browser_revoke", { instance: a.instance });
+        } finally {
+          state.settings = await invoke("get_settings");
+        }
+      }),
   });
 
 $("confirm").addEventListener("close", () => {

@@ -1,7 +1,8 @@
 // Checks the desktop app's UI without a webview: the i18n tables (same keys and
 // placeholders in English and German, t() and the language choice), that every key
 // index.html and app.js use exists, and that both themes in style.css keep readable
-// contrast (WCAG ratios) for every text and control colour pair the UI uses.
+// contrast (WCAG ratios) for every text and control colour pair the UI uses. Then
+// app.js runs against a fake DOM and fake commands (the revoke flow).
 //
 //   node desktop/scripts/test-app-ui.mjs
 
@@ -122,8 +123,148 @@ for (const [name, theme] of [["light", light], ["dark", darkMedia]]) {
   }
 }
 
+// ---- app.js against a fake DOM and fake commands --------------------------
+
+// Just enough DOM for app.js: elements by id (made on first use), created elements,
+// listeners that the test fires by hand. Nothing is laid out or rendered.
+class FakeEl {
+  constructor(id = "") {
+    this.id = id;
+    this.textContent = "";
+    this.value = "";
+    this.hidden = false;
+    this.disabled = false;
+    this.type = "";
+    this.className = "";
+    this.returnValue = "";
+    this.scrollTop = 0;
+    this.clientHeight = 0;
+    this.scrollHeight = 0;
+    this.dataset = {};
+    this.children = [];
+    this.attrs = {};
+    this.listeners = {};
+    this.classList = { toggle() {}, add() {}, remove() {} };
+  }
+  addEventListener(type, fn) {
+    (this.listeners[type] ??= []).push(fn);
+  }
+  fire(type) {
+    for (const fn of this.listeners[type] ?? []) fn({ preventDefault() {} });
+  }
+  setAttribute(k, v) {
+    this.attrs[k] = String(v);
+  }
+  append(...c) {
+    this.children.push(...c);
+  }
+  replaceChildren(...c) {
+    this.children = c;
+  }
+  querySelectorAll() {
+    return [];
+  }
+  showModal() {
+    this.open = true;
+  }
+  focus() {}
+  select() {}
+}
+
+const SETTINGS = { port: 17650, token: "old-token", captures_dir: "C:/c", language: "en", theme: "system" };
+const SNAPSHOT = {
+  sink: { state: "stopped" },
+  sink_path: "C:/sink.exe",
+  ffmpeg: "C:/ffmpeg.exe",
+  config_error: null,
+  captures: [],
+  captures_error: null,
+  mux: {},
+  log: [],
+  browser: {
+    host_path: "C:/host.exe",
+    bridge_error: null,
+    registrations: [],
+    link: { connections: [], approvals: [{ instance: "p-1", browser: "chrome", profile: "Default", connected: true }], store_error: null },
+  },
+};
+
+// Loads app.js with `commands` as the app's Tauri commands; returns the element
+// lookup, what was copied to the clipboard and a way to run code inside the page.
+const loadApp = (commands) => {
+  const els = new Map();
+  const byId = (id) => {
+    if (!els.has(id)) els.set(id, new FakeEl(id));
+    return els.get(id);
+  };
+  const copied = [];
+  const context = vm.createContext({
+    console,
+    window: {
+      addEventListener() {},
+      __TAURI__: {
+        core: {
+          invoke: async (cmd, args) => {
+            if (!(cmd in commands)) throw new Error(`unexpected command ${cmd}`);
+            return structuredClone(await commands[cmd](args));
+          },
+        },
+      },
+    },
+    document: {
+      documentElement: new FakeEl("html"),
+      activeElement: null,
+      getElementById: byId,
+      createElement: () => new FakeEl(),
+      querySelectorAll: () => [],
+      querySelector: () => null,
+    },
+    navigator: { language: "en-US", clipboard: { writeText: async (text) => void copied.push(text) } },
+    CSS: { escape: (s) => s },
+    setInterval: () => 0,
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  });
+  vm.runInContext(read("i18n.js"), context);
+  vm.runInContext(read("app.js"), context);
+  return { byId, copied, page: (code) => vm.runInContext(code, context) };
+};
+
+const settle = async () => {
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+};
+
+// After a revoke the token field and Copy give the new token, also when the revoke
+// reports an error after the token changed (the sink did not start again).
+for (const failAfterRotation of [false, true]) {
+  const backend = { ...SETTINGS };
+  const app = loadApp({
+    get_settings: () => backend,
+    snapshot: () => SNAPSHOT,
+    browser_revoke: ({ instance }) => {
+      check(instance === "p-1", "browser_revoke gets the instance");
+      backend.token = "new-token";
+      if (failAfterRotation) throw "revoked and the token changed, but the sink did not start again";
+      return null;
+    },
+  });
+  await settle();
+  const what = failAfterRotation ? "revoke that fails after the rotation" : "revoke";
+  check(app.byId("token").value === "old-token", `${what}: the token field shows the token first`);
+  app.page(`askRevoke(${JSON.stringify(SNAPSHOT.browser.link.approvals[0])})`);
+  const dialog = app.byId("confirm");
+  check(dialog.open === true, `${what}: the revoke asks first`);
+  dialog.returnValue = "ok";
+  dialog.fire("close");
+  await settle();
+  check(app.byId("token").value === "new-token", `${what}: the token field shows the new token, not ${app.byId("token").value}`);
+  app.byId("token-copy").fire("click");
+  await settle();
+  check(app.copied.at(-1) === "new-token", `${what}: Copy gives the new token, not ${app.copied.at(-1)}`);
+}
+
 if (failures) {
   console.error(`${failures} check(s) failed`);
   process.exit(1);
 }
-console.log("app UI: i18n tables, keys and theme contrast ok");
+console.log("app UI: i18n tables, keys, theme contrast and the revoke flow ok");

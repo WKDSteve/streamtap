@@ -17,11 +17,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use streamtap_host::framing::read_line;
@@ -462,16 +462,46 @@ fn same_key(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Reads the key line: at most `MAX_BRIDGE_KEY` bytes and until `deadline`
+/// in total, not per read, so a client that trickles in a byte now and then
+/// is cut off as well. None for a timeout, a closed or failed connection, a
+/// line that is too long or one without its end.
+fn read_key(lines: &mut BufReader<TcpStream>, deadline: Instant) -> Option<Vec<u8>> {
+    let mut key = Vec::new();
+    loop {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())?;
+        lines.get_ref().set_read_timeout(Some(left)).ok()?;
+        let buf = lines.fill_buf().ok()?;
+        if buf.is_empty() {
+            return None;
+        }
+        let (take, found) = buf
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or((buf.len(), false), |i| (i, true));
+        if key.len() + take > MAX_BRIDGE_KEY {
+            return None;
+        }
+        key.extend_from_slice(&buf[..take]);
+        lines.consume(take + usize::from(found));
+        if found {
+            if key.last() == Some(&b'\r') {
+                key.pop();
+            }
+            return Some(key);
+        }
+    }
+}
+
 fn serve_connection(hub: &Hub, stream: TcpStream, key: &str) {
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    // The key comes first, read with a short timeout and a small bound;
+    // The key comes first, within a short time in total and a small bound;
     // without it the connection gets no slot and no prompt.
-    let _ = stream.set_read_timeout(Some(KEY_TIMEOUT));
+    let deadline = Instant::now() + KEY_TIMEOUT;
     let mut lines = BufReader::new(stream);
-    let keyed = read_line(&mut lines, MAX_BRIDGE_KEY)
-        .ok()
-        .flatten()
-        .is_some_and(|k| same_key(&k, key.as_bytes()));
+    let keyed = read_key(&mut lines, deadline).is_some_and(|k| same_key(&k, key.as_bytes()));
     let stream = lines.get_ref();
     if !keyed {
         let _ = stream.shutdown(Shutdown::Both);
@@ -865,6 +895,52 @@ mod tests {
         drop(silent);
         server.stop();
         hub.close_all();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The key timeout counts in total: a client that sends a byte of the
+    /// right key now and then (each read is quick) is cut off all the same.
+    #[test]
+    fn a_trickled_key_is_cut_off_after_the_key_timeout() {
+        use std::io::Read as _;
+        let (h, dir) = hub("trickle");
+        let hub = Arc::new(h);
+        let server = Server::start(&hub, &dir).unwrap();
+        let bridge = streamtap_host::relay::read_bridge(&dir).unwrap();
+        let key = bridge.key().as_bytes().to_vec();
+        let mut s = TcpStream::connect(("127.0.0.1", bridge.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let start = Instant::now();
+        let mut sent = 0;
+        let closed = loop {
+            if start.elapsed() > KEY_TIMEOUT * 3 {
+                break false;
+            }
+            if s.write_all(&key[sent..=sent]).is_err() {
+                break true;
+            }
+            sent += 1;
+            let mut b = [0u8; 1];
+            match s.read(&mut b) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                _ => break true,
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        };
+        assert!(closed, "still open after {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < KEY_TIMEOUT * 2,
+            "closed only after {:?}",
+            start.elapsed()
+        );
+        assert!(sent < key.len(), "the key was never complete");
+        assert_eq!(hub.slots(), 0);
+        server.stop();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
