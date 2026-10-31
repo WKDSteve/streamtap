@@ -356,6 +356,15 @@ check(last().initLen !== null && last().tsoSet === true, "an init+media append c
 sb13.appendBuffer(ab(media(90000)));
 check(last().tsoSet === false, "an init+media append uses it up");
 
+// An empty append adds no frames: it neither uses up a set offset nor counts.
+const sb13e = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+sb13e.appendBuffer(ab(init("avc1")));
+const seqBefore = last().seq;
+sb13e.timestampOffset = 4;
+sb13e.appendBuffer(ab(Buffer.alloc(0)));
+sb13e.appendBuffer(ab(media(0)));
+check(last().tsoSet === true && last().seq === seqBefore + 1, "an empty append leaves the set offset and seq alone");
+
 // A short tail of media, then an init: both posted on their own, the init intact.
 const sb14 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
 const ini14 = init("avc1");

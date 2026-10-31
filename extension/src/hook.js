@@ -547,7 +547,9 @@
 
   const onAppend = (sb, data, api) => {
     const u8 = toU8(data);
-    if (!u8) return;
+    // An empty append adds no coded frames: the browser does not use up a set
+    // timestampOffset on it, so it is not recorded at all (nor counted).
+    if (!u8 || u8.byteLength === 0) return;
     let info = sbInfo.get(sb);
     if (!info) {
       // Created before the hook was installed (late injection, or a player that
