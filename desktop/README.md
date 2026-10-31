@@ -464,6 +464,12 @@ the extension. Three parts:
   the `winreg` crate (MIT, already in the tree through Tauri's build tooling)
   behind a trait: the tests use a fake, and one test uses a throw-away key under
   `HKCU\Software\streamtap-test-<pid>` that it removes, never the browsers' keys.
+  Start the app from Explorer or the Start menu when you register: an app
+  launched by a packaged (MSIX) program, such as a terminal or agent inside
+  one, inherits its container, and its HKCU key, manifest and `bridge.json`
+  then exist only inside that package (`%LOCALAPPDATA%\Packages\<package>\LocalCache`,
+  private registry hive). The app shows "registered", but the browser finds no
+  host and never starts it (popup: "the connector is not registered").
 
 Pairing: the extension connects and says hello (a random instance id it keeps per
 browser profile, the browser it believes it is, its version). The app shows
