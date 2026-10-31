@@ -316,18 +316,16 @@ ffprobe reports h264 640×360 + aac 48 kHz, 6.08 s.
 First real-browser run (Chrome, ARD Mediathek, 2026-10-31): one session,
 H.264 1280×720 + AAC, 630 s after reordering, full decode without errors.
 
-## Deferred from the NEW_PROJECT gate (rules-vault, native)
+## Hardening: done and deferred
 
 Done: loopback bind, exact origin check in the handshake, token before any
 write, hard size limits, bounded tracks and bad messages, atomic
 `session.json`, unit tests of the storage and mux logic, workspace lints, no
 shell for the ffmpeg child, child-process frame for ffmpeg/ffprobe (deadline,
-empty environment, byte limits, exit status and stderr checked: `RS-04`,
-`RS-06`, `ENG-01`..`ENG-03`), error enum with one exit code per class
-(`RS-05`), a missing ffprobe is reported (`ENG-13`), no heredocs for docs,
-LICENSE.
-Not yet (spike): `deny.toml` / `cargo audit` in CI, Windows CI runner (repo is
-private), security tests as raw TCP bytes against the running server (`TST-01`),
+empty environment, byte limits, exit status and stderr checked), error enum
+with one exit code per class, a missing ffprobe is reported, LICENSE.
+Not yet (spike): `deny.toml` / `cargo audit` in CI, Windows CI runner, security
+tests as raw TCP bytes against the running server,
 read and handshake timeouts, the token on the command line (visible to other
 processes; pairing replaces it), the core/sink/testkit split, the Tauri
 shell and UI. The security tests, CI and the split come first, before new

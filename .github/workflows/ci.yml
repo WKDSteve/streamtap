@@ -1,10 +1,9 @@
 # CI of streamtap.
 #
-# Runs on a self-hosted runner (the author's Windows machine): the repository is private and has no paid plan, so
-# hosted runners (ubuntu-latest) do not start. Start the runner with `scripts/runners.ps1 ensure streamtap` of the
-# nvim config; without it a push stays "Queued". Only for a PRIVATE repo with trusted authors: no `pull_request`
-# trigger on purpose (a PR would run its own workflow with the author's rights on this machine). A Linux and a Windows
-# job on hosted runners come when the repository goes public (NREL-13).
+# Runs on a self-hosted runner (the author's Windows machine), by choice; without a running runner a push stays
+# "Queued". No `pull_request` trigger on purpose: a pull request would run its own workflow with the author's rights
+# on this machine. Checks of pull requests on GitHub-hosted runners may come later as their own legs; the repository
+# requires approval before a workflow of an outside contributor runs.
 #
 # Tools (rustup, cargo-audit, cargo-deny, node, python) are expected on the PATH and print their versions; the Rust
 # toolchain itself is the one desktop/rust-toolchain.toml names, so local builds and CI use the same.
@@ -40,7 +39,7 @@ jobs:
       run:
         working-directory: desktop
     steps:
-      # Actions are pinned by commit (NREL-03); the comment names the tag.
+      # Actions are pinned by commit; the comment names the tag.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
         with:
           persist-credentials: false
@@ -51,7 +50,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      # The supply chain (NREL-01): known advisories, licenses, sources.
+      # The supply chain: known advisories, licenses, sources.
       - run: cargo audit --deny warnings
       - run: cargo deny check
 
@@ -63,7 +62,7 @@ jobs:
         with:
           persist-credentials: false
       - run: node --version
-      # Syntax of every script of the extension and of the test drivers (TST-17).
+      # Syntax of every script of the extension and of the test drivers.
       - name: node --check
         run: git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' 'desktop/crates/streamtap-app/ui/*.js' | xargs -0 -n1 node --check
       # The MSE hook in Node with stand-ins; needs neither a browser nor a sink.
@@ -76,7 +75,7 @@ jobs:
       - run: node desktop/scripts/test-sink-link.mjs
 
   # A control or invisible character in a tracked text file (a backspace in a path, a bidirectional override in
-  # source) is refused (NREL-14); the tool tests itself.
+  # source) is refused; the tool tests itself.
   hygiene:
     runs-on: [self-hosted, windows]
     timeout-minutes: 10

@@ -5,10 +5,12 @@ already in the clear: a browser extension hooks `SourceBuffer.appendBuffer()`
 (Media Source Extensions) and hands the segments to a desktop app that writes
 them to disk and muxes them into a playable file. Bit-exact, no re-encoding.
 
-Aimed at players that do not use DRM (public broadcasters' media libraries,
-YouTube, Vimeo, Twitch, news sites, lecture platforms); verified so far in
-Chrome on the ARD Mediathek (hls.js). Content protected by EME/DRM
-(Widevine, PlayReady, FairPlay) is detected and left alone, by design.
+Aimed at players that do not use DRM, for personal copies where the site
+allows them (public broadcasters' media libraries, lecture platforms, your own
+content); verified so far in Chrome on the ARD Mediathek (hls.js). Content
+protected by EME/DRM (Widevine, PlayReady, FairPlay) is detected and left
+alone, by design. Respect the terms of the sites you use it on; see the
+[legal note](#legal-note).
 
 ## Status
 
@@ -42,8 +44,8 @@ streamtap/
 
 ## Checks
 
-CI (`.github/workflows/ci.yml`, self-hosted Windows runner while the
-repository is private) runs, and locally the same commands do:
+CI (`.github/workflows/ci.yml`, the author's self-hosted Windows runner, on
+pushes to `main` only) runs, and locally the same commands do:
 
 ```
 cd desktop
@@ -73,11 +75,8 @@ installs it on first use).
 3. MVP: desktop app with a capture list, DRM flag, mux and open (started: sink control,
    live list, mux/open/delete, browser pairing with a tab list; still to do: background
    capture mode, installer).
-4. Later: download modes (yt-dlp, manifest replay), tab capture, live ring
+4. Later: more capture modes for DRM-free streams, tab capture, live ring
    buffer, Firefox.
-
-The full concept, the mode matrix and the DRM/CDM primer are kept outside this
-repository (vault notes).
 
 ## Legal note
 

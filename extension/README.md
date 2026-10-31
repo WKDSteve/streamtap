@@ -14,9 +14,6 @@ CSP (`connect-src`) can block it. The manifest's `key` pins the extension id
 to `oggpddakdbffbjhkjmcakidgmhpgakia` on every machine, so the origin is
 `chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia`.
 
-The concept and the DRM primer live in the nvim-config vault under
-`docs/ROADMAP/IDEAS/video-capture/`.
-
 ## Files
 
 | File | Runs where | Purpose |
@@ -86,7 +83,7 @@ service worker, so the sink link does not run there; it also ignores `key`
 ## What a successful run looks like
 
 - Two SourceBuffers per MediaSource on DASH / most HLS-via-hls.js sites: one
-  `video/mp4`, one `audio/mp4` (or `video/webm` + `audio/webm` on YouTube).
+  `video/mp4`, one `audio/mp4` (or `video/webm` + `audio/webm` on WebM players).
 - First append per SourceBuffer is the init segment (`[ftyp moov]`, `INIT`),
   followed by media segments (`[moof mdat]`) with monotonically increasing
   `t=` values and a stable duration (typically 2–10 s).
