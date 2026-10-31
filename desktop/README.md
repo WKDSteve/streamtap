@@ -98,10 +98,29 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
 ## Mux
 
 ```
-target/release/streamtap-sink mux captures/<dir> [--out file.mp4]
+target/release/streamtap-sink mux captures/<dir> [--out file.mp4] [--timeout-secs 3600]
 ```
 
-Runs `ffmpeg -f mp4 -protocol_whitelist file [-itsoffset <s>] -i <part> … -map 0 -map 1 … -c copy -movflags +faststart`.
+Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffset <s>] -i <part> … -map 0 -map 1 … -c copy -movflags +faststart`.
+
+- **ffmpeg and ffprobe as children:** started without a shell, with an
+  empty environment plus `PATH`, `PATHEXT`, `SystemRoot`, `windir`, `TEMP`,
+  `TMP`, `TMPDIR`, `HOME`, `USERPROFILE`, stdin null and no console window.
+  One deadline covers exit and pipes: `ffmpeg -version` 20 s, ffprobe 60 s
+  per part, the mux `--timeout-secs` (default 3600); then the child is
+  killed. stdout and stderr are capped at 64 KiB each (more kills the
+  child); a failure quotes the last 4 KiB of stderr. ffmpeg logs errors only,
+  and what it reports on success is printed after the run.
+- **Version and missing tools:** `mux` first runs `ffmpeg -version` and
+  prints the version line (`mux: ffmpeg version …`); without ffmpeg it stops
+  before any work with "ffmpeg not found on PATH". A missing ffprobe is a
+  warning, said once: the parts are then not checked for decodability and
+  are aligned by the capture's own timestamps (without B-frame offsets and
+  edit lists). ffprobe timing out on a part is a warning for that part.
+- **Exit codes:** `0` ok, `1` file or socket error, `2` usage, `3` the capture
+  holds nothing to mux, `4` ffmpeg/ffprobe missing or not startable, `5` a tool
+  timed out or exceeded its output limit, `6` ffmpeg failed (its stderr tail is
+  printed).
 
 - **Inputs are checked and forced:** a part must start like its kind (`ftyp`,
   `moov` or `styp` for MP4, the EBML magic for WebM) and ffmpeg gets the
@@ -209,11 +228,14 @@ H.264 1280×720 + AAC, 630 s after reordering, full decode without errors.
 Done: loopback bind, exact origin check in the handshake, token before any
 write, hard size limits, bounded tracks and bad messages, atomic
 `session.json`, unit tests of the storage and mux logic, workspace lints, no
-shell for the ffmpeg child, no heredocs for docs, LICENSE.
+shell for the ffmpeg child, child-process frame for ffmpeg/ffprobe (deadline,
+empty environment, byte limits, exit status and stderr checked: `RS-04`,
+`RS-06`, `ENG-01`..`ENG-03`), error enum with one exit code per class
+(`RS-05`), a missing ffprobe is reported (`ENG-13`), no heredocs for docs,
+LICENSE.
 Not yet (spike): `deny.toml` / `cargo audit` in CI, Windows CI runner (repo is
 private), security tests as raw TCP bytes against the running server (`TST-01`),
-read and handshake timeouts, child-process timeout for ffmpeg (`RS-04`),
-error enum (`RS-05`), the token on the command line (visible to other
+read and handshake timeouts, the token on the command line (visible to other
 processes; pairing replaces it), the core/sink/testkit split, the Tauri
 shell and UI. The security tests, CI and the split come first, before new
 features.

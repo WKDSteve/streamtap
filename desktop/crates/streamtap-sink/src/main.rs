@@ -15,12 +15,25 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+mod error;
+mod proc;
+
+use error::SinkError;
+use proc::{Spec, Tool, Tools};
+
+/// Deadline of `ffmpeg -version`.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(20);
+/// Deadline of one ffprobe run on a part.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default deadline of the mux (`--timeout-secs`): a stream copy of a
+/// 16 GiB capture takes minutes, not hours.
+const DEFAULT_MUX_TIMEOUT_SECS: u64 = 3600;
 
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
@@ -45,14 +58,21 @@ const DEFAULT_ORIGIN: &str = "chrome-extension://oggpddakdbffbjhkjmcakidgmhpgaki
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let code = match args.first().map(String::as_str) {
-        Some("serve") => run_serve(&args[1..]),
-        Some("mux") => run_mux(&args[1..]),
-        _ => {
-            eprintln!(
-                "usage:\n  streamtap-sink serve --token <token> [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>]"
-            );
-            2
+    let (cmd, result) = match args.first().map(String::as_str) {
+        Some("serve") => ("serve", run_serve(&args[1..])),
+        Some("mux") => ("mux", run_mux(&args[1..], &Tools::default())),
+        _ => (
+            "streamtap-sink",
+            Err(SinkError::Usage(format!(
+                "usage:\n  streamtap-sink serve --token <token> [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}]"
+            ))),
+        ),
+    };
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{cmd}: {e}");
+            e.exit_code()
         }
     };
     std::process::exit(code);
@@ -69,55 +89,40 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 // serve
 // ---------------------------------------------------------------------------
 
-fn run_serve(args: &[String]) -> i32 {
+fn run_serve(args: &[String]) -> Result<(), SinkError> {
     let Some(token) = flag(args, "--token") else {
-        eprintln!("serve: --token is required (the extension must send the same value)");
-        return 2;
+        return Err(SinkError::Usage(
+            "--token is required (the extension must send the same value)".into(),
+        ));
     };
     let port = match flag(args, "--port").map(str::parse::<u16>) {
         None => DEFAULT_PORT,
         Some(Ok(p)) => p,
-        Some(Err(_)) => {
-            eprintln!("serve: --port must be a number");
-            return 2;
-        }
+        Some(Err(_)) => return Err(SinkError::Usage("--port must be a number".into())),
     };
     let out = PathBuf::from(flag(args, "--out").unwrap_or("captures"));
     let origin = flag(args, "--allow-origin")
         .unwrap_or(DEFAULT_ORIGIN)
         .to_owned();
     let gib = |name: &str, default: u64| match flag(args, name).map(str::parse::<u64>) {
-        None => Some(default << 30),
-        Some(Ok(g)) if (1..=4096).contains(&g) => Some(g << 30),
-        Some(_) => {
-            eprintln!("serve: {name} must be a whole number from 1 to 4096");
-            None
-        }
+        None => Ok(default << 30),
+        Some(Ok(g)) if (1..=4096).contains(&g) => Ok(g << 30),
+        Some(_) => Err(SinkError::Usage(format!(
+            "{name} must be a whole number from 1 to 4096"
+        ))),
     };
-    let (Some(per_session), Some(total_max)) = (
-        gib("--max-session-gib", DEFAULT_MAX_SESSION_GIB),
-        gib("--max-total-gib", DEFAULT_MAX_TOTAL_GIB),
-    ) else {
-        return 2;
-    };
+    let per_session = gib("--max-session-gib", DEFAULT_MAX_SESSION_GIB)?;
+    let total_max = gib("--max-total-gib", DEFAULT_MAX_TOTAL_GIB)?;
     let budget = Arc::new(Budget {
         per_session,
         total_max,
         total_used: AtomicU64::new(0),
     });
-    if let Err(e) = fs::create_dir_all(&out) {
-        eprintln!("serve: cannot create {}: {e}", out.display());
-        return 1;
-    }
+    fs::create_dir_all(&out).map_err(|e| SinkError::io("cannot create", Some(out.clone()), e))?;
 
     // Loopback only. Binding anything else is not an option, not a flag.
-    let listener = match TcpListener::bind(("127.0.0.1", port)) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("serve: bind 127.0.0.1:{port} failed: {e}");
-            return 1;
-        }
-    };
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| SinkError::io(format!("bind 127.0.0.1:{port} failed"), None, e))?;
     println!(
         "streamtap-sink listening on ws://127.0.0.1:{port}  out={}  origin={origin}",
         out.display()
@@ -140,7 +145,7 @@ fn run_serve(args: &[String]) -> i32 {
             Err(e) => eprintln!("accept failed: {e}"),
         }
     }
-    0
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1695,21 +1700,29 @@ fn write_sorted(
     Ok(sorted)
 }
 
-fn run_mux(args: &[String]) -> i32 {
+fn run_mux(args: &[String], tools: &Tools) -> Result<(), SinkError> {
     let Some(dir) = args.first().filter(|a| !a.starts_with("--")) else {
-        eprintln!("mux: capture directory required");
-        return 2;
+        return Err(SinkError::Usage("capture directory required".into()));
     };
     let dir = PathBuf::from(dir);
     let out = flag(args, "--out").map_or_else(|| dir.join("out.mp4"), PathBuf::from);
-
-    let index = match fs::read_to_string(dir.join("index.jsonl")) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("mux: cannot read index.jsonl: {e}");
-            return 1;
+    let timeout = match flag(args, "--timeout-secs").map(str::parse::<u64>) {
+        None => Duration::from_secs(DEFAULT_MUX_TIMEOUT_SECS),
+        Some(Ok(s)) if (1..=86_400).contains(&s) => Duration::from_secs(s),
+        Some(_) => {
+            return Err(SinkError::Usage(
+                "--timeout-secs must be a whole number from 1 to 86400".into(),
+            ))
         }
     };
+
+    let index_path = dir.join("index.jsonl");
+    let index = fs::read_to_string(&index_path)
+        .map_err(|e| SinkError::io("cannot read", Some(index_path), e))?;
+
+    // Fail before any work when ffmpeg is missing, and name the version the
+    // mux ran with.
+    println!("mux: {}", ffmpeg_version(tools)?);
 
     // A bad line (an interrupted sink, a forged record) costs that line only.
     let mut rows: Vec<IndexRow> = Vec::new();
@@ -1730,13 +1743,34 @@ fn run_mux(args: &[String]) -> i32 {
     }
 
     keep_main_media_source(&mut rows);
-    let inputs = match mux_inputs(&dir, &rows) {
-        Ok(i) => i,
-        Err(code) => return code,
-    };
+    let plan = mux_inputs(&dir, &rows, tools)?;
+    for w in &plan.warnings {
+        eprintln!("mux: {w}");
+    }
+    run_ffmpeg(tools, &plan.inputs, &out, timeout)
+}
 
-    let mut cmd = Command::new("ffmpeg");
-    run_ffmpeg(&mut cmd, &inputs, &out)
+/// The first line of `ffmpeg -version`, e.g. `ffmpeg version 7.1 ...`.
+fn ffmpeg_version(tools: &Tools) -> Result<String, SinkError> {
+    let out = proc::run(&Spec {
+        tool: Tool::Ffmpeg,
+        program: tools.program(Tool::Ffmpeg),
+        args: vec!["-hide_banner".into(), "-version".into()],
+        extra_env: Vec::new(),
+        timeout: VERSION_TIMEOUT,
+    })?;
+    Ok(version_line(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `ffmpeg version <v>` from the version output, without the copyright.
+fn version_line(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    let cut = first.find(" Copyright").map_or(first, |i| &first[..i]);
+    if cut.is_empty() {
+        "ffmpeg version unknown (empty -version output)".to_owned()
+    } else {
+        printable(cut, 200)
+    }
 }
 
 /// One `MediaSource` is one video. A preroll ad, the next video of a
@@ -1785,9 +1819,16 @@ fn input_format(kind: &str, path: &Path) -> Option<&'static str> {
     }
 }
 
+/// What `mux_inputs` hands to ffmpeg, plus what the caller must tell the
+/// user about ffprobe (ENG-13: a missing ffprobe is said, not swallowed).
+#[derive(Debug)]
+struct MuxPlan {
+    inputs: Vec<MuxInput>,
+    warnings: Vec<String>,
+}
+
 /// The ffmpeg inputs: per `SourceBuffer` the chosen part in timeline order.
-/// `Err` carries the exit code.
-fn mux_inputs(dir: &Path, rows: &[IndexRow]) -> Result<Vec<MuxInput>, i32> {
+fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, SinkError> {
     let mut parts: HashMap<(u32, u32), (u64, bool, String)> = HashMap::new();
     for row in rows {
         let e = parts
@@ -1797,9 +1838,13 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow]) -> Result<Vec<MuxInput>, i32> {
         e.1 |= row.is_init;
     }
     if parts.is_empty() {
-        eprintln!("mux: index is empty");
-        return Err(1);
+        return Err(SinkError::Capture("index is empty".into()));
     }
+    let mut prober = Prober {
+        tools,
+        missing: false,
+        warnings: Vec::new(),
+    };
 
     // Adaptive players often start at a low quality and switch after the
     // first segment, which starts a new part. Pick, per SourceBuffer, the
@@ -1838,13 +1883,9 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow]) -> Result<Vec<MuxInput>, i32> {
             .iter()
             .find(|r| r.is_init)
             .map_or("", |r| r.kind.as_str());
-        let (path, start, traks) = match ordered_part(dir, *id, *part, &part_rows) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("mux: sb{id}.p{part}: cannot reorder segments: {e}");
-                return Err(1);
-            }
-        };
+        let (path, start, traks) = ordered_part(dir, *id, *part, &part_rows).map_err(|e| {
+            SinkError::io(format!("sb{id}.p{part}: cannot reorder segments"), None, e)
+        })?;
         // An MP4 init without a complete moov (cut short) cannot be decoded,
         // and ffmpeg would fail the whole mux with it.
         if kind == "mp4" && traks == 0 {
@@ -1865,13 +1906,16 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow]) -> Result<Vec<MuxInput>, i32> {
         // The first presentation time as ffmpeg sees it (B-frame composition
         // offsets and edit lists included): that is what ffmpeg subtracts.
         // A part ffprobe cannot read is left out instead of failing the mux.
-        let start = match probe_start(format, &path) {
-            Probe::Undecodable => {
+        // Without ffprobe (or when it fails to run) the part is kept with the
+        // capture's own start, and that is said (ENG-13).
+        let verdict = prober.probe(format, &path, &format!("sb{id}.p{part}"));
+        let start = match verdict {
+            Some(Probe::Undecodable) => {
                 eprintln!("mux: sb{id}.p{part} cannot be decoded; skipped");
                 continue;
             }
-            Probe::Start(s) => Some(s),
-            Probe::Unknown => start,
+            Some(Probe::Start(s)) => Some(s),
+            Some(Probe::Unknown) | None => start,
         };
         inputs.push(MuxInput {
             path,
@@ -1880,37 +1924,88 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow]) -> Result<Vec<MuxInput>, i32> {
         });
     }
     if inputs.is_empty() {
-        eprintln!("mux: nothing decodable to mux");
-        return Err(1);
+        return Err(SinkError::Capture("nothing decodable to mux".into()));
     }
-    Ok(inputs)
+    Ok(MuxPlan {
+        inputs,
+        warnings: prober.warnings,
+    })
 }
 
-/// What ffprobe says about a part.
+/// Runs ffprobe per part and collects what went wrong with ffprobe itself.
+struct Prober<'a> {
+    tools: &'a Tools,
+    /// Set once ffprobe turned out to be missing: not asked again per part.
+    missing: bool,
+    warnings: Vec<String>,
+}
+
+impl Prober<'_> {
+    /// `None` when ffprobe could not tell (a warning is recorded).
+    fn probe(&mut self, format: &str, path: &Path, name: &str) -> Option<Probe> {
+        if self.missing {
+            return None;
+        }
+        match probe_start(self.tools, format, path) {
+            Ok(p) => Some(p),
+            Err(e @ SinkError::ToolMissing { .. }) => {
+                self.missing = true;
+                self.warnings.push(format!(
+                    "{e}. Without it the parts are not checked for decodability and are aligned by the capture's own timestamps (B-frame offsets and edit lists not counted)."
+                ));
+                None
+            }
+            Err(e) => {
+                self.warnings.push(format!(
+                    "{name}: {e}; aligned by the capture's own timestamps"
+                ));
+                None
+            }
+        }
+    }
+}
+
+/// What ffprobe says about a part it could run on.
+#[derive(Debug, PartialEq)]
 enum Probe {
     /// First presentation time in seconds.
     Start(f64),
-    /// Readable, no start time reported (or ffprobe missing).
+    /// Readable, no start time reported.
     Unknown,
     /// ffprobe failed on it.
     Undecodable,
 }
 
-fn probe_start(format: &str, path: &Path) -> Probe {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error", "-f", format, "-protocol_whitelist", "file"])
-        .args([
-            "-show_entries",
-            "stream=codec_type:format=start_time",
-            "-of",
-            "default=noprint_wrappers=1",
-        ])
-        .arg(path)
-        .stdin(Stdio::null())
-        .output();
+/// `Err` only when ffprobe itself could not do its job (missing, not
+/// startable, timed out, too much output); a part it rejects is
+/// `Probe::Undecodable`.
+fn probe_start(tools: &Tools, format: &str, path: &Path) -> Result<Probe, SinkError> {
+    let mut args: Vec<std::ffi::OsString> = [
+        "-v",
+        "error",
+        "-f",
+        format,
+        "-protocol_whitelist",
+        "file",
+        "-show_entries",
+        "stream=codec_type:format=start_time",
+        "-of",
+        "default=noprint_wrappers=1",
+    ]
+    .iter()
+    .map(Into::into)
+    .collect();
+    args.push(path.into());
+    let out = proc::run(&Spec {
+        tool: Tool::Ffprobe,
+        program: tools.program(Tool::Ffprobe),
+        args,
+        extra_env: Vec::new(),
+        timeout: PROBE_TIMEOUT,
+    });
     match out {
-        Err(_) => Probe::Unknown,
-        Ok(o) if !o.status.success() => Probe::Undecodable,
+        Err(SinkError::ToolFailed { .. }) => Ok(Probe::Undecodable),
+        Err(e) => Err(e),
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stdout);
             // No audio or video stream (an init cut short reads "fine" but
@@ -1919,13 +2014,14 @@ fn probe_start(format: &str, path: &Path) -> Probe {
                 .lines()
                 .any(|l| l == "codec_type=video" || l == "codec_type=audio");
             if !has_stream {
-                return Probe::Undecodable;
+                return Ok(Probe::Undecodable);
             }
-            text.lines()
+            Ok(text
+                .lines()
                 .find_map(|l| l.strip_prefix("start_time="))
                 .and_then(|v| v.trim().parse::<f64>().ok())
                 .filter(|v| v.is_finite())
-                .map_or(Probe::Unknown, Probe::Start)
+                .map_or(Probe::Unknown, Probe::Start))
         }
     }
 }
@@ -1962,36 +2058,50 @@ fn input_args(inputs: &[MuxInput]) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn run_ffmpeg(cmd: &mut Command, inputs: &[MuxInput], out: &Path) -> i32 {
-    cmd.arg("-hide_banner").arg("-y");
-    if inputs.iter().any(|i| i.start.is_none()) && inputs.len() > 1 {
-        eprintln!("mux: some inputs have no start time; their alignment is ffmpeg's guess");
-    }
-    for a in input_args(inputs) {
-        cmd.args(a);
-    }
+/// The whole ffmpeg argv of the mux. Errors only (no progress, no
+/// per-packet warnings): stderr is capped (`proc::PIPE_LIMIT`).
+fn ffmpeg_args(inputs: &[MuxInput], out: &Path) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> =
+        ["-hide_banner", "-nostats", "-loglevel", "error", "-y"]
+            .iter()
+            .map(Into::into)
+            .collect();
+    args.extend(input_args(inputs).into_iter().flatten().map(Into::into));
     // Every stream of every input, not ffmpeg's "one best video, one best
     // audio" pick across inputs.
     for n in 0..inputs.len() {
-        cmd.arg("-map").arg(n.to_string());
+        args.push("-map".into());
+        args.push(n.to_string().into());
     }
-    cmd.args(["-c", "copy", "-movflags", "+faststart"]).arg(out);
-    cmd.stdin(Stdio::null());
+    args.extend(["-c", "copy", "-movflags", "+faststart"].map(Into::into));
+    args.push(out.into());
+    args
+}
+
+fn run_ffmpeg(
+    tools: &Tools,
+    inputs: &[MuxInput],
+    out: &Path,
+    timeout: Duration,
+) -> Result<(), SinkError> {
+    if inputs.iter().any(|i| i.start.is_none()) && inputs.len() > 1 {
+        eprintln!("mux: some inputs have no start time; their alignment is ffmpeg's guess");
+    }
     println!("mux: {} input(s) -> {}", inputs.len(), out.display());
-    match cmd.status() {
-        Ok(st) if st.success() => {
-            println!("mux: ok");
-            0
-        }
-        Ok(st) => {
-            eprintln!("mux: ffmpeg exited with {st}");
-            1
-        }
-        Err(e) => {
-            eprintln!("mux: cannot start ffmpeg: {e}");
-            1
-        }
+    let done = proc::run(&Spec {
+        tool: Tool::Ffmpeg,
+        program: tools.program(Tool::Ffmpeg),
+        args: ffmpeg_args(inputs, out),
+        extra_env: Vec::new(),
+        timeout,
+    })?;
+    // Errors ffmpeg reported but survived are passed on, not dropped (RS-06).
+    let notes = proc::quote_tail(&done.stderr, proc::STDERR_QUOTE);
+    if !notes.is_empty() {
+        eprintln!("mux: ffmpeg reported:\n{notes}");
     }
+    println!("mux: ok");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2344,9 +2454,11 @@ mod tests {
         fs::write(dir.join("sb1.p0.bin"), mpd).expect("write");
         let mut r = row(0, mpd.len() as u64, true, None, None);
         r.kind = "mp4".into();
-        assert_eq!(
-            mux_inputs(&dir, &[r]).unwrap_err(),
-            1,
+        assert!(
+            matches!(
+                mux_inputs(&dir, &[r], &Tools::default()),
+                Err(SinkError::Capture(_))
+            ),
             "an MPD is not an mp4 part"
         );
         assert_eq!(input_format("mp4", &dir.join("sb1.p0.bin")), None);
@@ -2831,11 +2943,118 @@ mod tests {
         let cut = &full[..full.len() - 4];
         fs::write(dir.join("sb1.p0.bin"), cut).expect("write");
         let r = row(0, cut.len() as u64, true, None, None);
-        assert_eq!(
-            mux_inputs(&dir, &[r]).unwrap_err(),
-            1,
+        assert!(
+            matches!(
+                mux_inputs(&dir, &[r], &Tools::default()),
+                Err(SinkError::Capture(_))
+            ),
             "no complete moov: skipped"
         );
+    }
+
+    fn tools_without(tool: Tool) -> Tools {
+        let mut tools = Tools::default();
+        let missing = std::ffi::OsString::from("streamtap-no-such-tool-4711");
+        match tool {
+            Tool::Ffmpeg => tools.ffmpeg = missing,
+            Tool::Ffprobe => tools.ffprobe = missing,
+        }
+        tools
+    }
+
+    /// ENG-13: a missing ffprobe is said once, the parts are kept with the
+    /// capture's own start instead of silently counting as "start unknown".
+    #[test]
+    fn a_missing_ffprobe_is_reported_not_swallowed() {
+        let dir = temp_dir("noprobe");
+        let init = init_with_traks(1);
+        let mut seg = init.clone();
+        seg.extend(moof(2000));
+        let mut rows = Vec::new();
+        for sb in [1, 2] {
+            fs::write(dir.join(format!("sb{sb}.p0.bin")), &seg).expect("write");
+            let mut i = row(0, init.len() as u64, true, None, None);
+            let mut m = row(
+                init.len() as u64,
+                (seg.len() - init.len()) as u64,
+                false,
+                Some(2000),
+                None,
+            );
+            i.sb = sb;
+            m.sb = sb;
+            rows.push(i);
+            rows.push(m);
+        }
+        let plan = mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)).expect("plan");
+        assert_eq!(plan.inputs.len(), 2, "parts are kept: {plan:?}");
+        assert!(
+            plan.inputs.iter().all(|i| i.start == Some(2.0)),
+            "the capture's start is used: {plan:?}"
+        );
+        assert_eq!(plan.warnings.len(), 1, "said once: {:?}", plan.warnings);
+        assert!(
+            plan.warnings[0].starts_with("ffprobe not found"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn a_missing_ffmpeg_fails_the_mux_with_its_own_code() {
+        let dir = temp_dir("noffmpeg");
+        fs::write(dir.join("index.jsonl"), "").expect("write");
+        let args = [dir.to_string_lossy().into_owned()];
+        let err = run_mux(&args, &tools_without(Tool::Ffmpeg)).unwrap_err();
+        assert!(
+            matches!(err, SinkError::ToolMissing { tool: Tool::Ffmpeg }),
+            "{err}"
+        );
+        assert_eq!(err.exit_code(), 4);
+    }
+
+    #[test]
+    fn mux_usage_errors_exit_with_2() {
+        for args in [
+            vec![],
+            vec![
+                "dir".to_owned(),
+                "--timeout-secs".to_owned(),
+                "0".to_owned(),
+            ],
+        ] {
+            let err = run_mux(&args, &Tools::default()).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{err}");
+        }
+    }
+
+    #[test]
+    fn version_line_drops_the_copyright() {
+        assert_eq!(
+            version_line("ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c) 2000-2024 the FFmpeg developers
+built with gcc"),
+            "ffmpeg version 7.1-full_build-www.gyan.dev"
+        );
+        assert!(version_line("").contains("unknown"));
+    }
+
+    #[test]
+    fn ffmpeg_runs_quiet_and_maps_every_input() {
+        let inputs = [MuxInput {
+            path: PathBuf::from("v"),
+            format: "mp4",
+            start: None,
+        }];
+        let args: Vec<String> = ffmpeg_args(&inputs, Path::new("out.mp4"))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-loglevel" && w[1] == "error"));
+        assert!(args.iter().any(|a| a == "-nostats"));
+        assert!(args.windows(2).any(|w| w[0] == "-map" && w[1] == "0"));
+        assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
     }
 
     #[test]
