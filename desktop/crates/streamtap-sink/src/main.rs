@@ -242,11 +242,19 @@ struct IndexLine<'a> {
 const MAX_SEEN_PER_SESSION: usize = 400_000;
 /// Init bytes held until the init is complete (an init split across appends).
 const MAX_PENDING_INIT: usize = 4 * 1024 * 1024;
+/// Part files per `SourceBuffer` (one per distinct init).
+const MAX_PARTS_PER_TRACK: u32 = 64;
+/// Budget charged for each part file (its directory entry and cluster).
+const PART_FILE_COST: u64 = 4096;
 
 /// Dedupe keys: (tfdt, timestampOffset in ms, duration), or in sequence mode
 /// (payload hash, `i64::MIN`, length).
 type SeenSet = HashSet<(u64, i64, u64)>;
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent per-track flags, not states of one machine"
+)]
 struct TrackState {
     part: u32,
     file: File,
@@ -275,6 +283,8 @@ struct TrackState {
     /// The current init segment is encrypted (EME/DRM): nothing is written
     /// until a clear init segment arrives.
     refused: bool,
+    /// A new init came beyond `MAX_PARTS_PER_TRACK`: its media is skipped.
+    parts_full: bool,
     bytes: u64,
     segments: u64,
     dupes: u64,
@@ -379,9 +389,17 @@ fn read_vint(b: &[u8], off: usize, keep_marker: bool) -> Option<(u64, usize)> {
     Some((v, len))
 }
 
+/// Top-level MP4 boxes that belong to a media segment, not to its init.
+const MEDIA_BOXES: [&[u8; 4]; 7] = [
+    b"styp", b"sidx", b"ssix", b"emsg", b"prft", b"moof", b"mdat",
+];
+
 /// Where the init part of an init+media append ends (video.js VHS appends the
-/// init together with the first segment): the first top-level `moof`/`mdat`
-/// (MP4), or the first Cluster (`WebM`). `None` when there is no media in it.
+/// init together with the first segment): the first top-level media box
+/// (`styp`, `sidx`, `emsg`, `moof`, ...; MP4) or the first Cluster (`WebM`).
+/// Per-segment boxes in front of the `moof` (a `sidx` differs per segment)
+/// must not count as init bytes, or every combined append would look like a
+/// new init. `None` when there is no media in it.
 fn init_prefix_len(kind: &str, payload: &[u8]) -> Option<usize> {
     if kind == "webm" {
         let mut off = 0;
@@ -404,12 +422,48 @@ fn init_prefix_len(kind: &str, payload: &[u8]) -> Option<usize> {
     // A box starts where the previous one ended (headers may be 8 or 16 bytes).
     let mut start = 0;
     for (kind, _, end) in boxes_in(payload, 0, payload.len()) {
-        if &kind == b"moof" || &kind == b"mdat" {
+        if MEDIA_BOXES.contains(&&kind) {
             return (start > 0).then_some(start);
         }
         start = end;
     }
     None
+}
+
+/// The init bytes so far hold a complete `moov` (MP4) or `Tracks` (`WebM`):
+/// nothing more of this init is to come.
+fn init_complete(kind: &str, bytes: &[u8]) -> bool {
+    if kind == "webm" {
+        let mut off = 0;
+        while off < bytes.len() {
+            let Some((id, il)) = read_vint(bytes, off, true) else {
+                return false;
+            };
+            let Some((size, sl)) = read_vint(bytes, off + il, false) else {
+                return false;
+            };
+            let body = off + il + sl;
+            let unknown = sl < 8 && size == (1u64 << (7 * sl)) - 1;
+            if id == 0x1853_8067 || unknown {
+                off = body;
+                continue;
+            }
+            let Some(end) = usize::try_from(size).ok().and_then(|s| body.checked_add(s)) else {
+                return false;
+            };
+            if end > bytes.len() {
+                return false;
+            }
+            if id == 0x1654_ae6b {
+                return true;
+            }
+            off = end;
+        }
+        return false;
+    }
+    boxes_in(bytes, 0, bytes.len())
+        .iter()
+        .any(|(kind, _, _)| kind == b"moov")
 }
 
 /// `WebM`/Matroska encryption in init bytes: the element IDs
@@ -595,11 +649,10 @@ fn handle_connection(
                     break;
                 }
                 // A spent process budget creates no further directories.
-                if budget.total_used.load(Ordering::Relaxed) >= budget.total_max {
+                let Some(s) = Session::open(out, &id, &url, &title, Arc::clone(budget))? else {
                     eprintln!("{peer}: --max-total-gib reached, closing");
                     break;
-                }
-                let s = Session::open(out, &id, &url, &title, Arc::clone(budget))?;
+                };
                 println!(
                     "{peer}: session {} ({})",
                     s.dir.display(),
@@ -696,11 +749,21 @@ impl TrackState {
             init_kind: String::new(),
             skip_tail: false,
             refused: false,
+            parts_full: false,
             bytes: 0,
             segments: 0,
             dupes: 0,
             skipped: 0,
         }
+    }
+
+    /// The pending init chunks together form a complete init.
+    fn pending_complete(&self) -> bool {
+        let mut whole = Vec::with_capacity(self.pending_bytes);
+        for (_, c) in &self.pending {
+            whole.extend_from_slice(c);
+        }
+        init_complete(&self.init_kind, &whole)
     }
 
     /// Makes `part` the current part file, keeping the state of the old one.
@@ -731,6 +794,7 @@ impl TrackState {
             // Back to an earlier init (an ABR switch back): continue its
             // part, whose file already starts with this init.
             self.switch_part(dir, sb, earlier)?;
+            self.parts_full = false;
             println!("sb{sb} init seen before, continuing part {earlier}");
             self.dupes += 1;
             return Ok(false);
@@ -738,6 +802,17 @@ impl TrackState {
         // Media that came before the first init (the hook attached late)
         // stays alone in its part.
         if !self.hash_part.is_empty() || self.offset > 0 {
+            if self.parts >= MAX_PARTS_PER_TRACK {
+                // Each distinct init opens a file; a page can forge them.
+                // Its media would land under another init: skipped until a
+                // known init comes back.
+                if !self.parts_full {
+                    eprintln!("sb{sb}: more than {MAX_PARTS_PER_TRACK} parts; skipping media under new inits");
+                }
+                self.parts_full = true;
+                return Ok(false);
+            }
+            self.parts_full = false;
             let part = self.parts;
             self.parts += 1;
             self.switch_part(dir, sb, part)?;
@@ -787,10 +862,19 @@ impl Session {
         url: &str,
         title: &str,
         budget: Arc<Budget>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Option<Self>> {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
+        let meta = serde_json::json!({ "url": url, "title": title, "session": session_id, "started": secs });
+        let meta = serde_json::to_vec_pretty(&meta)?;
+        // The directory and session.json count against the budget too; it
+        // is charged before anything is created, so a spent process budget
+        // creates no further directories.
+        let open_cost = meta.len() as u64 + 4096;
+        if open_cost > budget.per_session || !budget.charge(open_cost) {
+            return Ok(None);
+        }
         let short = sanitize(session_id, 8);
         let base = format!("{secs}_{}", if short.is_empty() { "anon" } else { &short });
         // A reconnect of the same session within the same second must not
@@ -809,8 +893,6 @@ impl Session {
                 Err(e) => return Err(e),
             }
         };
-        let meta = serde_json::json!({ "url": url, "title": title, "session": session_id, "started": secs });
-        let meta = serde_json::to_vec_pretty(&meta)?;
         // Written atomically: a reader never sees half a file.
         let tmp = dir.join("session.json.tmp");
         fs::write(&tmp, &meta)?;
@@ -819,20 +901,17 @@ impl Session {
             .create(true)
             .append(true)
             .open(dir.join("index.jsonl"))?;
-        let mut s = Self {
+        Ok(Some(Self {
             dir,
             index,
             tracks: HashMap::new(),
             track_limit_logged: false,
-            bytes_total: 0,
+            bytes_total: open_cost,
             budget,
             stopped: false,
             seen_total: 0,
             seen_limit_logged: false,
-        };
-        // The directory and session.json count against the budget too.
-        s.within_budget(meta.len() as u64 + 4096);
-        Ok(s)
+        }))
     }
 
     fn open_part(dir: &Path, sb: u32, part: u32) -> io::Result<File> {
@@ -922,7 +1001,11 @@ impl Session {
         for (_, c) in &chunks {
             whole.extend_from_slice(c);
         }
-        if !track.decide_init(fnv1a(&whole), &dir, sb)? {
+        let parts_before = track.parts;
+        let write = track.decide_init(fnv1a(&whole), &dir, sb)?;
+        let new_file = track.parts != parts_before;
+        // A new part file costs more than its bytes.
+        if (new_file && !self.within_budget(PART_FILE_COST)) || !write {
             return Ok(());
         }
         for (h, c) in &chunks {
@@ -939,6 +1022,30 @@ impl Session {
                 eprintln!("{}: sb{sb}: init not written: {e}", self.dir.display());
             }
         }
+    }
+
+    /// Creates the track of `sb` on its first segment; false when it is over
+    /// the track limit or the budget.
+    fn ensure_track(&mut self, sb: u32) -> io::Result<bool> {
+        if self.tracks.contains_key(&sb) {
+            return Ok(true);
+        }
+        if self.tracks.len() >= MAX_TRACKS {
+            if !self.track_limit_logged {
+                eprintln!(
+                    "{}: more than {MAX_TRACKS} SourceBuffers, ignoring sb{sb} and further new ones",
+                    self.dir.display()
+                );
+                self.track_limit_logged = true;
+            }
+            return Ok(false);
+        }
+        if !self.within_budget(PART_FILE_COST) {
+            return Ok(false);
+        }
+        let file = Self::open_part(&self.dir, sb, 0)?;
+        self.tracks.insert(sb, TrackState::new(file));
+        Ok(true)
     }
 
     fn write_segment(&mut self, h: &SegmentHeader, payload: &[u8]) -> io::Result<()> {
@@ -965,24 +1072,16 @@ impl Session {
             }
         }
         let dir = self.dir.clone();
-        if !self.tracks.contains_key(&h.sb) {
-            if self.tracks.len() >= MAX_TRACKS {
-                if !self.track_limit_logged {
-                    eprintln!(
-                        "{}: more than {MAX_TRACKS} SourceBuffers, ignoring sb{} and further new ones",
-                        dir.display(),
-                        h.sb
-                    );
-                    self.track_limit_logged = true;
-                }
-                return Ok(());
-            }
-            let file = Self::open_part(&dir, h.sb, 0)?;
-            self.tracks.insert(h.sb, TrackState::new(file));
+        if !self.ensure_track(h.sb)? {
+            return Ok(());
         }
         let track = self.tracks.get_mut(&h.sb).expect("present");
-        let continuation =
-            !h.is_init && h.tfdt.is_none() && (h.init_cont || !track.pending.is_empty());
+        // An untimed chunk continues the init when the extension says so, or
+        // while the pending init is still incomplete. After a complete init it
+        // is media (a segment cut inside its moof), not init bytes.
+        let continuation = !h.is_init
+            && h.tfdt.is_none()
+            && (h.init_cont || (!track.pending.is_empty() && !track.pending_complete()));
 
         if payload_encrypted(h, payload, continuation, &track.init_kind) {
             if !track.refused {
@@ -1025,9 +1124,17 @@ impl Session {
             // Too large to hold: decide on what came so far, write the rest
             // as init bytes of that part.
             self.flush_init(h.sb)?;
+            if self.tracks[&h.sb].parts_full {
+                return Ok(());
+            }
             return self.write_row(h.sb, h, payload, true);
         }
         self.flush_init(h.sb)?;
+        let track = self.tracks.get_mut(&h.sb).expect("present");
+        if track.parts_full {
+            track.skipped += 1;
+            return Ok(());
+        }
 
         let seen_room = self.seen_total < MAX_SEEN_PER_SESSION;
         if !seen_room && !self.seen_limit_logged {
@@ -1272,6 +1379,45 @@ fn shift_ticks(tso: Option<f64>, timescale: Option<u32>) -> i64 {
     }
 }
 
+/// Ticks of `from` as ticks of `to`, rounded (0 without a source timescale).
+fn rescale(ticks: i64, from: Option<u32>, to: u32) -> i64 {
+    let Some(src) = from.filter(|s| *s > 0) else {
+        return 0;
+    };
+    let num = i128::from(ticks) * i128::from(to);
+    let den = i128::from(src);
+    let quot = (num + num.signum() * den / 2) / den;
+    i64::try_from(quot.clamp(i128::from(i64::MIN), i128::from(i64::MAX))).expect("clamped")
+}
+
+/// Sequence mode: the browser lays out the appends one after the other.
+/// Where a segment does not start within 100 ms of where the previous one
+/// ended (a seek, or a new period that restarts `tfdt`), it is moved there,
+/// as the browser does; the segments after it keep that move. Returns the
+/// move (ticks of `ts`) per row offset and the number of jumps.
+fn seq_layout(media: &[&IndexRow], ts: u32) -> (HashMap<u64, i64>, usize) {
+    let tolerance = i128::from(ts / 10);
+    let mut moves = HashMap::new();
+    let mut adj: i128 = 0;
+    let mut prev_end: Option<i128> = None;
+    let mut jumps = 0;
+    for r in media {
+        let Some(t) = r.tfdt else { continue };
+        let mut start = i128::from(t) + adj;
+        if let Some(end) = prev_end {
+            if (start - end).abs() > tolerance {
+                adj += end - start;
+                start = end;
+                jumps += 1;
+            }
+        }
+        prev_end = r.dur.map(|d| start + i128::from(d));
+        let clamped = adj.clamp(i128::from(i64::MIN), i128::from(i64::MAX));
+        moves.insert(r.offset, i64::try_from(clamped).expect("clamped"));
+    }
+    (moves, jumps)
+}
+
 fn read_segment(src: &mut File, r: &IndexRow, buf: &mut Vec<u8>) -> io::Result<()> {
     let len = usize::try_from(r.len)
         .ok()
@@ -1358,8 +1504,12 @@ struct MuxInput {
 /// - With durations on every segment, a segment fully covered by earlier
 ///   ones (an LL-HLS full segment after its parts, a re-fetch with another
 ///   cut) is left out; partial overlaps are kept and counted.
+/// - Sequence mode: laid out one after the other in arrival order, as the
+///   browser plays it (`seq_layout`); a jump (a seek, a new period) gets its
+///   `tfdt` rewritten.
 /// - Without a `tfdt` on every media segment (`WebM` blocks, continuation
-///   chunks) or in sequence mode the arrival order is kept.
+///   chunks), or in sequence mode without durations, the arrival order is
+///   kept.
 fn ordered_part(
     dir: &Path,
     sb: u32,
@@ -1369,7 +1519,13 @@ fn ordered_part(
     let raw = dir.join(format!("sb{sb}.p{part}.bin"));
     let init: Vec<&IndexRow> = rows.iter().copied().filter(|r| r.is_init).collect();
     let media: Vec<&IndexRow> = rows.iter().copied().filter(|r| !r.is_init).collect();
-    let ts = rows.iter().find_map(|r| r.timescale).filter(|t| *t > 0);
+    // The media rows carry the timescale of their tfdt; the first row of a
+    // split init may still carry the previous rendition's.
+    let ts = media
+        .iter()
+        .chain(init.iter())
+        .find_map(|r| r.timescale)
+        .filter(|t| *t > 0);
     let mut src = File::open(&raw)?;
     let mut buf = Vec::new();
 
@@ -1384,10 +1540,21 @@ fn ordered_part(
     // Per-track timescales let a multi-track segment be shifted traf by traf.
     let track_ts = trak_timescales(&init_bytes);
     // Sequence mode: the browser rewrote timestampOffset itself, the recorded
-    // one is stale and never used.
+    // one is stale and never used; the part is laid out like the browser does.
+    let seq: Vec<&IndexRow> = media.iter().copied().filter(|r| r.seq_mode).collect();
+    let seq_ok = ts.is_some() && seq.iter().all(|r| r.dur.is_some_and(|d| d > 0));
+    let (seq_adj, jumps) = match ts {
+        Some(ts) if seq_ok && !seq.is_empty() => seq_layout(&seq, ts),
+        _ => (HashMap::new(), 0),
+    };
+    if jumps > 0 {
+        eprintln!(
+            "mux: sb{sb}.p{part}: sequence mode: {jumps} jump(s) in the timeline (a seek or a new period); laid out one after the other in arrival order, as the browser plays it"
+        );
+    }
     let offset = |r: &IndexRow| {
         if r.seq_mode {
-            0
+            seq_adj.get(&r.offset).copied().unwrap_or(0)
         } else {
             shift_ticks(r.tso, ts)
         }
@@ -1403,9 +1570,10 @@ fn ordered_part(
     // only rewritten where one timescale holds for the whole segment.
     let delta = |r: &IndexRow| if can_shift { offset(r) } else { 0 };
     let pts = |r: &IndexRow| i128::from(r.tfdt.unwrap_or(0)) + i128::from(offset(r));
-    // Sequence mode: the browser placed the appends one after the other, so
-    // the arrival order (duplicates already removed by the sink) is the order.
-    let timed = !media.is_empty() && media.iter().all(|r| r.tfdt.is_some() && !r.seq_mode);
+    // Sequence mode needs durations to lay out the jumps; without them the
+    // arrival order (duplicates already removed by the sink) is kept.
+    let timed =
+        !media.is_empty() && media.iter().all(|r| r.tfdt.is_some()) && (seq.is_empty() || seq_ok);
     let init_first = rows.iter().take(init.len()).all(|r| r.is_init);
 
     let mut order: Vec<&IndexRow> = media.clone();
@@ -1428,11 +1596,8 @@ fn ordered_part(
                 "mux: sb{sb}.p{part}: segment durations unknown; overlapping re-fetches cannot be detected"
             );
         }
-    } else if !media.is_empty() {
-        let untimed = media.iter().filter(|r| r.tfdt.is_none()).count();
-        eprintln!(
-            "mux: sb{sb}.p{part}: {untimed} media segment(s) without tfdt; keeping arrival order"
-        );
+    } else {
+        warn_arrival_order(sb, part, &media);
     }
 
     // Start time of the first media segment, for aligning the inputs.
@@ -1465,12 +1630,30 @@ fn ordered_part(
         }
         match (r.seq_mode, tid.and_then(|t| track_ts.get(&t))) {
             (false, Some(&t)) if tracks > 1 => shift_ticks(r.tso, Some(t)),
+            (true, Some(&t)) if tracks > 1 => rescale(offset(r), ts, t),
             _ => delta(r),
         }
     };
     let rows_out: Vec<&IndexRow> = init.iter().chain(order.iter()).copied().collect();
     let sorted = write_sorted(dir, (sb, part), &mut src, &rows_out, &shift_for, shifted)?;
     Ok((sorted, start, raw_tracks))
+}
+
+/// Says why a part keeps its arrival order.
+fn warn_arrival_order(sb: u32, part: u32, media: &[&IndexRow]) {
+    if media.is_empty() {
+        return;
+    }
+    let untimed = media.iter().filter(|r| r.tfdt.is_none()).count();
+    if untimed > 0 {
+        eprintln!(
+            "mux: sb{sb}.p{part}: {untimed} media segment(s) without tfdt; keeping arrival order"
+        );
+    } else {
+        eprintln!(
+            "mux: sb{sb}.p{part}: sequence mode without segment durations; keeping arrival order, a seek or a new period may jump back in time"
+        );
+    }
 }
 
 /// Writes `sbN.pM.sorted.bin` from `rows` in that order, shifting each
@@ -2266,6 +2449,7 @@ mod tests {
             budget(16 * GIB, 64 * GIB),
         )
         .expect("session")
+        .expect("within budget")
     }
 
     fn index_lines(dir: &Path) -> usize {
@@ -2416,7 +2600,9 @@ mod tests {
     #[test]
     fn session_budget_counts_index_lines_and_stops_for_good() {
         let out = temp_dir("cap");
-        let mut s = Session::open(&out, "test", "u", "t", budget(5000, 64 * GIB)).expect("session");
+        let mut s = Session::open(&out, "test", "u", "t", budget(9000, 64 * GIB))
+            .expect("session")
+            .expect("within budget");
         write(&mut s, &seg(1, true, None, None), b"INIT");
         write(&mut s, &seg(1, false, Some(0), None), b"");
         write(&mut s, &seg(1, false, Some(1), None), b"X");
@@ -2437,19 +2623,33 @@ mod tests {
 
     #[test]
     fn process_budget_is_shared_by_sessions() {
-        let shared = budget(16 * GIB, 300);
-        let mut a =
-            Session::open(&temp_dir("tot-a"), "a", "u", "t", Arc::clone(&shared)).expect("a");
-        let mut b =
-            Session::open(&temp_dir("tot-b"), "b", "u", "t", Arc::clone(&shared)).expect("b");
+        // Two directories and two part files (about 4 KiB each) fit, then a
+        // few rows.
+        let shared = budget(16 * GIB, 20_000);
+        let open = |name: &str| {
+            Session::open(&temp_dir(name), name, "u", "t", Arc::clone(&shared))
+                .expect("session")
+                .expect("within budget")
+        };
+        let mut a = open("tot-a");
+        let mut b = open("tot-b");
         write(&mut a, &seg(1, true, None, None), b"INIT");
         write(&mut b, &seg(1, true, None, None), b"INIT");
         for t in 0..10 {
             write(&mut a, &seg(1, false, Some(t), None), b"X");
             write(&mut b, &seg(1, false, Some(t), None), b"X");
         }
-        assert!(shared.total_used.load(Ordering::Relaxed) <= 300);
+        assert!(shared.total_used.load(Ordering::Relaxed) <= 20_000);
         assert!(a.stopped || b.stopped);
+        // A spent process budget opens no further directory.
+        let out = temp_dir("tot-c");
+        let c = Session::open(&out, "c", "u", "t", Arc::clone(&shared)).expect("no io error");
+        assert!(c.is_none());
+        assert_eq!(
+            fs::read_dir(&out).expect("dir").count(),
+            0,
+            "nothing created"
+        );
     }
 
     #[test]
@@ -2660,9 +2860,164 @@ mod tests {
     #[test]
     fn sessions_never_share_a_directory() {
         let out = temp_dir("dirs");
-        let a = Session::open(&out, "same", "u", "t", budget(GIB, GIB)).expect("a");
-        let b = Session::open(&out, "same", "u", "t", budget(GIB, GIB)).expect("b");
+        let a = Session::open(&out, "same", "u", "t", budget(GIB, GIB))
+            .expect("a")
+            .expect("within budget");
+        let b = Session::open(&out, "same", "u", "t", budget(GIB, GIB))
+            .expect("b")
+            .expect("within budget");
         assert_ne!(a.dir, b.dir);
         assert!(a.dir.join("session.json").is_file());
+    }
+
+    #[test]
+    fn per_segment_boxes_are_not_init_bytes() {
+        // DASH packagers put styp and a per-segment sidx in front of the
+        // moof; with the init in the same append they belong to the media.
+        let init = init_with_traks(1);
+        let mut append = init.clone();
+        append.extend(mp4_box(*b"styp", b"msdh"));
+        append.extend(mp4_box(*b"sidx", b"1234"));
+        append.extend(moof(0));
+        assert_eq!(init_prefix_len("mp4", &append), Some(init.len()));
+        let mut free = init.clone();
+        free.extend(mp4_box(*b"free", b"x"));
+        let mut with_free = free.clone();
+        with_free.extend(moof(0));
+        assert_eq!(
+            init_prefix_len("mp4", &with_free),
+            Some(free.len()),
+            "a free box after moov stays init"
+        );
+
+        // A switch back with a different sidx each time continues part 0.
+        let mut s = session("sidx");
+        let init_b = init_with_traks(2);
+        let with = |init: &[u8], t: u32| {
+            let mut v = init.to_vec();
+            v.extend(mp4_box(*b"styp", b"msdh"));
+            v.extend(mp4_box(*b"sidx", &t.to_be_bytes()));
+            v.extend(moof(t));
+            v
+        };
+        write(&mut s, &seg(1, true, Some(0), None), &with(&init, 0));
+        write(
+            &mut s,
+            &seg(1, true, Some(1000), None),
+            &with(&init_b, 1000),
+        );
+        write(&mut s, &seg(1, true, Some(2000), None), &with(&init, 2000));
+        s.finish();
+        assert!(!s.dir.join("sb1.p2.bin").exists(), "no third part");
+        assert_eq!(s.tracks[&1].part, 0, "back in part 0");
+    }
+
+    #[test]
+    fn untimed_media_after_a_complete_init_is_media() {
+        // The init alone, then a segment cut inside its moof (the first
+        // piece has no tfdt): the piece is media, so the same init after a
+        // seek is a duplicate and opens no part.
+        let mut s = session("cutmoof");
+        let init = init_with_traks(1);
+        for t in [0u32, 1000] {
+            write(&mut s, &seg(1, true, None, None), &init);
+            let m = moof(t);
+            write(&mut s, &seg(1, false, None, None), &m[..10]);
+            write(&mut s, &seg(1, false, None, None), &m[10..]);
+        }
+        s.finish();
+        assert!(!s.dir.join("sb1.p1.bin").exists(), "one part");
+        let rows: Vec<serde_json::Value> = fs::read_to_string(s.dir.join("index.jsonl"))
+            .expect("index")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        let inits = rows.iter().filter(|r| r["is_init"] == true).count();
+        assert_eq!(inits, 1, "one init row, the pieces are media");
+    }
+
+    #[test]
+    fn init_complete_needs_moov_or_tracks() {
+        let init = init_with_traks(1);
+        assert!(init_complete("mp4", &init));
+        assert!(!init_complete("mp4", &init[..init.len() - 1]));
+        assert!(!init_complete("mp4", &mp4_box(*b"ftyp", b"iso6")));
+        // EBML header, Segment (unknown size), Info, Tracks.
+        let ebml = [0x1a, 0x45, 0xdf, 0xa3, 0x80];
+        let segment = [
+            0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ];
+        let info = [0x15, 0x49, 0xa9, 0x66, 0x80];
+        let tracks = [0x16, 0x54, 0xae, 0x6b, 0x80];
+        let mut head = [&ebml[..], &segment, &info].concat();
+        assert!(!init_complete("webm", &head));
+        head.extend_from_slice(&tracks);
+        assert!(init_complete("webm", &head));
+    }
+
+    #[test]
+    fn parts_per_track_are_capped() {
+        let mut s = session("parts");
+        for i in 0..(MAX_PARTS_PER_TRACK + 6) {
+            let mut init = init_with_traks(1);
+            init.extend(mp4_box(*b"free", &i.to_be_bytes()));
+            write(&mut s, &seg(1, true, None, None), &init);
+            write(&mut s, &seg(1, false, Some(u64::from(i)), None), &moof(i));
+        }
+        s.finish();
+        let files = fs::read_dir(&s.dir)
+            .expect("dir")
+            .filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.file_name().to_string_lossy().starts_with("sb1.p"))
+            })
+            .count();
+        assert_eq!(files, MAX_PARTS_PER_TRACK as usize);
+        assert!(s.tracks[&1].parts_full);
+        assert!(s.tracks[&1].skipped >= 6, "media under new inits skipped");
+    }
+
+    #[test]
+    fn sequence_mode_lays_out_jumps_like_the_browser() {
+        // Period 1 (0, 1000), then period 2 restarting tfdt (0, 1000), then a
+        // seek back fetching 500 again: placed one after the other.
+        let dir = temp_dir("seqlayout");
+        let init = init_with_traks(1);
+        let segs = [moof(0), moof(1000), moof(0), moof(1000), moof(500)];
+        let mut rows = write_part(
+            &dir,
+            &[
+                (&init, true, None, None),
+                (&segs[0], false, Some(0), None),
+                (&segs[1], false, Some(1000), None),
+                (&segs[2], false, Some(0), None),
+                (&segs[3], false, Some(1000), None),
+                (&segs[4], false, Some(500), None),
+            ],
+        );
+        for r in &mut rows[1..] {
+            r.seq_mode = true;
+            r.dur = Some(1000);
+        }
+        let got = order(&dir, &rows).0;
+        let media = &got[init.len()..];
+        let tfdts: Vec<u32> = media.chunks(32).map(tfdt_of).collect();
+        assert_eq!(tfdts, [0, 1000, 2000, 3000, 4000]);
+
+        // Without durations the jumps cannot be laid out: arrival order.
+        for r in &mut rows[1..] {
+            r.dur = None;
+        }
+        let (got, path, _) = order(&dir, &rows);
+        assert_eq!(path, dir.join("sb1.p0.bin"), "unchanged");
+        let tfdts: Vec<u32> = got[init.len()..].chunks(32).map(tfdt_of).collect();
+        assert_eq!(tfdts, [0, 1000, 0, 1000, 500]);
+    }
+
+    #[test]
+    fn rescale_rounds_between_timescales() {
+        assert_eq!(rescale(1000, Some(1000), 90_000), 90_000);
+        assert_eq!(rescale(-3, Some(2), 1), -2);
+        assert_eq!(rescale(5, None, 1000), 0);
     }
 }

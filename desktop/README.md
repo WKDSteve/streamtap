@@ -45,12 +45,14 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   extension opens one connection per MediaSource, so one directory is one
   video.
 - Limits: 64 KiB JSON header, 64 MiB per message and per WebSocket frame
-  (larger close the connection), 32 SourceBuffers per session, 400 000 media
-  segments per session. Disk: the directory, payload and index lines count
-  against 16 GiB per session (`--max-session-gib`) and 64 GiB per sink
-  process (`--max-total-gib`); when either is reached the session stops for
-  good (logged once), and once the process budget is spent a new connection
-  is closed without creating a directory. Empty payloads are not written. A
+  (larger close the connection), 32 SourceBuffers per session, 64 part files
+  per SourceBuffer, 400 000 media segments per session. Disk: the directory,
+  each part file (4 KiB), payload and index lines count against 16 GiB per
+  session (`--max-session-gib`) and 64 GiB per sink process
+  (`--max-total-gib`); when either is reached the session stops for good
+  (logged once). The directory is charged before it is created: once the
+  process budget cannot hold another one, a new connection is closed without
+  creating anything. Empty payloads are not written. A
   malformed message after `hello` is skipped and logged (a page can forge the
   hook's records); more than 100 close the connection. Before `hello` any bad
   message closes it. Every way a connection ends prints the per-SourceBuffer
@@ -67,17 +69,22 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
 ### Dedupe and parts
 
 - An init appended together with media (video.js VHS) is stored as two rows:
-  the init part and the media part. The init is decided right there, so the
-  media part never counts as its continuation (also without a `tfdt`).
+  the init part and the media part. The init part ends at the first media box
+  (`styp`, `sidx`, `emsg`, `prft`, `moof`, `mdat`; a `sidx` differs per
+  segment and must not make every combined append a new init). The init is
+  decided right there, so the media part never counts as its continuation
+  (also without a `tfdt`).
 - An init is decided once it is complete: its chunks (an init split across
-  appends: the untimed chunks right after it, or chunks the extension flags
-  `initCont`) are held, up to 4 MiB, until the next media, then compared as a
-  whole.
+  appends: chunks the extension flags `initCont`, or untimed chunks while the
+  init has no complete `moov` / `Tracks` yet) are held, up to 4 MiB, until
+  the next media, then compared as a whole. After a complete init an untimed
+  chunk (a segment cut inside its `moof`) is media.
 - A repeated, identical init is skipped. A **different** init (codec or
   quality change, `changeType`) starts a new part file `sbN.p(M+1).bin`; a
   switch **back** to an init seen before continues that earlier part. The
   first init when media came before it (the hook attached late) starts a new
-  part too: that media stays alone in part 0.
+  part too: that media stays alone in part 0. Beyond 64 parts a new init's
+  media is skipped until a known init comes back (a page can forge inits).
 - A media segment whose (`tfdt`, `timestampOffset`, duration) was already
   written for that part is skipped (players re-fetch ranges after seeks). The
   offset matters: multi-period DASH and HLS discontinuities restart `tfdt` and
@@ -125,8 +132,15 @@ Runs `ffmpeg -f mp4 -protocol_whitelist file [-itsoffset <s>] -i <part> … -map
   after its parts) is left out; partial overlaps are kept and counted (frames
   may repeat there). Without durations that check cannot run, which is
   warned. Without a `tfdt` on every media segment (WebM blocks, continuation
-  chunks), and in sequence mode (the browser placed the appends one after the
-  other; the sink already dropped re-appends), the arrival order is kept.
+  chunks, a segment cut inside its `moof`) the arrival order is kept, and
+  re-fetches cannot be told apart there.
+- **Sequence mode:** the browser lays out the appends one after the other
+  (the sink already dropped re-appends). `mux` does the same: where a segment
+  does not start within 100 ms of the previous one's end (a seek, a new period
+  restarting `tfdt`), it and the ones after it are moved there and their
+  `tfdt` rewritten, and the jumps are counted. Media fetched after a seek back
+  therefore plays after what came before it, as in the browser. Without
+  durations this cannot be done: the arrival order is kept, which is warned.
 - **Gaps:** ranges skipped by a forward seek are reported with their
   approximate length.
 - A bad `index.jsonl` line (an interrupted sink) is skipped, not fatal.

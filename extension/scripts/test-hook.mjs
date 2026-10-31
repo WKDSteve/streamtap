@@ -234,10 +234,14 @@ check(last().timescale === 2000 && last().startSec === 1, "WebM TimecodeScale ke
 // Split inside ftyp: the first chunk has not even a complete box.
 const sb6 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
 const enc6 = init("encv");
+const before6 = appends().length;
 sb6.appendBuffer(ab(enc6.subarray(0, 6)));
-check(last().encrypted === false, "6 bytes cannot be told apart yet; they are held");
+check(appends().length === before6, "6 bytes cannot be told apart yet; they are held, nothing posted");
 sb6.appendBuffer(ab(enc6.subarray(6)));
-check(last().initCont === true && last().encrypted === true, "init split inside the ftyp header: the rest is caught");
+check(
+  last().isInit === true && last().bytes === enc6.length && last().encrypted === true,
+  "init split inside the ftyp header: posted joined as the init, and caught"
+);
 const sb6b = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
 sb6b.appendBuffer(ab(enc6.subarray(0, 10)));
 check(last().isInit === true, "a cut-off ftyp box still starts an init");
@@ -263,6 +267,53 @@ const sb9 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
 const ini9 = init("avc1");
 sb9.appendBuffer(ab(Buffer.concat([ini9, media(0)])));
 check(last().isInit === true && last().initLen === ini9.length, "initLen marks the init part of an init+media append");
+
+// A clear init whose first append is a short head: one init record with all bytes.
+const sb10 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const ini10 = init("avc1");
+const before10 = appends().length;
+sb10.appendBuffer(ab(ini10.subarray(0, 5)));
+sb10.appendBuffer(ab(ini10.subarray(5)));
+const recs10 = appends().slice(before10);
+check(
+  recs10.length === 1 && recs10[0].isInit === true && recs10[0].payload.byteLength === ini10.length,
+  "a short init head is posted together with its rest, as the init"
+);
+
+// Init split right after ftyp: the moov is its continuation, not a new init.
+const sb11 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const ini11 = init("avc1");
+const ftyp11 = ini11.readUInt32BE(0);
+sb11.appendBuffer(ab(ini11.subarray(0, ftyp11)));
+sb11.appendBuffer(ab(ini11.subarray(ftyp11)));
+check(last().isInit === false && last().initCont === true, "init split after ftyp: the moov continues it");
+
+// WebM init split right after the EBML header: the Segment continues it.
+const segWebm = Buffer.concat([
+  Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+  ebml(0x1549a966, ebml(0x4d80, Buffer.from("x"))), // Info without TimecodeScale
+  ebml(0x1654ae6b, ebml(0xae, Buffer.from([0x86, 0x82, 0x56, 0x39]))),
+]);
+const ebmlHead = ebml(0x1a45dfa3, Buffer.from([0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]));
+const sbw7 = ms.addSourceBuffer('video/webm; codecs="vp9"');
+sbw7.appendBuffer(ab(ts500));
+sbw7.appendBuffer(ab(ebmlHead));
+check(last().isInit === true, "an EBML header alone starts an init");
+sbw7.appendBuffer(ab(segWebm));
+check(last().isInit === false && last().initCont === true, "WebM split after the EBML header: the Segment continues it");
+// That init has no TimecodeScale: 1 ms, not the 500 us of the init before.
+sbw7.appendBuffer(ab(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x84, 0xe7, 0x82, 0x07, 0xd0])));
+check(last().timescale === 1000 && last().startSec === 2, "a WebM init without TimecodeScale resets to 1 ms");
+
+// Per-segment boxes in front of the moof are not init bytes.
+const sb12 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const ini12 = init("avc1");
+sb12.appendBuffer(ab(Buffer.concat([ini12, box("styp", Buffer.from("msdh")), box("sidx", Buffer.alloc(4)), media(0)])));
+check(last().initLen === ini12.length, "initLen ends before styp/sidx");
+
+// The head of a new split init does not carry the previous init's timescale.
+sb8.appendBuffer(ab(clear8.subarray(0, 20)));
+check(last().isInit === true && last().timescale === null, "the head of a split init has no stale timescale");
 
 // The MediaSource closing is reported for the content script.
 ms.handlers.sourceclose();

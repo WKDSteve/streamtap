@@ -337,6 +337,8 @@
   // or the length; open means the last box/element runs past the bytes.
   // An init is complete only with its moov (MP4) or Tracks (WebM): bytes that
   // end right after ftyp or Info are still an open init.
+  // Per-segment boxes (a sidx differs per segment): media, not init.
+  const MEDIA_BOXES = ["styp", "sidx", "ssix", "emsg", "prft", "moof", "mdat"];
   const mp4InitEnd = (u8) => {
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     let off = 0;
@@ -352,7 +354,7 @@
       } else if (size === 0) {
         size = u8.byteLength - off;
       }
-      if (type === "moof" || type === "mdat") return { end: off, open: false };
+      if (MEDIA_BOXES.includes(type)) return { end: off, open: false };
       if (size < header) return { end: off, open: false };
       if (off + size > u8.byteLength) return { end: u8.byteLength, open: true };
       if (type === "moov") sawMoov = true;
@@ -385,6 +387,19 @@
 
   const initEnd = (u8, kind) => (kind === "webm" ? webmInitEnd(u8) : mp4InitEnd(u8));
 
+  // An open init that holds only its head (MP4: no moov yet, it would not be
+  // open otherwise; WebM: exactly the EBML header) continues with an append
+  // that starts with the missing part (moov; Segment), not a new init.
+  const continuesHead = (buf, u8, kind) => {
+    if (kind === "mp4") return u8.byteLength >= 8 && ascii(u8, 4) === "moov";
+    if (kind !== "webm") return false;
+    const first = ((u8[0] << 24) | (u8[1] << 16) | (u8[2] << 8) | u8[3]) >>> 0;
+    if (first !== SEGMENT_ID) return false;
+    const id = readVint(buf, 0, true);
+    const size = id && readVint(buf, id.len, false);
+    return !!size && id.value === EBML_ID && id.len + size.len + size.value === buf.byteLength;
+  };
+
   // Protection markers in init bytes that cannot be parsed yet (still open).
   // MP4: the ISO fourccs. WebM: all three element IDs (ContentEncodings
   // 0x6D80, ContentEncryption 0x5035, ContentEncKeyID 0x47E2), which clear
@@ -401,7 +416,9 @@
   const finishInit = (info, initBytes, kind) => {
     const p = kind === "webm" ? parseWebm(initBytes) : parseIsoBmff(initBytes);
     if (p.encrypted) info.encrypted = true;
-    if (p.timescale) info.timescale = p.timescale;
+    // A WebM init without TimecodeScale means 1 ms, not the previous init's.
+    if (kind === "webm") info.timescale = p.timescale || 1000;
+    else if (p.timescale) info.timescale = p.timescale;
   };
 
   const concat = (a, b) => {
@@ -500,7 +517,7 @@
   }
 
   const onAppend = (sb, data, api) => {
-    const u8 = toU8(data);
+    let u8 = toU8(data);
     if (!u8) return;
     let info = sbInfo.get(sb);
     if (!info) {
@@ -512,6 +529,17 @@
       log(`SourceBuffer #${info.id} seen first in append (created before hook)`);
     }
     info.seq++;
+
+    // Fewer than 8 bytes cannot be told apart (an init head, or media): they
+    // are held and posted together with the next append, so an init that
+    // starts that way is recorded as one.
+    if (info.shortHead) {
+      u8 = concat(info.shortHead, u8);
+      info.shortHead = null;
+    } else if (!info.initBuf && u8.byteLength < 8 && sniff(u8) === "unknown") {
+      info.shortHead = u8.slice();
+      return;
+    }
 
     const kind = sniff(u8);
     const parsed = kind === "mp4" ? parseIsoBmff(u8) : kind === "webm" ? parseWebm(u8) : null;
@@ -530,34 +558,21 @@
     let initCont = false;
     let isInit = false;
     let initLen = null; // set when init and media share this append
-    if (startsInit(u8, kind)) {
+    const headCont = !!info.initBuf && info.initBuf.kind === kind && continuesHead(info.initBuf.bytes, u8, kind);
+    if (startsInit(u8, kind) && !headCont) {
       isInit = true;
       const r = initEnd(u8, kind);
       if (r.open && r.end === u8.byteLength) {
         info.initBuf = u8.byteLength <= INIT_MAX ? { kind, bytes: u8.slice() } : null;
+        // Read from the complete init; the head must not carry the previous
+        // rendition's timescale.
+        info.timescale = null;
         if (openInitEncrypted(u8, kind)) encryptedHere = true;
       } else {
         info.initBuf = null;
         finishInit(info, u8.subarray(0, r.end), kind);
         if (r.end < u8.byteLength) initLen = r.end;
       }
-    } else if (info.initBuf && info.initBuf.kind === null) {
-      // Fewer than 8 bytes came first: only now can they be told apart.
-      const joined = concat(info.initBuf.bytes, u8);
-      const k = sniff(joined);
-      info.initBuf = null;
-      if (startsInit(joined, k)) {
-        initCont = true;
-        const r = initEnd(joined, k);
-        if (r.open && r.end === joined.byteLength && joined.byteLength <= INIT_MAX) {
-          info.initBuf = { kind: k, bytes: joined };
-          if (openInitEncrypted(joined, k)) encryptedHere = true;
-        } else {
-          finishInit(info, joined.subarray(0, r.end), k);
-        }
-      }
-    } else if (!info.initBuf && kind === "unknown" && u8.byteLength < 8) {
-      info.initBuf = { kind: null, bytes: u8.slice() };
     } else if (info.initBuf) {
       initCont = true;
       const joined = concat(info.initBuf.bytes, u8);

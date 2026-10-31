@@ -18,6 +18,7 @@ const SINK_MAX_PENDING_TOTAL = 128 * 1024 * 1024; // all links of the worker
 const SINK_MAX_BUFFERED_BYTES = 64 * 1024 * 1024; // per socket, unsent while open
 const SINK_MAX_INIT_BYTES = 1024 * 1024; // init segments kept for a new socket
 const SINK_MAX_KEPT_INITS = 16;
+const SINK_MAX_KEPT_TOTAL = 64 * 1024 * 1024; // kept init bytes of all links (parked ones too)
 const SINK_MAX_LINKS = 16; // tapping ports of the whole worker
 const SINK_MAX_BACKLOG = 128 * 1024 * 1024; // data: URL chars received, not yet decoded
 const SINK_STABLE_MS = 5000; // a socket open this long resets the backoff
@@ -62,6 +63,24 @@ let nextPortId = 1;
 let sinkLinkCount = 0; // links that may connect (not overflow)
 let sinkPendingTotal = 0;
 let sinkBacklog = 0;
+let sinkKeptTotal = 0;
+
+const blobsSize = (chunks) => (chunks ? chunks.reduce((n, b) => n + b.size, 0) : 0);
+
+// Sets (or with null drops) the init bytes a link keeps for sb, within the
+// worker-wide budget: what does not fit is not kept at all, so a stale init
+// is never replayed in its place.
+const linkKeep = (link, sb, chunks) => {
+  const old = blobsSize(link.inits.get(sb));
+  let size = blobsSize(chunks);
+  if (chunks && (size > SINK_MAX_INIT_BYTES || sinkKeptTotal - old + size > SINK_MAX_KEPT_TOTAL)) {
+    chunks = null;
+    size = 0;
+  }
+  link.inits.delete(sb);
+  if (chunks) link.inits.set(sb, chunks);
+  sinkKeptTotal += size - old;
+};
 
 const sinkFrame = (header, payload) => {
   const h = sinkEnc.encode(JSON.stringify(header));
@@ -88,17 +107,12 @@ const linkConsumed = (link, item) => {
   const keep = item.keep || item.blob;
   if (item.initCont) {
     const chunks = link.inits.get(item.sb);
-    if (!chunks) return;
-    const kept = chunks.reduce((n, b) => n + b.size, 0);
-    if (kept + keep.size > SINK_MAX_INIT_BYTES) link.inits.delete(item.sb);
-    else chunks.push(keep);
+    if (chunks) linkKeep(link, item.sb, [...chunks, keep]);
     return;
   }
   if (!item.isInit) return;
-  link.inits.delete(item.sb);
-  if (keep.size > SINK_MAX_INIT_BYTES) return;
-  link.inits.set(item.sb, [keep]);
-  while (link.inits.size > SINK_MAX_KEPT_INITS) link.inits.delete(link.inits.keys().next().value);
+  linkKeep(link, item.sb, [keep]);
+  while (link.inits.size > SINK_MAX_KEPT_INITS) linkKeep(link, link.inits.keys().next().value, null);
 };
 
 const linkDropPending = (link) => {
@@ -255,6 +269,7 @@ chrome.runtime.onConnect.addListener((port) => {
     closed: false,
     overflow: true, // until linkAdmit gives it a slot
     inits: new Map(), // sb -> [framed init, continuation...] in effect, replayed on every new socket
+    lostInit: new Set(), // sb whose init was dropped: nothing until the next init
     pending: [], // { blob, sb, isInit, initCont } while connecting
     pendingBytes: 0,
     sent: 0,
@@ -279,9 +294,20 @@ chrome.runtime.onConnect.addListener((port) => {
       // Small init bytes may go up to twice the cap: media after a lost init
       // would be filed under the previous one.
       const h = msg.header || {};
-      const smallInit = (h.isInit === true || h.initCont === true) && held <= 2 * SINK_MAX_INIT_BYTES;
+      const initBytes = h.isInit === true || h.initCont === true;
+      const smallInit = initBytes && held <= 2 * SINK_MAX_INIT_BYTES;
       if (sinkBacklog + held > (smallInit ? 2 * SINK_MAX_BACKLOG : SINK_MAX_BACKLOG)) {
         link.dropped++;
+        // Media after a lost init would be filed under the previous one:
+        // in stream order, that SourceBuffer takes nothing until its next
+        // init, and its kept init is not replayed.
+        if (initBytes) {
+          const sb = h.sb;
+          chain = chain.then(() => {
+            link.lostInit.add(sb);
+            linkKeep(link, sb, null);
+          });
+        }
         return;
       }
       sinkBacklog += held;
@@ -302,6 +328,11 @@ chrome.runtime.onConnect.addListener((port) => {
         if (msg.t === "segment" && msg.header && typeof msg.header === "object") {
           const admitted = linkAdmit(link);
           const initBytes = msg.header.isInit === true || msg.header.initCont === true;
+          if (msg.header.isInit === true) link.lostInit.delete(msg.header.sb);
+          else if (link.lostInit.has(msg.header.sb)) {
+            link.dropped++;
+            return;
+          }
           // A parked link still keeps its init bytes, so it can replay them
           // once it is admitted; its media is dropped.
           if (!admitted && !initBytes) {
@@ -353,6 +384,7 @@ chrome.runtime.onConnect.addListener((port) => {
       if (link.ws && link.ws.readyState === WebSocket.OPEN) link.ws.close();
       if (!link.overflow) sinkLinkCount--;
       link.overflow = true; // never admitted again
+      for (const sb of [...link.inits.keys()]) linkKeep(link, sb, null);
       const m = sinkLinks.get(tabId);
       if (m) {
         m.delete(portId);
