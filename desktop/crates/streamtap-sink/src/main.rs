@@ -3122,6 +3122,30 @@ mod tests {
         assert_eq!(index_lines(&s.dir), 2);
     }
 
+    /// A reconnect opens a fresh session that never sees the (encrypted)
+    /// init: its media must still be refused from the `senc` in the moof.
+    /// Seen live on 2026-10-31, when an older sink wrote such media to disk.
+    #[test]
+    fn encrypted_media_without_init_after_reconnect_is_refused() {
+        let mut s = session("drmreconnect");
+        for t in 0..3u32 {
+            let mut m = moof(t * 1000);
+            // senc inside the traf, as CENC media carries it
+            m = mp4_box(
+                *b"moof",
+                &mp4_box(*b"traf", &[&m[16..], &mp4_box(*b"senc", b"")[..]].concat()),
+            );
+            write(&mut s, &seg(1, false, Some(u64::from(t) * 1000), None), &m);
+        }
+        assert_eq!(index_lines(&s.dir), 0, "no row for encrypted media");
+        assert_eq!(
+            fs::read(s.dir.join("sb1.p0.bin")).map_or(0, |b| b.len()),
+            0,
+            "no bytes written"
+        );
+        assert!(s.tracks[&1].refused, "track refused without an init");
+    }
+
     #[test]
     fn encrypted_continuation_of_a_split_init_is_refused() {
         let mut s = session("drmsplit");
