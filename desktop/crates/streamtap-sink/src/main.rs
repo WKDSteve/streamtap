@@ -5057,8 +5057,11 @@ mod tests {
     #[test]
     fn an_unstartable_ffprobe_is_reported_once() {
         let dir = temp_dir("badprobe");
+        // A directory, not a text file named .exe: starting a non-PE .exe makes
+        // Windows pop up the "16-bit application" dialog on every test run,
+        // while a directory fails the spawn with "access denied" silently.
         let bad = dir.join("ffprobe-not-a-program.exe");
-        fs::write(&bad, "this is a text file, not a program").expect("write");
+        fs::create_dir(&bad).expect("create dir");
         let tools = Tools {
             ffprobe: bad.into(),
             ..Tools::default()
