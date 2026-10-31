@@ -442,6 +442,9 @@ impl Refusals {
 
 struct Session {
     dir: PathBuf,
+    /// Content of `session.json`; rewritten with `state: ended` when the
+    /// session is dropped (the connection is over), see `mark_ended`.
+    meta: serde_json::Value,
     /// The extension's session id (truncated); empty for a client that sends
     /// none, whose refusals are then not remembered (they would collide).
     id: String,
@@ -1113,7 +1116,42 @@ impl TrackState {
     }
 }
 
+/// Written atomically: a reader never sees half a file.
+fn write_session_file(dir: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = dir.join("session.json.tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, dir.join("session.json"))
+}
+
+impl Drop for Session {
+    /// Runs when the connection is over, also after a panic or a write error.
+    fn drop(&mut self) {
+        self.mark_ended();
+    }
+}
+
 impl Session {
+    /// Records on disk that this connection is over (`state: ended`, `ended`
+    /// in unix seconds), so the desktop app can tell a finished capture from
+    /// one that is only quiet. A sink killed hard writes nothing; readers
+    /// treat a capture of a sink that is not running as finished.
+    fn mark_ended(&mut self) {
+        if self.meta["state"] == "ended" {
+            return;
+        }
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        self.meta["state"] = "ended".into();
+        self.meta["ended"] = secs.into();
+        let written = serde_json::to_vec_pretty(&self.meta)
+            .map_err(io::Error::from)
+            .and_then(|bytes| write_session_file(&self.dir, &bytes));
+        if let Err(e) = written {
+            eprintln!("{}: session end not recorded: {e}", self.dir.display());
+        }
+    }
+
     fn open(
         out: &Path,
         session_id: &str,
@@ -1125,12 +1163,19 @@ impl Session {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let meta = serde_json::json!({ "url": url, "title": title, "session": session_id, "started": secs });
-        let meta = serde_json::to_vec_pretty(&meta)?;
+        // `state` and `sink_pid` tell a reader whether this connection is
+        // still open (`mark_ended` flips it); captures of older sinks have
+        // neither.
+        let meta = serde_json::json!({
+            "url": url, "title": title, "session": session_id, "started": secs,
+            "state": "open", "sink_pid": std::process::id(),
+        });
+        let meta_bytes = serde_json::to_vec_pretty(&meta)?;
         // The directory and session.json count against the budget too; it
         // is charged before anything is created, so a spent process budget
         // creates no further directories.
-        let open_cost = meta.len() as u64 + 4096;
+        // The 4096 bytes of slack also cover the longer `ended` rewrite.
+        let open_cost = meta_bytes.len() as u64 + 4096;
         if open_cost > budget.per_session || !budget.charge(open_cost) {
             return Ok(None);
         }
@@ -1152,16 +1197,16 @@ impl Session {
                 Err(e) => return Err(e),
             }
         };
-        // Written atomically: a reader never sees half a file.
-        let tmp = dir.join("session.json.tmp");
-        fs::write(&tmp, &meta)?;
-        fs::rename(&tmp, dir.join("session.json"))?;
+        // The index first: a failure after `session.json` said "open" would
+        // leave a connection that never ends.
         let index = OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join("index.jsonl"))?;
+        write_session_file(&dir, &meta_bytes)?;
         Ok(Some(Self {
             dir,
+            meta,
             id: session_id.chars().take(MAX_SESSION_ID).collect(),
             refusals: Arc::clone(refusals),
             index,
@@ -5191,6 +5236,40 @@ built with gcc"),
             .expect("within budget");
         assert_ne!(a.dir, b.dir);
         assert!(a.dir.join("session.json").is_file());
+    }
+
+    #[test]
+    fn session_json_says_open_until_the_session_is_dropped() {
+        let out = temp_dir("ended");
+        let read = |dir: &Path| -> serde_json::Value {
+            serde_json::from_slice(&fs::read(dir.join("session.json")).expect("read"))
+                .expect("json")
+        };
+        let s = Session::open(
+            &out,
+            "sid",
+            "https://x/v",
+            "T",
+            &budget(GIB, GIB),
+            &refusals(),
+        )
+        .expect("open")
+        .expect("within budget");
+        let dir = s.dir.clone();
+        let open = read(&dir);
+        assert_eq!(open["state"], "open");
+        assert_eq!(open["sink_pid"], std::process::id());
+        assert!(open.get("ended").is_none());
+        drop(s);
+        let done = read(&dir);
+        assert_eq!(done["state"], "ended");
+        assert!(done["ended"]
+            .as_u64()
+            .is_some_and(|t| t >= done["started"].as_u64().unwrap()));
+        // Everything else is kept, and no temp file is left behind.
+        assert_eq!(done["url"], "https://x/v");
+        assert_eq!(done["title"], "T");
+        assert!(!dir.join("session.json.tmp").exists());
     }
 
     #[test]

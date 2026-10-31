@@ -5,7 +5,9 @@
 // segment to exercise the tfdt dedupe. Usage:
 //
 //   node scripts/test-sink.mjs <fragmented.mp4> --token <token> [--port 17650]
-//        [--origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia]
+//        [--origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia] [--hold <ms>]
+//
+// --hold keeps the connection open that long after the last segment (a paused video), to watch the app show it live.
 //
 // The sink only accepts the extension's origin, so the client sends it (the
 // non-standard `headers` option of Node's undici WebSocket). Needs Node >= 22.
@@ -19,13 +21,14 @@ const flag = (n, d) => {
 };
 const token = flag("--token");
 const port = Number(flag("--port", "17650"));
+const hold = Number(flag("--hold", "300"));
 const origin = flag("--origin", "chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia");
 if (!file || !token) {
   console.error("usage: test-sink.mjs <fragmented.mp4> --token <token> [--port 17650] [--origin <origin>]");
   process.exit(2);
 }
 
-const { init, segments, tfdtOf, timescale } = splitFmp4(file);
+const { init, segments, tfdtOf, durOf, timescale } = splitFmp4(file);
 console.log(`init ${init.byteLength} B, ${segments.length} media segments, timescale ${timescale}`);
 
 const enc = new TextEncoder();
@@ -46,15 +49,16 @@ ws.onopen = () => {
   ws.send(frame({ type: "hello", token, session: "test-client", url: "file://" + file, title: "test-sink.mjs" }));
   const mime = 'video/mp4; codecs="avc1.64001e, mp4a.40.2"';
   let seq = 1;
-  const seg = (payload, isInit) =>
-    ws.send(frame({ type: "segment", sb: 1, seq: seq++, mime, isInit, kind: "mp4", tfdt: isInit ? null : tfdtOf(payload), timescale }, payload));
+  // `dur` (ticks of `timescale`) is what the app's list sums up as the duration, like the extension sends it.
+  const seg = (payload, isInit, dur = null) =>
+    ws.send(frame({ type: "segment", sb: 1, seq: seq++, mime, isInit, kind: "mp4", tfdt: isInit ? null : tfdtOf(payload), timescale, dur: isInit ? null : dur }, payload));
   seg(init, true);
-  for (const s of segments) seg(s, false);
+  segments.forEach((s, i) => seg(s, false, durOf(i)));
   // Re-send init and the second media segment: both must be deduped.
   seg(init, true);
-  if (segments[1]) seg(segments[1], false);
+  if (segments[1]) seg(segments[1], false, durOf(1));
   ws.send(frame({ type: "event", name: "endofstream", sb: null }));
-  setTimeout(() => ws.close(), 300);
+  setTimeout(() => ws.close(), hold);
 };
 ws.onclose = (e) => {
   console.log(`closed code=${e.code}; sent ${segments.length + 1} unique + 2 duplicate segments`);

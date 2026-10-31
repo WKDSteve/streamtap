@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
-/// A capture that was written to within this window, while the sink runs,
-/// counts as live (the sink keeps no "connection open" flag on disk).
+/// Captures of a sink that wrote no connection state (`state` missing in
+/// `session.json`): written to within this window, while the sink runs, they
+/// count as live. Newer sinks record the state, which is exact.
 pub(crate) const LIVE_WINDOW: Duration = Duration::from_secs(10);
 /// Directories listed at most (newest first).
 const MAX_CAPTURES: usize = 1000;
@@ -35,6 +36,11 @@ struct SessionFile {
     url: String,
     title: String,
     started: u64,
+    /// `open` while the connection lives, `ended` after; empty for captures
+    /// of sinks that do not record it.
+    state: String,
+    /// Process id of the sink that wrote the capture (with `state`).
+    sink_pid: Option<u32>,
 }
 
 /// The fields of the sink's `IndexLine` the list needs.
@@ -231,23 +237,42 @@ fn read_session(dir: &Path) -> SessionFile {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
-/// Whether the sink is running and wrote into `dir` within `LIVE_WINDOW`.
-pub(crate) fn is_live(dir: &Path, sink_running: bool, now: SystemTime) -> bool {
-    if !sink_running {
+/// Whether the capture in `dir` is still receiving data. `sink_pid` is the
+/// process id of the sink the app runs (`None`: no sink, nothing is live).
+pub(crate) fn dir_is_live(dir: &Path, sink_pid: Option<u32>, now: SystemTime) -> bool {
+    is_live(dir, &read_session(dir), sink_pid, now)
+}
+
+/// A capture is live while the connection that writes it is open: the sink
+/// records `state: open` with its pid and flips it to `ended` when the
+/// connection is over. An `open` capture of another sink process (one that
+/// was killed hard and so could not write the end) is not live. Captures
+/// without a state fall back to "written within `LIVE_WINDOW`".
+fn is_live(dir: &Path, session: &SessionFile, sink_pid: Option<u32>, now: SystemTime) -> bool {
+    let Some(pid) = sink_pid else {
         return false;
+    };
+    match (session.state.as_str(), session.sink_pid) {
+        ("ended", _) => false,
+        ("open", Some(writer)) => writer == pid,
+        _ => recently_written(dir, now),
     }
+}
+
+fn recently_written(dir: &Path, now: SystemTime) -> bool {
     ["index.jsonl", "session.json"]
         .iter()
         .filter_map(|n| fs::metadata(dir.join(n)).ok()?.modified().ok())
         .max()
         .is_some_and(|m| now.duration_since(m).unwrap_or_default() <= LIVE_WINDOW)
 }
+
 /// Lists the capture directories of `root`, newest first. `cache` holds one
 /// accumulator per directory and is pruned of directories that are gone.
 pub(crate) fn scan(
     root: &Path,
     cache: &mut HashMap<String, IndexAcc>,
-    sink_running: bool,
+    sink_pid: Option<u32>,
     now: SystemTime,
 ) -> io::Result<Vec<CaptureInfo>> {
     let mut names = Vec::new();
@@ -279,7 +304,7 @@ pub(crate) fn scan(
         let acc = cache.entry(name.clone()).or_default();
         // An unreadable index leaves the totals as they were.
         let _ = acc.update(&index_path);
-        let live = is_live(&dir, sink_running, now);
+        let live = is_live(&dir, &session, sink_pid, now);
         let result = paths::result_file(&dir);
         let drm = fs::symlink_metadata(dir.join(DRM_FLAG)).is_ok_and(|m| m.is_file());
         let mut source_buffers: Vec<SbSummary> = acc.sbs.values().cloned().collect();
@@ -309,6 +334,8 @@ pub(crate) fn scan(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    const PID: u32 = 4242;
 
     fn row(sb: u32, len: u64, init: bool, dur: u64, ts: u32) -> String {
         format!(
@@ -441,7 +468,7 @@ mod tests {
             format!("{{\"url\":\"{big}\",\"title\":\"{big}\",\"started\":1}}"),
         )
         .unwrap();
-        let list = scan(&root, &mut HashMap::new(), false, SystemTime::now()).unwrap();
+        let list = scan(&root, &mut HashMap::new(), None, SystemTime::now()).unwrap();
         assert_eq!(list[0].title.chars().count(), MAX_TITLE_CHARS);
         assert_eq!(list[0].url.chars().count(), MAX_URL_CHARS);
         assert!(!list[0].title.contains('\u{202e}'));
@@ -492,7 +519,7 @@ mod tests {
         fs::write(root.join("1730000000_aaaa").join(DRM_FLAG), b"").unwrap();
 
         let mut cache = HashMap::new();
-        let list = scan(&root, &mut cache, true, SystemTime::now()).unwrap();
+        let list = scan(&root, &mut cache, Some(PID), SystemTime::now()).unwrap();
         let ids: Vec<_> = list.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["1730000500_bbbb", "1730000000_aaaa"]);
         let new = &list[0];
@@ -505,17 +532,78 @@ mod tests {
         assert_eq!(old.result_bytes, 5);
 
         // The sink is not running: nothing is live. Old files: nothing is live.
-        let stopped = scan(&root, &mut cache, false, SystemTime::now()).unwrap();
+        let stopped = scan(&root, &mut cache, None, SystemTime::now()).unwrap();
         assert!(stopped.iter().all(|c| !c.live));
         let later = SystemTime::now() + LIVE_WINDOW + Duration::from_secs(5);
-        let aged = scan(&root, &mut cache, true, later).unwrap();
+        let aged = scan(&root, &mut cache, Some(PID), later).unwrap();
         assert!(aged.iter().all(|c| !c.live));
 
         // A removed capture leaves the cache.
         fs::remove_dir_all(root.join("1730000000_aaaa")).unwrap();
-        let after = scan(&root, &mut cache, true, SystemTime::now()).unwrap();
+        let after = scan(&root, &mut cache, Some(PID), SystemTime::now()).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(cache.len(), 1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A capture dir whose `session.json` carries `extra` (JSON members).
+    fn capture(root: &Path, name: &str, extra: &str) -> std::path::PathBuf {
+        let d = root.join(name);
+        fs::create_dir(&d).unwrap();
+        fs::write(
+            d.join("session.json"),
+            format!("{{\"url\":\"https://x/v\",\"title\":\"t\",\"started\":1{extra}}}"),
+        )
+        .unwrap();
+        fs::write(d.join("index.jsonl"), row(1, 10, false, 1000, 1000)).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_recorded_state_decides_live_not_the_write_time() {
+        let root = tmp("state");
+        capture(&root, "1_open", ",\"state\":\"open\",\"sink_pid\":4242");
+        capture(
+            &root,
+            "2_ended",
+            ",\"state\":\"ended\",\"sink_pid\":4242,\"ended\":5",
+        );
+        capture(&root, "3_old", "");
+        let now = SystemTime::now();
+        // Far in the future: the 10 s heuristic would call all of them done.
+        let later = now + LIVE_WINDOW * 100;
+        let live_at = |t: SystemTime, pid: Option<u32>| -> Vec<(String, bool)> {
+            let mut l: Vec<_> = scan(&root, &mut HashMap::new(), pid, t)
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.id, c.live))
+                .collect();
+            l.sort();
+            l
+        };
+        let yes = |id: &str, v: bool| (id.to_owned(), v);
+        // Recent: the ended capture is done at once although just written.
+        assert_eq!(
+            live_at(now, Some(PID)),
+            [
+                yes("1_open", true),
+                yes("2_ended", false),
+                yes("3_old", true)
+            ]
+        );
+        // A quiet but open connection stays live; one without state ages out.
+        assert_eq!(
+            live_at(later, Some(PID)),
+            [
+                yes("1_open", true),
+                yes("2_ended", false),
+                yes("3_old", false)
+            ]
+        );
+        // No sink running: nothing is live (a sink killed hard leaves "open").
+        assert!(live_at(now, None).iter().all(|(_, l)| !l));
+        // Another sink process is running: the old "open" is stale.
+        assert!(!live_at(now, Some(PID + 1))[0].1);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -526,7 +614,7 @@ mod tests {
         fs::create_dir(&d).unwrap();
         fs::write(d.join("session.json"), b"{ truncated").unwrap();
         let mut cache = HashMap::new();
-        let list = scan(&root, &mut cache, false, SystemTime::now()).unwrap();
+        let list = scan(&root, &mut cache, None, SystemTime::now()).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].title, "");
         assert_eq!(list[0].segments, 0);
@@ -539,7 +627,7 @@ mod tests {
         let root = tmp("scanlink");
         let outside = tmp("scanlink-out");
         std::os::unix::fs::symlink(&outside, root.join("1_link")).unwrap();
-        let list = scan(&root, &mut HashMap::new(), false, SystemTime::now()).unwrap();
+        let list = scan(&root, &mut HashMap::new(), None, SystemTime::now()).unwrap();
         assert!(list.is_empty());
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&outside).unwrap();

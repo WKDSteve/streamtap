@@ -6,9 +6,14 @@ use std::env;
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use serde::Serialize;
+
+use crate::jobs::KillOnClose;
 
 /// Name of the sink executable next to this one.
 #[cfg(windows)]
@@ -27,6 +32,9 @@ const LOG_LINE_CHARS: usize = 500;
 const MAX_READ_LINE: u64 = 16 * 1024;
 /// Mux stderr kept (the end of it, where the cause is).
 pub(crate) const MUX_TAIL_BYTES: usize = 4096;
+
+/// How often a running mux is checked for its end.
+const WAIT_POLL: Duration = Duration::from_millis(50);
 
 /// `CREATE_NO_WINDOW`: no console window for a child of a GUI process.
 #[cfg(windows)]
@@ -194,12 +202,49 @@ pub(crate) enum MuxState {
     },
 }
 
-/// Runs `sink mux <dir>` to its end; stdout is discarded, the end of stderr
-/// is kept. The caller runs this on its own thread.
-pub(crate) fn run_mux(sink: &Path, dir: &Path) -> MuxState {
-    let mut child = match command(sink)
-        .arg("mux")
-        .arg(dir)
+/// A running mux the app can abort: the child, the job that ties it (and the
+/// ffmpeg it starts) to the app, and the half-written file it leaves behind
+/// when it is killed.
+#[derive(Debug)]
+pub(crate) struct MuxHandle {
+    child: Mutex<Child>,
+    job: Mutex<Option<KillOnClose>>,
+    part_file: Option<PathBuf>,
+    /// `abort` ran: the exit status is then no outcome of the mux (killing a
+    /// job ends its processes with exit code 0).
+    aborted: AtomicBool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl MuxHandle {
+    /// Kills the mux and everything it started (ffmpeg), waits until the
+    /// processes are gone and removes `out.part.mp4`, which the mux could not
+    /// clean up itself because it was killed.
+    pub(crate) fn abort(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        // Closing the job ends the whole tree (the child alone on other platforms).
+        lock(&self.job).take();
+        let mut child = lock(&self.child);
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(part) = &self.part_file {
+            let _ = std::fs::remove_file(part);
+        }
+    }
+}
+
+/// Runs `cmd` (a `streamtap-sink mux` command) to its end; stdout is
+/// discarded, the end of stderr is kept. `register` gets the handle as soon
+/// as the child runs. The caller runs this on its own thread.
+pub(crate) fn run_child(
+    mut cmd: Command,
+    part_file: Option<PathBuf>,
+    register: impl FnOnce(&Arc<MuxHandle>),
+) -> MuxState {
+    let mut child = match cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -214,8 +259,17 @@ pub(crate) fn run_mux(sink: &Path, dir: &Path) -> MuxState {
             }
         }
     };
+    let job = KillOnClose::new(&child).ok();
+    let stderr = child.stderr.take();
+    let handle = Arc::new(MuxHandle {
+        child: Mutex::new(child),
+        job: Mutex::new(job),
+        part_file,
+        aborted: AtomicBool::new(false),
+    });
+    register(&handle);
     let mut stderr_text = String::new();
-    if let Some(err) = child.stderr.take() {
+    if let Some(err) = stderr {
         for_each_line(err, |l| {
             stderr_text.push_str(&clean_line(l, ""));
             stderr_text.push('\n');
@@ -226,7 +280,22 @@ pub(crate) fn run_mux(sink: &Path, dir: &Path) -> MuxState {
             }
         });
     }
-    match child.wait() {
+    // Polled, not waited for: `abort` needs the lock while the mux runs.
+    let status = loop {
+        match lock(&handle.child).try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => std::thread::sleep(WAIT_POLL),
+            Err(e) => break Err(e),
+        }
+    };
+    if handle.aborted.load(Ordering::SeqCst) {
+        return MuxState::Failed {
+            code: None,
+            meaning: "the mux was aborted because the app exited".into(),
+            stderr_tail: tail(&stderr_text, MUX_TAIL_BYTES).to_owned(),
+        };
+    }
+    match status {
         Ok(status) if status.success() => MuxState::Ok,
         Ok(status) => MuxState::Failed {
             code: status.code(),
@@ -239,6 +308,14 @@ pub(crate) fn run_mux(sink: &Path, dir: &Path) -> MuxState {
             stderr_tail: e.to_string(),
         },
     }
+}
+
+/// Runs `sink mux <dir>`; see `run_child`.
+pub(crate) fn run_mux(sink: &Path, dir: &Path, register: impl FnOnce(&Arc<MuxHandle>)) -> MuxState {
+    let mut cmd = command(sink);
+    cmd.arg("mux").arg(dir);
+    // The sink writes the result to `out.part.mp4` first.
+    run_child(cmd, Some(dir.join("out.part.mp4")), register)
 }
 
 /// Opens a file or folder with the system's default handler. The program is
@@ -397,8 +474,43 @@ mod tests {
 
     #[test]
     fn mux_of_a_missing_sink_fails_cleanly() {
-        let state = run_mux(Path::new("does-not-exist-streamtap-sink"), Path::new("x"));
+        let state = run_mux(
+            Path::new("does-not-exist-streamtap-sink"),
+            Path::new("x"),
+            |_| {},
+        );
         assert!(matches!(state, MuxState::Failed { code: None, .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_aborted_mux_ends_at_once_and_leaves_no_part_file() {
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join(format!("streamtap-app-abort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("out.part.mp4");
+        std::fs::write(&part, b"half a file").unwrap();
+        let mut cmd = command("ping");
+        cmd.args(["-n", "120", "127.0.0.1"]);
+        let (tx, rx) = mpsc::channel();
+        let part2 = part.clone();
+        let runner = std::thread::spawn(move || {
+            run_child(cmd, Some(part2), |h| tx.send(Arc::clone(h)).unwrap())
+        });
+        let handle = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("registered");
+        let t0 = std::time::Instant::now();
+        handle.abort();
+        let state = runner.join().unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the mux was not aborted"
+        );
+        assert!(matches!(state, MuxState::Failed { .. }), "{state:?}");
+        assert!(!part.exists(), "the half-written file is removed");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

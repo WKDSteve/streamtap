@@ -8,6 +8,7 @@
 
 mod captures;
 mod config;
+mod jobs;
 mod paths;
 mod sink;
 
@@ -30,6 +31,8 @@ type CmdResult<T> = Result<T, String>;
 struct SinkProc {
     child: Child,
     pid: u32,
+    /// Ends the sink with the app, even when the app is killed hard.
+    _job: Option<jobs::KillOnClose>,
 }
 
 /// How the last sink process ended, when nobody asked it to.
@@ -47,6 +50,8 @@ struct Inner {
     crashed: Option<SinkExit>,
     log: VecDeque<String>,
     mux: HashMap<String, MuxState>,
+    /// The running mux jobs, to abort them when the app exits.
+    mux_handles: HashMap<String, Arc<sink::MuxHandle>>,
     index_cache: HashMap<String, IndexAcc>,
     /// Counts sink starts: output of an earlier sink process (its reader
     /// threads may still be draining) is not mixed into the new log.
@@ -62,6 +67,24 @@ impl AppState {
     }
 }
 
+impl AppState {
+    /// The app is exiting: stops the sink and aborts every running mux
+    /// (their `out.part.mp4` goes with them). A hard kill skips this, the
+    /// job objects then end the children.
+    fn shutdown(&self) {
+        let handles: Vec<_> = {
+            let mut g = self.lock();
+            g.stop_sink();
+            g.mux_handles.drain().map(|(_, h)| h).collect()
+        };
+        // Outside the lock: aborting waits for the process, and the mux
+        // threads take the lock when their job ends.
+        for h in handles {
+            h.abort();
+        }
+    }
+}
+
 impl Inner {
     fn new(settings: Settings, config_path: PathBuf, config_error: Option<String>) -> Self {
         Self {
@@ -72,6 +95,7 @@ impl Inner {
             crashed: None,
             log: VecDeque::new(),
             mux: HashMap::new(),
+            mux_handles: HashMap::new(),
             index_cache: HashMap::new(),
             log_gen: 0,
         }
@@ -92,6 +116,11 @@ impl Inner {
 
     fn sink_running(&self) -> bool {
         self.sink.is_some()
+    }
+
+    /// Process id of the running sink.
+    fn sink_pid(&self) -> Option<u32> {
+        self.sink.as_ref().map(|p| p.pid)
     }
 
     fn stop_sink(&mut self) {
@@ -127,7 +156,8 @@ struct Snapshot {
 async fn snapshot(state: State<'_, AppState>) -> CmdResult<Snapshot> {
     let mut g = state.lock();
     g.refresh_sink();
-    let running = g.sink_running();
+    let sink_pid = g.sink_pid();
+    let running = sink_pid.is_some();
     let sink = SinkStatus {
         state: if running {
             "running"
@@ -141,7 +171,7 @@ async fn snapshot(state: State<'_, AppState>) -> CmdResult<Snapshot> {
     };
     let root = g.settings.captures_dir.clone();
     let (captures, captures_error) = if root.is_dir() {
-        match captures::scan(&root, &mut g.index_cache, running, SystemTime::now()) {
+        match captures::scan(&root, &mut g.index_cache, sink_pid, SystemTime::now()) {
             Ok(list) => (list, None),
             Err(e) => (
                 Vec::new(),
@@ -225,15 +255,20 @@ async fn regenerate_token(state: State<'_, AppState>) -> CmdResult<Settings> {
 
 #[tauri::command]
 async fn start_sink(state: State<'_, AppState>) -> CmdResult<()> {
-    let mut g = state.lock();
-    require_stopped(&mut g)?;
-    g.settings.validate()?;
     let exe = sink::find_sink()
         .ok_or("streamtap-sink was not found next to the app (build it: scripts/build.ps1)")?;
+    launch_sink(state.inner(), &exe)
+}
+
+/// Starts `exe serve` with the stored settings and reads its output.
+fn launch_sink(shared: &AppState, exe: &Path) -> CmdResult<()> {
+    let mut g = shared.lock();
+    require_stopped(&mut g)?;
+    g.settings.validate()?;
     let root = g.settings.captures_dir.clone();
     fs::create_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
     let token = g.settings.token.clone();
-    let mut child = sink::command(&exe)
+    let mut child = sink::command(exe)
         .args(sink::serve_args(g.settings.port, &token, &root))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -245,6 +280,18 @@ async fn start_sink(state: State<'_, AppState>) -> CmdResult<()> {
     let generation = g.log_gen;
     g.crashed = None;
     let pid = child.id();
+    let job = match jobs::KillOnClose::new(&child) {
+        Ok(job) => Some(job),
+        Err(e) => {
+            sink::push_log(
+                &mut g.log,
+                format!(
+                    "warning: the sink is not tied to the app and outlives a hard kill of it: {e}"
+                ),
+            );
+            None
+        }
+    };
     for pipe in [
         child.stdout.take().map(Pipe::Out),
         child.stderr.take().map(Pipe::Err),
@@ -252,7 +299,7 @@ async fn start_sink(state: State<'_, AppState>) -> CmdResult<()> {
     .into_iter()
     .flatten()
     {
-        let shared = state.inner().clone();
+        let shared = shared.clone();
         let (token, root) = (token.clone(), root.clone());
         std::thread::spawn(move || match pipe {
             Pipe::Out(p) => sink::for_each_line(p, |l| {
@@ -263,7 +310,11 @@ async fn start_sink(state: State<'_, AppState>) -> CmdResult<()> {
             }),
         });
     }
-    g.sink = Some(SinkProc { child, pid });
+    g.sink = Some(SinkProc {
+        child,
+        pid,
+        _job: job,
+    });
     Ok(())
 }
 
@@ -307,7 +358,7 @@ async fn mux_capture(state: State<'_, AppState>, id: String) -> CmdResult<()> {
         if matches!(g.mux.get(&id), Some(MuxState::Running)) {
             return Err("a mux of this capture is already running".into());
         }
-        if captures::is_live(&dir, g.sink_running(), SystemTime::now()) {
+        if captures::dir_is_live(&dir, g.sink_pid(), SystemTime::now()) {
             return Err("the capture is still receiving data; mux it when it is done".into());
         }
         g.mux.insert(id.clone(), MuxState::Running);
@@ -315,8 +366,15 @@ async fn mux_capture(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     };
     let shared = state.inner().clone();
     std::thread::spawn(move || {
-        let result = sink::run_mux(&sink_exe, &dir);
-        shared.lock().mux.insert(id, result);
+        let result = sink::run_mux(&sink_exe, &dir, |handle| {
+            shared
+                .lock()
+                .mux_handles
+                .insert(id.clone(), Arc::clone(handle));
+        });
+        let mut g = shared.lock();
+        g.mux_handles.remove(&id);
+        g.mux.insert(id, result);
     });
     Ok(())
 }
@@ -343,7 +401,7 @@ async fn delete_capture(state: State<'_, AppState>, id: String) -> CmdResult<()>
     if matches!(g.mux.get(&id), Some(MuxState::Running)) {
         return Err("a mux of this capture is running".into());
     }
-    if captures::is_live(&dir, g.sink_running(), SystemTime::now()) {
+    if captures::dir_is_live(&dir, g.sink_pid(), SystemTime::now()) {
         return Err("the capture is still receiving data; stop the sink or wait".into());
     }
     // remove_dir_all does not follow links inside the directory.
@@ -388,7 +446,7 @@ fn main() {
     app.run(|handle, event| {
         if let RunEvent::Exit = event {
             if let Some(state) = handle.try_state::<AppState>() {
-                state.lock().stop_sink();
+                state.shutdown();
             }
         }
     });
@@ -455,6 +513,153 @@ mod tests {
         g.mux.insert("1_x".into(), MuxState::Ok);
         assert!(apply_settings(&mut g, other).is_ok());
         drop(g);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- end to end against the real sink ----
+
+    /// The sink exe next to the test exe's profile directory, built first.
+    fn built_sink() -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let profile_dir = exe.parent().and_then(Path::parent).unwrap().to_path_buf();
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let status = std::process::Command::new(cargo)
+            .args(["build", "-p", "streamtap-sink", "--locked"])
+            .status()
+            .expect("cargo build");
+        assert!(status.success(), "cargo build -p streamtap-sink failed");
+        let sink = profile_dir.join(if cfg!(windows) {
+            "streamtap-sink.exe"
+        } else {
+            "streamtap-sink"
+        });
+        assert!(sink.is_file(), "{} missing", sink.display());
+        sink
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < end {
+            if let Some(v) = f() {
+                return v;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// One wire message of the extension: u32 LE header length, JSON header, payload.
+    fn frame(header: &serde_json::Value, payload: &[u8]) -> Vec<u8> {
+        let h = serde_json::to_vec(header).unwrap();
+        let mut out = u32::try_from(h.len()).unwrap().to_le_bytes().to_vec();
+        out.extend(h);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn mp4_box(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut b = u32::try_from(8 + body.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        b.extend_from_slice(&kind);
+        b.extend_from_slice(body);
+        b
+    }
+
+    /// An init segment (`ftyp` + `moov`) that declares an encrypted track.
+    fn encrypted_init() -> Vec<u8> {
+        let tenc = mp4_box(*b"tenc", &[0; 24]);
+        let encv = mp4_box(*b"encv", &tenc);
+        let pssh = mp4_box(*b"pssh", &[0; 24]);
+        let mut init = mp4_box(*b"ftyp", b"isom    isom");
+        init.extend(mp4_box(*b"moov", &[encv, pssh].concat()));
+        init
+    }
+
+    fn scan_one(st: &AppState, root: &Path) -> Option<captures::CaptureInfo> {
+        let mut g = st.lock();
+        let pid = g.sink_pid();
+        let mut list = captures::scan(root, &mut g.index_cache, pid, SystemTime::now()).unwrap();
+        assert!(list.len() <= 1, "at most one capture");
+        (!list.is_empty()).then(|| list.remove(0))
+    }
+
+    #[test]
+    fn end_to_end_an_encrypted_init_through_the_real_sink_flags_the_capture() {
+        use tungstenite::client::IntoClientRequest;
+        let sink = built_sink();
+        let (st, dir) = state("e2e");
+        let port = free_port();
+        let root = dir.join("captures");
+        {
+            let mut g = st.lock();
+            g.settings.port = port;
+            g.settings.captures_dir = root.clone();
+        }
+        launch_sink(&st, &sink).expect("start the sink");
+        let token = st.lock().settings.token.clone();
+
+        let mut request = format!("ws://127.0.0.1:{port}/")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Origin",
+            "chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia"
+                .parse()
+                .unwrap(),
+        );
+        let mut ws = wait_for("the sink to accept", || {
+            tungstenite::connect(request.clone()).ok().map(|(ws, _)| ws)
+        });
+        let hello = serde_json::json!({
+            "type": "hello", "token": token, "session": "e2e-drm",
+            "url": "https://video.example/watch", "title": "DRM e2e",
+        });
+        ws.send(tungstenite::Message::binary(frame(&hello, b"")))
+            .unwrap();
+        let init = serde_json::json!({
+            "type": "segment", "sb": 1, "seq": 1, "isInit": true, "kind": "mp4",
+            "mime": "video/mp4; codecs=\"avc1.64001e\"", "timescale": 1000,
+        });
+        ws.send(tungstenite::Message::binary(frame(
+            &init,
+            &encrypted_init(),
+        )))
+        .unwrap();
+
+        // The connection is open: the capture is live, exactly.
+        let live = wait_for("a live capture", || scan_one(&st, &root).filter(|c| c.live));
+        assert_eq!(live.title, "DRM e2e");
+
+        // The page closes the connection: done at once, although the files
+        // were just written (the old 10 s heuristic would still say live).
+        ws.close(None).unwrap();
+        while ws.read().is_ok() {}
+        drop(ws);
+        let closed_at = std::time::Instant::now();
+        let done = wait_for("the capture to be done", || {
+            scan_one(&st, &root).filter(|c| !c.live)
+        });
+        assert!(closed_at.elapsed() < captures::LIVE_WINDOW);
+        // The sink logged the refusal, the app read it and flagged the capture.
+        let flagged = wait_for("the DRM flag", || scan_one(&st, &root).filter(|c| c.drm));
+        assert!(flagged.drm && !flagged.live);
+        assert_eq!(done.id, flagged.id);
+        assert_eq!(
+            flagged.segments, 0,
+            "nothing of the encrypted track is stored"
+        );
+
+        st.shutdown();
         fs::remove_dir_all(&dir).unwrap();
     }
 }

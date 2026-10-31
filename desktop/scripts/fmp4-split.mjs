@@ -49,5 +49,14 @@ export const splitFmp4 = (file) => {
   const mdhdOff = findBox(0, init.byteLength, ["moov", "trak", "mdia", "mdhd"]);
   const timescale = mdhdOff === null ? null : dv.getUint32(mdhdOff + 8 + (u8[mdhdOff + 8] === 1 ? 20 : 12));
 
-  return { init, segments, tfdtOf, timescale };
+  // Duration of media segment i in timescale ticks: the step to the next
+  // tfdt (the last segment repeats the step before it), null when unknown.
+  const durOf = (i) => {
+    const t = (j) => (segments[j] ? tfdtOf(segments[j]) : null);
+    const step = (j) => (t(j) !== null && t(j + 1) !== null ? t(j + 1) - t(j) : null);
+    const d = step(i) ?? (i > 0 ? step(i - 1) : null);
+    return d !== null && d > 0 ? d : null;
+  };
+
+  return { init, segments, tfdtOf, durOf, timescale };
 };
