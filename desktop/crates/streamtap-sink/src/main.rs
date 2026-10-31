@@ -11,13 +11,13 @@
 //! The first message of a connection is a `hello` header carrying the token.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,10 @@ const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 /// `SourceBuffers` per session; a page can forge records with arbitrary ids,
 /// and each track holds an open file.
 const MAX_TRACKS: usize = 32;
+/// Refused tracks remembered across connections (oldest forgotten first).
+const MAX_REFUSALS: usize = 4096;
+/// Characters of the extension's session id the sink keys on.
+const MAX_SESSION_ID: usize = 64;
 /// Malformed messages tolerated per connection after `hello` before closing.
 const MAX_BAD_MESSAGES: u32 = 100;
 /// Default cap of bytes written per session (`--max-session-gib`).
@@ -119,6 +123,7 @@ fn run_serve(args: &[String]) -> Result<(), SinkError> {
         total_max,
         total_used: AtomicU64::new(0),
     });
+    let refusals = Arc::new(Refusals::default());
     fs::create_dir_all(&out).map_err(|e| SinkError::io("cannot create", Some(out.clone()), e))?;
 
     // Loopback only. Binding anything else is not an option, not a flag.
@@ -137,8 +142,10 @@ fn run_serve(args: &[String]) -> Result<(), SinkError> {
                 let out = out.clone();
                 let origin = origin.clone();
                 let budget = Arc::clone(&budget);
+                let refusals = Arc::clone(&refusals);
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(s, &token, &origin, &out, &budget) {
+                    if let Err(e) = handle_connection(s, &token, &origin, &out, &budget, &refusals)
+                    {
                         eprintln!("connection ended with error: {e}");
                     }
                 });
@@ -353,8 +360,50 @@ impl Budget {
     }
 }
 
+/// Tracks refused as DRM, shared by all connections of one sink process. A
+/// reconnect opens a new session that may never see the encrypted init again,
+/// and `WebM` media carries no marker of its own: the track stays refused
+/// until a clear init arrives. Key: the extension's session id (one per
+/// `MediaSource`, the same on every socket) and the `SourceBuffer`.
+#[derive(Default)]
+struct Refusals {
+    keys: Mutex<VecDeque<(String, u32)>>,
+}
+
+impl Refusals {
+    fn keys(&self) -> std::sync::MutexGuard<'_, VecDeque<(String, u32)>> {
+        // A panic elsewhere leaves the list consistent: keep using it.
+        self.keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn contains(&self, id: &str, sb: u32) -> bool {
+        self.keys().iter().any(|(i, s)| i == id && *s == sb)
+    }
+
+    fn insert(&self, id: &str, sb: u32) {
+        let mut keys = self.keys();
+        if keys.iter().any(|(i, s)| i == id && *s == sb) {
+            return;
+        }
+        if keys.len() >= MAX_REFUSALS {
+            keys.pop_front();
+        }
+        keys.push_back((id.to_owned(), sb));
+    }
+
+    fn remove(&self, id: &str, sb: u32) {
+        self.keys().retain(|(i, s)| !(i == id && *s == sb));
+    }
+}
+
 struct Session {
     dir: PathBuf,
+    /// The extension's session id (truncated); empty for a client that sends
+    /// none, whose refusals are then not remembered (they would collide).
+    id: String,
+    refusals: Arc<Refusals>,
     index: File,
     tracks: HashMap<u32, TrackState>,
     track_limit_logged: bool,
@@ -715,6 +764,7 @@ fn handle_connection(
     origin: &str,
     out: &Path,
     budget: &Arc<Budget>,
+    refusals: &Arc<Refusals>,
 ) -> io::Result<()> {
     let peer = stream.peer_addr()?;
     // tungstenite's default caps a frame at 16 MiB; segments may be up to
@@ -775,7 +825,7 @@ fn handle_connection(
                     break;
                 }
                 // A spent process budget creates no further directories.
-                let Some(s) = Session::open(out, &id, &url, &title, Arc::clone(budget))? else {
+                let Some(s) = Session::open(out, &id, &url, &title, budget, refusals)? else {
                     eprintln!("{peer}: --max-total-gib reached, closing");
                     break;
                 };
@@ -1024,7 +1074,8 @@ impl Session {
         session_id: &str,
         url: &str,
         title: &str,
-        budget: Arc<Budget>,
+        budget: &Arc<Budget>,
+        refusals: &Arc<Refusals>,
     ) -> io::Result<Option<Self>> {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1066,11 +1117,13 @@ impl Session {
             .open(dir.join("index.jsonl"))?;
         Ok(Some(Self {
             dir,
+            id: session_id.chars().take(MAX_SESSION_ID).collect(),
+            refusals: Arc::clone(refusals),
             index,
             tracks: HashMap::new(),
             track_limit_logged: false,
             bytes_total: open_cost,
-            budget,
+            budget: Arc::clone(budget),
             stopped: false,
             seen_total: 0,
             seen_limit_logged: false,
@@ -1222,8 +1275,29 @@ impl Session {
             return Ok(false);
         }
         let file = Self::open_part(&self.dir, sb, 0)?;
-        self.tracks.insert(sb, TrackState::new(file));
+        let mut track = TrackState::new(file);
+        // Refused on an earlier connection: stays refused until a clear init.
+        if !self.id.is_empty() && self.refusals.contains(&self.id, sb) {
+            eprintln!(
+                "{}: sb{sb} was refused as DRM before this reconnect; not capturing it",
+                self.dir.display()
+            );
+            track.refused = true;
+        }
+        self.tracks.insert(sb, track);
         Ok(true)
+    }
+
+    /// Records whether `sb` is refused as DRM beyond this connection.
+    fn remember_refusal(&self, sb: u32, refused: bool) {
+        if self.id.is_empty() {
+            return;
+        }
+        if refused {
+            self.refusals.insert(&self.id, sb);
+        } else {
+            self.refusals.remove(&self.id, sb);
+        }
     }
 
     /// An init with its first segment in one append (`init_prefix_len` is
@@ -1340,6 +1414,7 @@ impl Session {
             track.refused = true;
             track.take_pending();
             track.skipped += 1;
+            self.remember_refusal(h.sb, true);
             return Ok(());
         }
         if track.refused && !h.is_init {
@@ -1354,6 +1429,10 @@ impl Session {
             track.pending_after_refusal = std::mem::take(&mut track.refused);
             track.init_kind.clone_from(&h.kind);
             track.push_pending(h, payload);
+            if track.pending_after_refusal {
+                self.remember_refusal(h.sb, false);
+            }
+            let track = self.tracks.get_mut(&h.sb).expect("present");
             if track.pending_cost() > MAX_PENDING_INIT {
                 self.flush_init(h.sb)?;
             }
@@ -3258,10 +3337,35 @@ mod tests {
 
     fn session(name: &str) -> TestSession {
         let dir = temp_dir(name);
-        let s = Session::open(&dir, "test", "u", "t", budget(16 * GIB, 64 * GIB))
+        let s = Session::open(
+            &dir,
+            "test",
+            "u",
+            "t",
+            &budget(16 * GIB, 64 * GIB),
+            &refusals(),
+        )
+        .expect("session")
+        .expect("within budget");
+        TestSession { s, _dir: dir }
+    }
+
+    fn refusals() -> Arc<Refusals> {
+        Arc::new(Refusals::default())
+    }
+
+    /// A session with the extension's session id `id`, sharing `refusals`
+    /// with the others (one sink process).
+    fn session_with(name: &str, id: &str, refusals: &Arc<Refusals>) -> TestSession {
+        let dir = temp_dir(name);
+        let s = Session::open(&dir, id, "u", "t", &budget(16 * GIB, 64 * GIB), refusals)
             .expect("session")
             .expect("within budget");
         TestSession { s, _dir: dir }
+    }
+
+    fn written(s: &Session, sb: u32) -> usize {
+        fs::read(s.dir.join(format!("sb{sb}.p0.bin"))).map_or(0, |b| b.len())
     }
 
     fn index_lines(dir: &Path) -> usize {
@@ -3422,6 +3526,122 @@ mod tests {
         assert!(s.tracks[&1].refused, "track refused without an init");
     }
 
+    /// `WebM` media carries no encryption marker: after a reconnect only the
+    /// refusal remembered from the first connection keeps it off the disk.
+    #[test]
+    fn refused_webm_track_stays_refused_after_reconnect() {
+        let shared = refusals();
+        let webm = |is_init: bool, tfdt: Option<u64>| {
+            let mut h = seg(1, is_init, tfdt, None);
+            h.kind = "webm".into();
+            h.mime = "video/webm".into();
+            h
+        };
+        // EBML header, Segment, Info, Tracks with ContentEncodings,
+        // ContentEncryption and ContentEncKeyID.
+        let init = [
+            &[0x1a, 0x45, 0xdf, 0xa3, 0x80][..],
+            &[
+                0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ],
+            &[0x15, 0x49, 0xa9, 0x66, 0x80],
+            &[
+                0x16, 0x54, 0xae, 0x6b, 0x86, 0x6d, 0x80, 0x50, 0x35, 0x47, 0xe2,
+            ],
+        ]
+        .concat();
+        let cluster = b"\x1f\x43\xb6\x75cluster";
+
+        let mut first = session_with("webmdrm-a", "tab-1", &shared);
+        write(&mut first, &webm(true, None), &init);
+        assert!(first.tracks[&1].refused, "encrypted init refused");
+        first.finish();
+        drop(first);
+
+        // Reconnect: same browser session, no init, only clusters.
+        let mut again = session_with("webmdrm-b", "tab-1", &shared);
+        for t in 0..3 {
+            write(&mut again, &webm(false, Some(t * 1000)), cluster);
+        }
+        assert_eq!(index_lines(&again.dir), 0, "no row after the reconnect");
+        assert_eq!(written(&again, 1), 0, "no bytes after the reconnect");
+
+        // Another browser session is not affected.
+        let mut other = session_with("webmdrm-c", "tab-2", &shared);
+        write(&mut other, &webm(false, Some(0)), cluster);
+        assert_eq!(index_lines(&other.dir), 1, "other session captured");
+    }
+
+    /// The same for fMP4, with clear-looking moofs (no `senc`) after the
+    /// reconnect: only the remembered refusal holds them back.
+    #[test]
+    fn refused_mp4_track_stays_refused_after_reconnect() {
+        let shared = refusals();
+        let mut init = mp4_box(*b"ftyp", b"iso6");
+        init.extend(mp4_box(*b"moov", b"..encv.."));
+
+        let mut first = session_with("mp4drm-a", "tab-1", &shared);
+        write(&mut first, &seg(1, true, None, None), &init);
+        assert!(first.tracks[&1].refused, "encrypted init refused");
+        drop(first);
+
+        let mut again = session_with("mp4drm-b", "tab-1", &shared);
+        for t in 0..3u32 {
+            write(
+                &mut again,
+                &seg(1, false, Some(u64::from(t) * 1000), None),
+                &moof(t * 1000),
+            );
+        }
+        assert_eq!(index_lines(&again.dir), 0, "no row after the reconnect");
+        assert_eq!(written(&again, 1), 0, "no bytes after the reconnect");
+        // Another SourceBuffer of the same session is not affected.
+        write(&mut again, &seg(2, false, Some(0), None), &moof(0));
+        assert_eq!(index_lines(&again.dir), 1, "sb2 captured");
+    }
+
+    /// A clear init ends the refusal, on this connection and the next ones.
+    #[test]
+    fn clear_init_after_reconnect_lifts_the_refusal() {
+        let shared = refusals();
+        let mut enc = mp4_box(*b"ftyp", b"iso6");
+        enc.extend(mp4_box(*b"moov", b"..encv.."));
+
+        let mut first = session_with("lift-a", "tab-1", &shared);
+        write(&mut first, &seg(1, true, None, None), &enc);
+        drop(first);
+
+        let mut again = session_with("lift-b", "tab-1", &shared);
+        assert!(!again.tracks.contains_key(&1));
+        write(&mut again, &seg(1, true, None, None), &init_with_traks(1));
+        write(&mut again, &seg(1, false, Some(0), None), &moof(0));
+        assert_eq!(index_lines(&again.dir), 2, "clear init and media written");
+        drop(again);
+
+        let mut third = session_with("lift-c", "tab-1", &shared);
+        write(&mut third, &seg(1, false, Some(1000), None), &moof(1000));
+        assert_eq!(index_lines(&third.dir), 1, "refusal forgotten");
+    }
+
+    #[test]
+    fn refusals_are_bounded_and_skip_anonymous_sessions() {
+        let r = Refusals::default();
+        for sb in 0..=u32::try_from(MAX_REFUSALS).expect("small") {
+            r.insert("s", sb);
+        }
+        assert!(!r.contains("s", 0), "oldest forgotten");
+        assert!(r.contains("s", 1));
+        assert_eq!(r.keys().len(), MAX_REFUSALS);
+
+        let shared = refusals();
+        let mut enc = mp4_box(*b"ftyp", b"iso6");
+        enc.extend(mp4_box(*b"moov", b"..encv.."));
+        let mut anon = session_with("anon-a", "", &shared);
+        write(&mut anon, &seg(1, true, None, None), &enc);
+        assert!(anon.tracks[&1].refused);
+        assert!(shared.keys().is_empty(), "no id, nothing remembered");
+    }
+
     #[test]
     fn encrypted_continuation_of_a_split_init_is_refused() {
         let mut s = session("drmsplit");
@@ -3451,7 +3671,7 @@ mod tests {
     #[test]
     fn session_budget_counts_index_lines_and_stops_for_good() {
         let out = temp_dir("cap");
-        let mut s = Session::open(&out, "test", "u", "t", budget(9000, 64 * GIB))
+        let mut s = Session::open(&out, "test", "u", "t", &budget(9000, 64 * GIB), &refusals())
             .expect("session")
             .expect("within budget");
         write(&mut s, &seg(1, true, None, None), b"INIT");
@@ -3479,7 +3699,7 @@ mod tests {
         let shared = budget(16 * GIB, 20_000);
         let open = |name: &str| {
             let dir = temp_dir(name);
-            let s = Session::open(&dir, name, "u", "t", Arc::clone(&shared))
+            let s = Session::open(&dir, name, "u", "t", &shared, &refusals())
                 .expect("session")
                 .expect("within budget");
             TestSession { s, _dir: dir }
@@ -3496,7 +3716,7 @@ mod tests {
         assert!(a.stopped || b.stopped);
         // A spent process budget opens no further directory.
         let out = temp_dir("tot-c");
-        let c = Session::open(&out, "c", "u", "t", Arc::clone(&shared)).expect("no io error");
+        let c = Session::open(&out, "c", "u", "t", &shared, &refusals()).expect("no io error");
         assert!(c.is_none());
         assert_eq!(
             fs::read_dir(&out).expect("dir").count(),
@@ -4178,10 +4398,10 @@ built with gcc"),
     #[test]
     fn sessions_never_share_a_directory() {
         let out = temp_dir("dirs");
-        let a = Session::open(&out, "same", "u", "t", budget(GIB, GIB))
+        let a = Session::open(&out, "same", "u", "t", &budget(GIB, GIB), &refusals())
             .expect("a")
             .expect("within budget");
-        let b = Session::open(&out, "same", "u", "t", budget(GIB, GIB))
+        let b = Session::open(&out, "same", "u", "t", &budget(GIB, GIB), &refusals())
             .expect("b")
             .expect("within budget");
         assert_ne!(a.dir, b.dir);

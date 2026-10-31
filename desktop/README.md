@@ -65,6 +65,14 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   top-level `moov` or `pssh`, sample encryption (`senc` or PIFF) in a `moof`;
   random bytes in media never count. The extension does not send protected
   segments in the first place; this is the second line.
+- **DRM across reconnects:** a reconnect opens a new session that may never
+  see the encrypted init again, and WebM media carries no marker of its own.
+  The sink process therefore remembers each refused track by the extension's
+  session id (one per MediaSource, the same on every socket) and
+  SourceBuffer: on the next connection that track stays refused until a clear
+  init arrives, which lifts it for later connections too. The list lives in
+  memory (at most 4096 tracks, oldest forgotten first); a client that sends
+  no session id gets no such memory.
 
 ### Dedupe and parts
 
@@ -234,7 +242,8 @@ Headers:
 ## Test without a browser
 
 `cargo test --release` runs the unit tests (dedupe, split inits, ABR
-switch-back, parts, DRM refusal incl. PIFF and split inits, budgets,
+switch-back, parts, DRM refusal incl. PIFF, split inits and reconnects,
+budgets,
 ordering, shifting, overlap, input checks, alignment arguments, printable
 output).
 
