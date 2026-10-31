@@ -469,7 +469,9 @@ const PIFF_SAMPLE_ENCRYPTION: [u8; 16] = [
 /// scanned for the markers: `encv`/`enca`/`tenc`/`pssh` (MP4), or the
 /// `ContentEncodings`/`ContentEncryption`/`ContentEncKeyID` IDs (`WebM`).
 /// Media is only read as structure: a top-level `moov` or `pssh`, or `senc` /
-/// PIFF sample encryption in a `moof`. Random bytes in media never count.
+/// PIFF sample encryption in a `moof`, or `saiz`/`saio` there (CENC media may
+/// carry its IVs as auxiliary info without a `senc`; clear media has no
+/// auxiliary info in practice). Random bytes in media never count.
 fn payload_encrypted(h: &SegmentHeader, payload: &[u8], init_part: bool, init_kind: &str) -> bool {
     let webm = h.kind == "webm" || (init_part && !h.is_init && init_kind == "webm");
     if h.is_init || init_part {
@@ -489,7 +491,8 @@ fn payload_encrypted(h: &SegmentHeader, payload: &[u8], init_part: bool, init_ki
             b"pssh" => true,
             b"moof" => {
                 let m = &payload[*s..*e];
-                m.windows(4).any(|w| w == b"senc")
+                m.windows(4)
+                    .any(|w| w == b"senc" || w == b"saiz" || w == b"saio")
                     || m.windows(16).any(|w| w == PIFF_SAMPLE_ENCRYPTION)
             }
             _ => false,
@@ -3274,6 +3277,13 @@ mod tests {
         let senc = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"senc", b"")));
         assert!(payload_encrypted(&h, &senc, false, "mp4"), "senc in a moof");
         assert!(!payload_encrypted(&h, &moof(0), false, "mp4"), "clear moof");
+        for aux in [*b"saiz", *b"saio"] {
+            let cenc = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(aux, b"")));
+            assert!(
+                payload_encrypted(&h, &cenc, false, "mp4"),
+                "auxiliary info without senc"
+            );
+        }
         let mut moov = mp4_box(*b"ftyp", b"iso6");
         moov.extend(mp4_box(*b"moov", b"..encv.."));
         assert!(
@@ -4046,23 +4056,26 @@ mod tests {
     /// Seen live on 2026-10-31, when an older sink wrote such media to disk.
     #[test]
     fn encrypted_media_without_init_after_reconnect_is_refused() {
-        let mut s = session("drmreconnect");
-        for t in 0..3u32 {
-            let mut m = moof(t * 1000);
-            // senc inside the traf, as CENC media carries it
-            m = mp4_box(
-                *b"moof",
-                &mp4_box(*b"traf", &[&m[16..], &mp4_box(*b"senc", b"")[..]].concat()),
+        // senc inside the traf, as CENC media carries it, or only the
+        // auxiliary info (saiz/saio) that points at the IVs.
+        for marker in [*b"senc", *b"saiz"] {
+            let mut s = session("drmreconnect");
+            for t in 0..3u32 {
+                let mut m = moof(t * 1000);
+                m = mp4_box(
+                    *b"moof",
+                    &mp4_box(*b"traf", &[&m[16..], &mp4_box(marker, b"")[..]].concat()),
+                );
+                write(&mut s, &seg(1, false, Some(u64::from(t) * 1000), None), &m);
+            }
+            assert_eq!(index_lines(&s.dir), 0, "no row for encrypted media");
+            assert_eq!(
+                fs::read(s.dir.join("sb1.p0.bin")).map_or(0, |b| b.len()),
+                0,
+                "no bytes written"
             );
-            write(&mut s, &seg(1, false, Some(u64::from(t) * 1000), None), &m);
+            assert!(s.tracks[&1].refused, "track refused without an init");
         }
-        assert_eq!(index_lines(&s.dir), 0, "no row for encrypted media");
-        assert_eq!(
-            fs::read(s.dir.join("sb1.p0.bin")).map_or(0, |b| b.len()),
-            0,
-            "no bytes written"
-        );
-        assert!(s.tracks[&1].refused, "track refused without an init");
     }
 
     /// `WebM` media carries no encryption marker: after a reconnect only the

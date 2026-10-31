@@ -151,6 +151,15 @@ sb.appendBuffer(ab(media(450000)));
 check(last().payload === undefined, "tap off: metadata only");
 globalThis.postMessage({ __vcCtl: 1, tap: true });
 
+// CENC media that carries only saiz/saio (no senc) behind a clear init.
+for (const aux of ["saiz", "saio"]) {
+  const sbAux = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+  sbAux.appendBuffer(ab(init("avc1")));
+  const cenc = Buffer.concat([box("moof", box("traf", tfhd(1), tfdt(0), box(aux, Buffer.alloc(4)))), box("mdat", Buffer.from("x"))]);
+  sbAux.appendBuffer(ab(cenc));
+  check(last().encrypted === true && last().payload === undefined, `media with only ${aux}: no bytes`);
+}
+
 // Encrypted init on a second SourceBuffer: marked for good.
 const sb2 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
 sb2.appendBuffer(ab(init("encv")));

@@ -71,7 +71,8 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   (real inits carry their markers in a `moov` or `Tracks` well below that). An init after a refusal that is still incomplete when it is
   decided (media came, or the connection ended) keeps the track refused.
   Media is only read as structure: a top-level `moov` or `pssh`, sample
-  encryption (`senc` or PIFF) in a `moof`; random bytes in media never
+  encryption (`senc` or PIFF) or auxiliary info (`saiz`/`saio`, CENC
+  without `senc`) in a `moof`; random bytes in media never
   count. The extension does not send protected
   segments in the first place; this is the second line.
 - **DRM across reconnects:** a reconnect opens a new session that may never

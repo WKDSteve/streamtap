@@ -107,8 +107,9 @@
         if (type === "moov" || type === "ftyp") out.isInit = true;
         if (type === "moov") out.moov = [bodyStart, bodyEnd];
         if (depth === 0 && (type === "moof" || type === "mdat")) out.media = true;
-        // Protection markers: a pssh box anywhere, sample encryption in traf.
-        if (type === "pssh" || type === "senc") out.encrypted = true;
+        // Protection markers: a pssh box anywhere, sample encryption in traf,
+        // or only the auxiliary info pointing at the IVs (CENC without senc).
+        if (type === "pssh" || type === "senc" || type === "saiz" || type === "saio") out.encrypted = true;
 
         if (type === "mdhd" && out.timescale === null) {
           const version = u8[bodyStart];
