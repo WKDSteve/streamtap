@@ -7,6 +7,7 @@
     "allow-snapshot",
     "allow-get-settings",
     "allow-save-settings",
+    "allow-save-ui-prefs",
     "allow-regenerate-token",
     "allow-start-sink",
     "allow-stop-sink",

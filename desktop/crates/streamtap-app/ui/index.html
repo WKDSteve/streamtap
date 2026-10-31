@@ -8,18 +8,18 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<a class="skip" href="#captures">Skip to captures</a>
+<a class="skip" href="#captures" data-i18n="skip">Skip to captures</a>
 
 <header class="bar">
   <h1>streamtap</h1>
   <div id="sink-status" class="status" role="status" aria-live="polite">
     <span id="sink-dot" class="dot dot-stopped" aria-hidden="true"></span>
-    <span id="sink-text">Sink: loading</span>
+    <span id="sink-text" data-i18n="sinkLoading">Sink: loading</span>
   </div>
   <div class="bar-actions">
-    <button id="sink-toggle" type="button" class="primary" disabled>Start</button>
-    <button id="browser-toggle" type="button" aria-expanded="false" aria-controls="browser">Connect browser</button>
-    <button id="settings-toggle" type="button" aria-expanded="false" aria-controls="settings">Settings</button>
+    <button id="sink-toggle" type="button" class="primary" disabled data-i18n="start">Start</button>
+    <button id="browser-toggle" type="button" aria-expanded="false" aria-controls="browser" data-i18n="connectBrowser">Connect browser</button>
+    <button id="settings-toggle" type="button" aria-expanded="false" aria-controls="settings" data-i18n="settings">Settings</button>
   </div>
 </header>
 
@@ -28,58 +28,79 @@
   <div id="pairing" class="notices" aria-live="assertive"></div>
 
   <section id="browser" class="panel" aria-labelledby="browser-h" hidden>
-    <h2 id="browser-h">Connect browser</h2>
-    <p class="hint">Register the connector for a browser once. After that the streamtap extension pairs itself with this app (you approve it here) and receives port and token without copy and paste. Chrome, Edge and Brave; reload the extension on <code>chrome://extensions</code> after updating it. The extension popup stays available as a manual fallback.</p>
+    <h2 id="browser-h" data-i18n="connectBrowser">Connect browser</h2>
+    <p class="hint"><span data-i18n="browserIntro1">Register the connector for a browser once. After that the streamtap extension pairs itself with this app (you approve it here) and receives port and token without copy and paste. Chrome, Edge and Brave; reload the extension on </span><code>chrome://extensions</code><span data-i18n="browserIntro2"> after updating it. The extension popup stays available as a manual fallback.</span></p>
     <ul id="browser-reg" class="plain"></ul>
     <p id="browser-note" class="hint" hidden></p>
-    <h3>Paired browsers</h3>
+    <h3 data-i18n="pairedBrowsers">Paired browsers</h3>
     <ul id="approvals" class="plain"></ul>
-    <h3>Tabs with video</h3>
+    <h3 data-i18n="tabsWithVideo">Tabs with video</h3>
     <p id="tabs-hint" class="hint"></p>
     <div id="tabs"></div>
   </section>
 
   <section id="settings" class="panel" aria-labelledby="settings-h" hidden>
-    <h2 id="settings-h">Settings</h2>
-    <p id="settings-lock" class="hint" hidden>Stop the sink to change port, captures folder or token.</p>
+    <h2 id="settings-h" data-i18n="settings">Settings</h2>
+    <p id="settings-lock" class="hint" hidden data-i18n="settingsLock">Stop the sink to change port, captures folder or token.</p>
     <form id="settings-form" autocomplete="off">
       <div class="field">
-        <label for="port">Port</label>
+        <label for="port" data-i18n="port">Port</label>
         <input id="port" name="port" type="number" min="1024" max="65535" inputmode="numeric" required>
       </div>
       <div class="field wide">
-        <label for="dir">Captures folder</label>
+        <label for="dir" data-i18n="capturesFolder">Captures folder</label>
         <input id="dir" name="dir" type="text" spellcheck="false" required>
       </div>
       <div class="field wide">
-        <label for="token">Token</label>
+        <label for="token" data-i18n="token">Token</label>
         <div class="row">
           <input id="token" name="token" type="password" readonly spellcheck="false" autocomplete="off">
-          <button id="token-show" type="button" aria-pressed="false">Show</button>
-          <button id="token-copy" type="button">Copy</button>
-          <button id="token-new" type="button">New token</button>
+          <button id="token-show" type="button" aria-pressed="false" data-i18n="show">Show</button>
+          <button id="token-copy" type="button" data-i18n="copy">Copy</button>
+          <button id="token-new" type="button" data-i18n="newToken">New token</button>
         </div>
-        <p class="hint">A browser paired through Connect browser gets port and token by itself. Otherwise paste them into the streamtap extension popup, then reload the video page.</p>
+        <p class="hint" data-i18n="tokenHint">A browser paired through Connect browser gets port and token by itself. Otherwise paste them into the streamtap extension popup, then reload the video page.</p>
       </div>
       <div class="row">
-        <button id="settings-save" type="submit" class="primary">Save</button>
+        <button id="settings-save" type="submit" class="primary" data-i18n="save">Save</button>
       </div>
     </form>
+    <!-- Outside the form: language and theme stay changeable while the sink runs. -->
+    <h3 data-i18n="appearance">Appearance</h3>
+    <div class="row prefs">
+      <div class="field">
+        <label for="pref-language" data-i18n="language">Language</label>
+        <select id="pref-language">
+          <option value="system" data-i18n="optSystem">System</option>
+          <option value="de" lang="de">Deutsch</option>
+          <option value="en" lang="en">English</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="pref-theme" data-i18n="theme">Theme</label>
+        <select id="pref-theme">
+          <option value="system" data-i18n="optSystem">System</option>
+          <option value="light" data-i18n="themeLight">Light</option>
+          <option value="dark" data-i18n="themeDark">Dark</option>
+        </select>
+      </div>
+    </div>
+    <p class="hint" data-i18n="prefsHint">Applies at once, also while the sink runs.</p>
     <dl class="facts">
       <dt>ffmpeg</dt><dd id="fact-ffmpeg">-</dd>
-      <dt>Sink program</dt><dd id="fact-sink">-</dd>
+      <dt data-i18n="sinkProgram">Sink program</dt><dd id="fact-sink">-</dd>
     </dl>
   </section>
 
   <section id="captures" class="captures" aria-labelledby="captures-h" tabindex="-1">
-    <h2 id="captures-h">Captures <span id="captures-count" class="count"></span></h2>
+    <h2 id="captures-h"><span data-i18n="captures">Captures</span> <span id="captures-count" class="count"></span></h2>
     <div id="empty" class="empty" hidden></div>
     <ul id="list" class="list"></ul>
   </section>
 
   <details id="log-box" class="panel">
-    <summary>Sink output</summary>
-    <pre id="log" tabindex="0" aria-label="Sink output"></pre>
+    <summary data-i18n="sinkOutput">Sink output</summary>
+    <pre id="log" tabindex="0" aria-label="Sink output" data-i18n-aria-label="sinkOutput"></pre>
   </details>
 </main>
 
@@ -87,15 +108,16 @@
 
 <dialog id="confirm" aria-labelledby="confirm-h">
   <form method="dialog">
-    <h2 id="confirm-h">Delete capture?</h2>
+    <h2 id="confirm-h" data-i18n="deleteCaptureQ">Delete capture?</h2>
     <p id="confirm-text"></p>
     <div class="row end">
-      <button value="cancel" id="confirm-cancel" type="submit">Cancel</button>
-      <button value="ok" id="confirm-ok" type="submit" class="danger">Delete</button>
+      <button value="cancel" id="confirm-cancel" type="submit" data-i18n="cancel">Cancel</button>
+      <button value="ok" id="confirm-ok" type="submit" class="danger" data-i18n="delete">Delete</button>
     </div>
   </form>
 </dialog>
 
+<script src="i18n.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

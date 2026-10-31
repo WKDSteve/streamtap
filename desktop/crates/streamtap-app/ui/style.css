@@ -16,8 +16,12 @@
   color-scheme: light dark;
 }
 
+/* Theme: no data-theme (or "system") follows the OS; "light" keeps the tokens above,
+   "dark" sets the dark ones. The two dark blocks must stay identical. */
+:root[data-theme="light"] { color-scheme: light; }
+
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #0f1318;
     --surface: #171c23;
     --text: #e6e9ee;
@@ -33,6 +37,24 @@
     --info-bg: #10304a;
     --focus: #79b8ff;
   }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0f1318;
+  --surface: #171c23;
+  --text: #e6e9ee;
+  --muted: #9aa5b4;
+  --border: #2d3641;
+  --accent: #4c8dff;
+  --accent-text: #0b1220;
+  --danger: #ff7b72;
+  --ok: #56d364;
+  --warn: #e3b341;
+  --warn-bg: #3a2f0b;
+  --err-bg: #3d1d1b;
+  --info-bg: #10304a;
+  --focus: #79b8ff;
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -83,7 +105,7 @@ h2 { font-size: 15px; }
 
 main { max-width: 980px; margin: 0 auto; padding: 12px 16px 32px; display: grid; gap: 12px; }
 
-button, input {
+button, input, select {
   font: inherit;
   color: inherit;
 }
@@ -100,7 +122,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 button.danger { color: var(--danger); border-color: var(--danger); }
 
-input {
+input, select {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -109,6 +131,11 @@ input {
   min-width: 0;
 }
 input:read-only { opacity: 0.85; }
+select { cursor: pointer; }
+select:disabled { opacity: 0.5; cursor: not-allowed; }
+option { background: var(--surface); color: var(--text); }
+.prefs { align-items: flex-start; gap: 12px; }
+.prefs .field { max-width: none; min-width: 12ch; }
 
 .panel {
   background: var(--surface);

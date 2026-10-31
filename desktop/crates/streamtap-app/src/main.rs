@@ -305,10 +305,39 @@ async fn save_settings(
     require_stopped(&mut g)?;
     let new = Settings {
         port,
-        token: g.settings.token.clone(),
         captures_dir: PathBuf::from(captures_dir.trim()),
+        ..g.settings.clone()
     };
     apply_settings(&mut g, new)?;
+    Ok(g.settings.clone())
+}
+
+/// Sets language and theme. Unlike the sink settings this works while the
+/// sink runs: nothing the sink or a paired browser uses changes. The values
+/// apply for this session even when they cannot be written, because the
+/// stored config is unusable (that file is only replaced by an explicit
+/// Save of the settings).
+fn apply_ui_prefs(g: &mut Inner, language: &str, theme: &str) -> CmdResult<()> {
+    let language: config::Language = language.parse()?;
+    let theme: config::Theme = theme.parse()?;
+    g.settings.language = language;
+    g.settings.theme = theme;
+    if g.config_error.is_some() {
+        return Err(
+            "not saved: the stored settings could not be read; save the settings first".into(),
+        );
+    }
+    config::save(&g.config_path, &g.settings)
+}
+
+#[tauri::command]
+async fn save_ui_prefs(
+    state: State<'_, AppState>,
+    language: String,
+    theme: String,
+) -> CmdResult<Settings> {
+    let mut g = state.lock();
+    apply_ui_prefs(&mut g, &language, &theme)?;
     Ok(g.settings.clone())
 }
 
@@ -555,6 +584,7 @@ fn main() {
             snapshot,
             get_settings,
             save_settings,
+            save_ui_prefs,
             regenerate_token,
             start_sink,
             stop_sink,
@@ -639,6 +669,53 @@ mod tests {
         assert!(apply_settings(&mut g, other.clone()).is_err());
         g.mux.insert("1_x".into(), MuxState::Ok);
         assert!(apply_settings(&mut g, other).is_ok());
+        drop(g);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ui_prefs_are_validated_strictly_and_saved() {
+        use config::{Language, Theme};
+        let (st, dir) = state("uiprefs");
+        let mut g = st.lock();
+        let before = g.settings.clone();
+        for (lang, theme) in [("fr", "dark"), ("de", "sepia"), ("DE", "dark"), ("", "")] {
+            assert!(
+                apply_ui_prefs(&mut g, lang, theme).is_err(),
+                "{lang}/{theme}"
+            );
+            assert_eq!(g.settings, before, "a refused value changes nothing");
+        }
+        assert!(!dir.join("config.json").exists());
+        apply_ui_prefs(&mut g, "de", "dark").unwrap();
+        assert_eq!(
+            (g.settings.language, g.settings.theme),
+            (Language::De, Theme::Dark)
+        );
+        assert_eq!(
+            g.settings.token, before.token,
+            "only the preferences change"
+        );
+        let stored = config::load_or_create(&dir.join("config.json"), &dir).unwrap();
+        assert_eq!(stored, g.settings);
+        drop(g);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ui_prefs_do_not_overwrite_an_unusable_config() {
+        use config::{Language, Theme};
+        let (st, dir) = state("uiprefs-broken");
+        let path = dir.join("config.json");
+        fs::write(&path, b"{ broken").unwrap();
+        let mut g = st.lock();
+        g.config_error = Some("broken".into());
+        assert!(apply_ui_prefs(&mut g, "en", "light").is_err());
+        assert_eq!(
+            (g.settings.language, g.settings.theme),
+            (Language::En, Theme::Light)
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"{ broken");
         drop(g);
         fs::remove_dir_all(&dir).unwrap();
     }

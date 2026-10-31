@@ -3,6 +3,7 @@ const COMMANDS: &[&str] = &[
     "snapshot",
     "get_settings",
     "save_settings",
+    "save_ui_prefs",
     "regenerate_token",
     "start_sink",
     "stop_sink",

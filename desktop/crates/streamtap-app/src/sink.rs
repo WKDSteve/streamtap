@@ -195,6 +195,22 @@ pub(crate) fn mux_exit_meaning(code: Option<i32>) -> &'static str {
     }
 }
 
+/// A stable key for [`mux_exit_meaning`], which the UI translates (the
+/// English `meaning` is its fallback).
+pub(crate) fn mux_exit_reason(code: Option<i32>) -> &'static str {
+    match code {
+        Some(0) => "ok",
+        Some(1) => "exit-1",
+        Some(2) => "exit-2",
+        Some(3) => "exit-3",
+        Some(4) => "exit-4",
+        Some(5) => "exit-5",
+        Some(6) => "exit-6",
+        Some(_) => "exit-unexpected",
+        None => "signal",
+    }
+}
+
 /// The last `max` bytes of `text`, cut at a character boundary.
 pub(crate) fn tail(text: &str, max: usize) -> &str {
     if text.len() <= max {
@@ -214,6 +230,8 @@ pub(crate) enum MuxState {
     Ok,
     Failed {
         code: Option<i32>,
+        /// Stable key of `meaning` for the UI's translations.
+        reason: &'static str,
         meaning: String,
         stderr_tail: String,
     },
@@ -271,6 +289,7 @@ pub(crate) fn run_child(
         Err(e) => {
             return MuxState::Failed {
                 code: None,
+                reason: "spawn",
                 meaning: "the sink could not be started".into(),
                 stderr_tail: e.to_string(),
             }
@@ -308,6 +327,7 @@ pub(crate) fn run_child(
     if handle.aborted.load(Ordering::SeqCst) {
         return MuxState::Failed {
             code: None,
+            reason: "aborted",
             meaning: "the mux was aborted because the app exited".into(),
             stderr_tail: tail(&stderr_text, MUX_TAIL_BYTES).to_owned(),
         };
@@ -316,11 +336,13 @@ pub(crate) fn run_child(
         Ok(status) if status.success() => MuxState::Ok,
         Ok(status) => MuxState::Failed {
             code: status.code(),
+            reason: mux_exit_reason(status.code()),
             meaning: mux_exit_meaning(status.code()).into(),
             stderr_tail: tail(&stderr_text, MUX_TAIL_BYTES).to_owned(),
         },
         Err(e) => MuxState::Failed {
             code: None,
+            reason: "wait",
             meaning: "waiting for the sink failed".into(),
             stderr_tail: e.to_string(),
         },
@@ -420,6 +442,17 @@ mod tests {
         let dev = sink_candidates(&dir, true);
         assert_eq!(dev[0], dir.join(SINK_EXE));
         assert!(dev.len() > 1, "development builds look further");
+    }
+
+    #[test]
+    fn every_exit_code_has_its_own_reason_key() {
+        let keys: Vec<_> = (0..=6).map(|c| mux_exit_reason(Some(c))).collect();
+        let unique: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "{keys:?}");
+        assert!(!keys.contains(&"exit-unexpected"));
+        assert_eq!(mux_exit_reason(Some(7)), "exit-unexpected");
+        assert_eq!(mux_exit_reason(Some(-1)), "exit-unexpected");
+        assert_eq!(mux_exit_reason(None), "signal");
     }
 
     #[test]

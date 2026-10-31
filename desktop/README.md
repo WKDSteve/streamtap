@@ -359,6 +359,23 @@ What it does:
   dir (`%APPDATA%\io.github.wkdsteve.streamtap`); the token is generated on
   first run. A config that does not parse is not overwritten: defaults run and
   the UI says so.
+- **Appearance** (in Settings): language *System* (default; German when the
+  webview's language starts with `de`, else English), *Deutsch* or *English*,
+  and theme *System* (default; follows the Windows light/dark mode live),
+  *Light* or *Dark*. A change applies at once, without a reload and without
+  losing open panels, open SourceBuffer tables, the pairing prompt or the delete
+  dialog, and also while the sink runs (it is saved by its own command,
+  `save_ui_prefs`, which accepts exactly `system`/`de`/`en` and
+  `system`/`light`/`dark`). Both are stored as `language` and `theme` in
+  `config.json`; a config without them (older app) loads with *System*, an
+  unknown value there falls back to *System* without failing the rest of the
+  file. While the stored config is unusable (see above) the choice applies to
+  the running app only and is not written. All texts of the UI are translated
+  (`ui/i18n.js`, one table per language, no dependency); error texts that come
+  from the app's Rust side (failed commands, config, registry and bridge errors,
+  the ffmpeg output) stay English, and page titles and URLs are shown as the
+  page sent them. Mux failures carry a stable `reason` key next to the English
+  `meaning`, so the UI shows the exit code's meaning in the chosen language.
 - **Captures:** every capture directory in the captures folder (named like the
   sink names them, `<unix seconds>_<session>[-n]`; other folders are ignored),
   newest first, refreshed
@@ -380,7 +397,7 @@ What it does:
 
 Security:
 
-- The webview may call the app's own fifteen commands and nothing else
+- The webview may call the app's own sixteen commands and nothing else
   (`build.rs` + `capabilities/main.json`; no fs, shell or opener plugin). CSP is
   `default-src 'none'` with scripts, styles and images from the app only and
   IPC as the one connection; the UI sets every disk or page string with
@@ -530,7 +547,11 @@ real sink: one sends an encrypted init (`encv`/`tenc`/`pssh`) over a
 WebSocket and checks that the app's scanner flags the capture `DRM refused`
 and that `live` ends with the connection; the other kills an owner process and
 checks that its job-tied child is gone. `cargo deny` checks the Windows target
-graph only (`targets` in `deny.toml`).
+graph only (`targets` in `deny.toml`). `node desktop/scripts/test-app-ui.mjs`
+checks the UI without a webview: both language tables have the same keys and
+placeholders, every key `index.html` and `app.js` use exists, and both themes
+in `style.css` keep WCAG contrast (4.5:1 for text, 3:1 for focus ring and
+status dot) for every colour pair the UI uses.
 
 Linux and macOS: the project is Windows-only for now and has no Linux CI. Two
 advisories only exist in Tauri's Linux backend (GTK3): RUSTSEC-2024-0370

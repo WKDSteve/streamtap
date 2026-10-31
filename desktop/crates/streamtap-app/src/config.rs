@@ -1,5 +1,6 @@
 //! The app's settings (`config.json` in the app config dir): sink port,
-//! the shared token and the captures directory.
+//! the shared token, the captures directory and the UI preferences
+//! (language and theme).
 
 use std::collections::hash_map::RandomState;
 use std::fmt::Write as _;
@@ -7,9 +8,10 @@ use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// The extension popup's default port.
 pub(crate) const DEFAULT_PORT: u16 = 17650;
@@ -23,6 +25,74 @@ pub(crate) struct Settings {
     pub(crate) port: u16,
     pub(crate) token: String,
     pub(crate) captures_dir: PathBuf,
+    /// UI language; missing in configs written before it existed.
+    #[serde(default, deserialize_with = "lenient")]
+    pub(crate) language: Language,
+    /// UI theme; missing in configs written before it existed.
+    #[serde(default, deserialize_with = "lenient")]
+    pub(crate) theme: Theme,
+}
+
+/// The UI language: `system` follows the webview's language (German for
+/// `de*`, else English).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Language {
+    #[default]
+    System,
+    De,
+    En,
+}
+
+impl FromStr for Language {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "system" => Ok(Self::System),
+            "de" => Ok(Self::De),
+            "en" => Ok(Self::En),
+            _ => Err("language must be one of: system, de, en".into()),
+        }
+    }
+}
+
+/// The UI theme: `system` follows the operating system's light or dark mode.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl FromStr for Theme {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "system" => Ok(Self::System),
+            "light" => Ok(Self::Light),
+            "dark" => Ok(Self::Dark),
+            _ => Err("theme must be one of: system, light, dark".into()),
+        }
+    }
+}
+
+/// Reads a UI preference without failing the whole config: an unknown or
+/// mistyped value (a newer app's option, a hand edit) gives the default, so
+/// the token and the other settings still load.
+fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr + Default,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default())
 }
 
 /// A random token of 64 hex digits.
@@ -53,6 +123,8 @@ impl Settings {
             port: DEFAULT_PORT,
             token: random_token(),
             captures_dir: data_dir.join("captures"),
+            language: Language::default(),
+            theme: Theme::default(),
         }
     }
 
@@ -131,6 +203,8 @@ mod tests {
             port: 17650,
             token: "0123456789abcdef0123".into(),
             captures_dir: dir,
+            language: Language::System,
+            theme: Theme::System,
         }
     }
 
@@ -184,6 +258,81 @@ mod tests {
             "a broken file is not replaced"
         );
         assert_eq!(fs::read(&path).unwrap(), b"{ not json");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn with_prefs(language: &str, theme: &str) -> String {
+        format!(
+            r#"{{"port":17651,"token":"0123456789abcdef0123","captures_dir":"C:/x/captures","language":{language},"theme":{theme}}}"#
+        )
+    }
+
+    #[test]
+    fn a_config_without_ui_preferences_still_loads_with_system_defaults() {
+        let old = r#"{"port":17650,"token":"0123456789abcdef0123","captures_dir":"C:/x/captures"}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.language, Language::System);
+        assert_eq!(s.theme, Theme::System);
+        assert_eq!(s.token, "0123456789abcdef0123");
+    }
+
+    #[test]
+    fn ui_preferences_round_trip_as_lowercase_names() {
+        let mut s = base();
+        s.language = Language::De;
+        s.theme = Theme::Dark;
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["language"], "de");
+        assert_eq!(json["theme"], "dark");
+        let back: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(back, s);
+        let s: Settings = serde_json::from_str(&with_prefs(r#""en""#, r#""light""#)).unwrap();
+        assert_eq!((s.language, s.theme), (Language::En, Theme::Light));
+    }
+
+    #[test]
+    fn unknown_ui_preferences_in_the_file_fall_back_without_losing_the_rest() {
+        for (lang, theme) in [
+            (r#""fr""#, r#""sepia""#),
+            ("42", "null"),
+            (r#""DE""#, r#""Dark""#),
+            ("{}", "[]"),
+        ] {
+            let s: Settings = serde_json::from_str(&with_prefs(lang, theme)).unwrap();
+            assert_eq!(s.language, Language::System, "{lang}");
+            assert_eq!(s.theme, Theme::System, "{theme}");
+            assert_eq!(s.port, 17651);
+            assert_eq!(s.token, "0123456789abcdef0123");
+        }
+    }
+
+    #[test]
+    fn ui_preference_names_are_parsed_strictly() {
+        assert_eq!("system".parse::<Language>(), Ok(Language::System));
+        assert_eq!("de".parse::<Language>(), Ok(Language::De));
+        assert_eq!("en".parse::<Language>(), Ok(Language::En));
+        assert_eq!("system".parse::<Theme>(), Ok(Theme::System));
+        assert_eq!("light".parse::<Theme>(), Ok(Theme::Light));
+        assert_eq!("dark".parse::<Theme>(), Ok(Theme::Dark));
+        for bad in ["", "DE", "de-DE", " en", "english", "fr"] {
+            assert!(bad.parse::<Language>().is_err(), "{bad:?}");
+        }
+        for bad in ["", "Dark", "auto", "light ", "hell"] {
+            assert!(bad.parse::<Theme>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ui_preferences_survive_a_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("streamtap-app-cfg-ui-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+        let mut s = load_or_create(&path, &dir).unwrap();
+        assert_eq!((s.language, s.theme), (Language::System, Theme::System));
+        s.language = Language::En;
+        s.theme = Theme::Light;
+        save(&path, &s).unwrap();
+        assert_eq!(load_or_create(&path, &dir).unwrap(), s);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

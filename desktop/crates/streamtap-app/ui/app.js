@@ -2,12 +2,16 @@
 
 // The UI only talks to the app's own Tauri commands (see capabilities/main.json).
 // Every string from disk or from the page (titles, URLs, MIME types) is set with
-// textContent, never as HTML.
+// textContent, never as HTML. UI texts come from I18N (i18n.js); error texts of the
+// commands stay as the app sends them (English).
 
 const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
 const $ = (id) => document.getElementById(id);
+const t = I18N.t;
 
 const POLL_MS = 2000;
+const LANGUAGES = ["system", "de", "en"];
+const THEMES = ["system", "light", "dark"];
 
 const state = {
   snap: null,
@@ -17,6 +21,8 @@ const state = {
   browserOpen: false,
   signature: "",
   busy: false,
+  // Language and theme as stored ("system" follows the webview / the OS).
+  prefs: { language: "system", theme: "system" },
 };
 
 // ---- helpers --------------------------------------------------------------
@@ -34,6 +40,8 @@ const el = (tag, props = {}, ...children) => {
   return node;
 };
 
+const fmtNumber = (v, digits) => v.toLocaleString(I18N.lang, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+
 const fmtBytes = (n) => {
   if (!n) return "0 B";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -43,7 +51,7 @@ const fmtBytes = (n) => {
     v /= 1024;
     i++;
   }
-  return `${i === 0 ? v : v.toFixed(v < 10 ? 2 : 1)} ${units[i]}`;
+  return `${i === 0 ? v : fmtNumber(v, v < 10 ? 2 : 1)} ${units[i]}`;
 };
 
 const fmtDuration = (ms) => {
@@ -54,15 +62,15 @@ const fmtDuration = (ms) => {
   return h ? `${h}:${p(m)}:${p(s % 60)}` : `${m}:${p(s % 60)}`;
 };
 
-const fmtDate = (secs) => (secs ? new Date(secs * 1000).toLocaleString() : "unknown time");
+const fmtDate = (secs) => (secs ? new Date(secs * 1000).toLocaleString(I18N.lang) : t("unknownTime"));
 
 let toastTimer = 0;
 const toast = (msg) => {
-  const t = $("toast");
-  t.textContent = msg;
-  t.hidden = false;
+  const box = $("toast");
+  box.textContent = msg;
+  box.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (t.hidden = true), 5000);
+  toastTimer = setTimeout(() => (box.hidden = true), 5000);
 };
 
 const run = async (label, fn) => {
@@ -74,18 +82,61 @@ const run = async (label, fn) => {
   await refresh();
 };
 
+// ---- language and theme ---------------------------------------------------
+
+const pick = (value, allowed) => (allowed.includes(value) ? value : "system");
+
+// Applies the stored preferences at once: language of every text, <html lang>,
+// data-theme (absent = follow the OS). The DOM is updated in place, so open panels,
+// open SourceBuffer tables, the pairing prompt and the tab list stay as they are.
+const applyPrefs = () => {
+  const root = document.documentElement;
+  I18N.setLanguage(I18N.resolve(state.prefs.language, navigator.language));
+  root.lang = I18N.lang;
+  if (state.prefs.theme === "system") delete root.dataset.theme;
+  else root.dataset.theme = state.prefs.theme;
+  I18N.applyStatic(document);
+  $("pref-language").value = state.prefs.language;
+  $("pref-theme").value = state.prefs.theme;
+  if (pendingCapture) $("confirm-text").textContent = confirmText(pendingCapture);
+  state.signature = "";
+  if (state.snap) render(state.snap);
+};
+
+const takePrefs = (settings) => {
+  state.prefs = { language: pick(settings?.language, LANGUAGES), theme: pick(settings?.theme, THEMES) };
+};
+
+const onPrefChange = () => {
+  state.prefs = { language: pick($("pref-language").value, LANGUAGES), theme: pick($("pref-theme").value, THEMES) };
+  applyPrefs();
+  const { language, theme } = state.prefs;
+  invoke("save_ui_prefs", { language, theme })
+    .then((s) => {
+      if (state.settings) state.settings = { ...state.settings, language: s.language, theme: s.theme };
+    })
+    .catch((e) => toast(`${t("saveAppearance")}: ${e}`));
+};
+
+$("pref-language").addEventListener("change", onPrefChange);
+$("pref-theme").addEventListener("change", onPrefChange);
+// "System" follows a change of the webview's language without a restart.
+window.addEventListener("languagechange", () => {
+  if (state.prefs.language === "system") applyPrefs();
+});
+
 // ---- rendering ------------------------------------------------------------
 
 const renderHeader = (snap) => {
   const s = snap.sink;
   const dot = $("sink-dot");
   dot.className = `dot dot-${s.state}`;
-  let text = "Sink: stopped";
-  if (s.state === "running") text = `Sink: running on 127.0.0.1:${state.settings?.port ?? ""}`;
-  if (s.state === "crashed") text = `Sink: crashed${s.exit_code != null ? ` (exit ${s.exit_code})` : ""}`;
+  let text = t("sinkStopped");
+  if (s.state === "running") text = t("sinkRunning", { port: state.settings?.port ?? "" });
+  if (s.state === "crashed") text = s.exit_code != null ? t("sinkCrashedCode", { code: s.exit_code }) : t("sinkCrashed");
   $("sink-text").textContent = text;
   const btn = $("sink-toggle");
-  btn.textContent = s.state === "running" ? "Stop" : "Start";
+  btn.textContent = s.state === "running" ? t("stop") : t("start");
   btn.disabled = state.busy || (s.state !== "running" && !snap.sink_path);
   btn.classList.toggle("danger", s.state === "running");
   btn.classList.toggle("primary", s.state !== "running");
@@ -99,18 +150,18 @@ const renderNotices = (snap) => {
   box.replaceChildren();
   const s = snap.sink;
   if (snap.config_error) {
-    box.append(notice("error", "The saved settings could not be used.", `${snap.config_error} Defaults are active; saving settings replaces the file.`));
+    box.append(notice("error", t("noticeConfigTitle"), t("noticeConfigBody", { error: snap.config_error })));
   }
   if (!snap.sink_path) {
-    box.append(notice("error", "streamtap-sink was not found.", "It must sit next to this app (or in desktop/target/release while developing). Build it with scripts/build.ps1."));
+    box.append(notice("error", t("noSinkTitle"), t("noSinkBody")));
   }
   if (s.state === "crashed") {
-    box.append(notice("error", "The sink stopped by itself.", "Often the port is already in use: change it in Settings, or close the other program. Last output:", snap.log.slice(-8).join("\n")));
+    box.append(notice("error", t("crashedTitle"), t("crashedBody"), snap.log.slice(-8).join("\n")));
   }
   if (!snap.ffmpeg) {
-    box.append(notice("warn", "ffmpeg was not found on PATH.", "Capturing works, but muxing a capture into an MP4 needs ffmpeg. Install it and restart this app."));
+    box.append(notice("warn", t("noFfmpegTitle"), t("noFfmpegBody")));
   }
-  if (snap.captures_error) box.append(notice("error", "Cannot list captures.", snap.captures_error));
+  if (snap.captures_error) box.append(notice("error", t("capturesErrorTitle"), snap.captures_error));
 };
 
 const renderEmpty = (snap) => {
@@ -124,41 +175,49 @@ const renderEmpty = (snap) => {
   const port = state.settings?.port ?? 17650;
   if (snap.sink.state !== "running") {
     box.append(
-      el("strong", { text: "The sink is not running." }),
-      el("span", { text: "The extension cannot deliver anything while it is stopped. Press Start in the header." }),
+      el("strong", { text: t("emptyStoppedTitle") }),
+      el("span", { text: t("emptyStoppedBody", { start: t("start") }) }),
     );
     return;
   }
   box.append(
-    el("strong", { text: "No captures yet. The sink is waiting for the extension." }),
+    el("strong", { text: t("emptyWaitingTitle") }),
     el("ol", {},
-      el("li", { text: `Open Settings, copy the token, and paste it with port ${port} into the streamtap extension popup (Save).` }),
-      el("li", { text: "Reload the page with the video and start playing it." }),
-      el("li", { text: "The capture appears here within a few seconds. DRM-protected streams are refused on purpose." }),
+      el("li", { text: t("emptyStep1", { port }) }),
+      el("li", { text: t("emptyStep2") }),
+      el("li", { text: t("emptyStep3") }),
     ),
   );
 };
 
 const badge = (text, cls) => el("span", { class: `badge ${cls}`, text });
 
+// The app sends a stable reason key with every failed mux; its English meaning is
+// the fallback for a key this UI does not know.
+const muxMeaning = (job) => {
+  const key = `reason.${job.reason}`;
+  return job.reason && key in I18N.tables.en ? t(key) : job.meaning;
+};
+
 const muxBox = (job) => {
   if (!job) return null;
-  if (job.state === "running") return el("div", { class: "mux", role: "status", text: "Muxing with ffmpeg, no re-encoding. This can take a while for long videos." });
-  if (job.state === "ok") return el("div", { class: "mux", role: "status", text: "Mux finished. The result is out.mp4 in the capture folder." });
-  const code = job.code == null ? "" : ` (exit ${job.code})`;
-  return el("div", { class: "mux failed", role: "alert" }, el("strong", { text: `Mux failed${code}: ${job.meaning}` }), job.stderr_tail ? el("pre", { text: job.stderr_tail }) : null);
+  if (job.state === "running") return el("div", { class: "mux", role: "status", text: t("muxRunningText") });
+  if (job.state === "ok") return el("div", { class: "mux", role: "status", text: t("muxOkText") });
+  const meaning = muxMeaning(job);
+  const text = job.code == null ? t("muxFailed", { meaning }) : t("muxFailedCode", { code: job.code, meaning });
+  return el("div", { class: "mux failed", role: "alert" }, el("strong", { text }), job.stderr_tail ? el("pre", { text: job.stderr_tail }) : null);
 };
 
 const card = (c, job, detailsOpen) => {
-  const title = c.title || "(untitled page)";
+  const title = c.title || t("untitledPage");
   const badges = el("div", { class: "badges" });
-  badges.append(badge(c.live ? "live" : "done", c.live ? "live" : "done"));
-  if (c.drm) badges.append(badge("DRM refused", "drm"));
-  if (c.muxed) badges.append(badge("muxed", "muxed"));
+  badges.append(badge(c.live ? t("badgeLive") : t("badgeDone"), c.live ? "live" : "done"));
+  if (c.drm) badges.append(badge(t("badgeDrmRefused"), "drm"));
+  if (c.muxed) badges.append(badge(t("badgeMuxed"), "muxed"));
   const muxRunning = job?.state === "running";
 
   const sbTable = el("table", {},
-    el("thead", {}, el("tr", {}, ...["#", "kind", "type", "segments", "size"].map((h) => el("th", { text: h })))),
+    el("thead", {}, el("tr", {}, ...["#", t("colKind"), t("colType"), t("colSegments"), t("colSize")].map((h) => el("th", { text: h })))),
     el("tbody", {}, ...c.source_buffers.map((s) => el("tr", {},
       el("td", { text: String(s.sb) }), el("td", { text: s.kind || "-" }), el("td", { text: s.mime || "-" }),
       el("td", { text: String(s.segments) }), el("td", { text: fmtBytes(s.bytes) })))),
@@ -166,25 +225,26 @@ const card = (c, job, detailsOpen) => {
 
   const btn = (label, fid, onclick, extra = {}) => el("button", { type: "button", "data-fid": `${c.id}:${fid}`, onclick, ...extra, text: label });
   const actions = el("div", { class: "actions" },
-    btn(muxRunning ? "Muxing..." : c.muxed ? "Mux again" : "Mux", "mux", () => run("Mux", () => invoke("mux_capture", { id: c.id })),
-      { disabled: muxRunning || c.live || !c.segments, title: c.live ? "Wait until the capture is done" : !c.segments ? "Nothing to mux yet" : "" }),
-    btn("Open result", "open", () => run("Open result", () => invoke("open_result", { id: c.id })), { disabled: !c.muxed }),
-    btn("Open folder", "folder", () => run("Open folder", () => invoke("open_folder", { id: c.id }))),
-    btn("Delete", "delete", () => askDelete(c), { class: "danger", disabled: muxRunning || c.live }),
+    btn(muxRunning ? t("muxing") : c.muxed ? t("muxAgain") : t("mux"), "mux", () => run(t("mux"), () => invoke("mux_capture", { id: c.id })),
+      { disabled: muxRunning || c.live || !c.segments, title: c.live ? t("waitUntilDone") : !c.segments ? t("nothingToMux") : "" }),
+    btn(t("openResult"), "open", () => run(t("openResult"), () => invoke("open_result", { id: c.id })), { disabled: !c.muxed }),
+    btn(t("openFolder"), "folder", () => run(t("openFolder"), () => invoke("open_folder", { id: c.id }))),
+    btn(t("delete"), "delete", () => askDelete(c), { class: "danger", disabled: muxRunning || c.live }),
   );
 
+  const sbCount = c.source_buffers.length;
   return el("li", { class: "card", "data-id": c.id },
     el("h3", { text: title }),
-    el("div", { class: "sub", text: `${c.host || "unknown host"} - ${fmtDate(c.started)}`, title: c.url }),
+    el("div", { class: "sub", text: `${c.host || t("unknownHost")} - ${fmtDate(c.started)}`, title: c.url }),
     badges,
     el("div", { class: "meta" },
-      el("span", { text: `Duration ${c.duration_ms ? fmtDuration(c.duration_ms) : "-"}` }),
+      el("span", { text: t("duration", { d: c.duration_ms ? fmtDuration(c.duration_ms) : "-" }) }),
       el("span", { text: fmtBytes(c.bytes) }),
-      el("span", { text: `${c.segments} segments` }),
-      el("span", { text: `${c.source_buffers.length} SourceBuffer${c.source_buffers.length === 1 ? "" : "s"}` }),
-      c.muxed ? el("span", { text: `Result ${fmtBytes(c.result_bytes)}` }) : null,
+      el("span", { text: t(c.segments === 1 ? "segmentsOne" : "segmentsMany", { n: c.segments }) }),
+      el("span", { text: t(sbCount === 1 ? "sourceBuffersOne" : "sourceBuffersMany", { n: sbCount }) }),
+      c.muxed ? el("span", { text: t("result", { size: fmtBytes(c.result_bytes) }) }) : null,
     ),
-    c.source_buffers.length ? el("details", { open: detailsOpen }, el("summary", { text: "SourceBuffers" }), sbTable) : null,
+    sbCount ? el("details", { open: detailsOpen }, el("summary", { text: t("sourceBuffers") }), sbTable) : null,
     muxBox(job),
     actions,
   );
@@ -210,24 +270,25 @@ const renderSettings = (snap) => {
   }
   if (s) $("token").value = s.token;
   $("token").type = state.tokenShown ? "text" : "password";
-  $("token-show").textContent = state.tokenShown ? "Hide" : "Show";
+  $("token-show").textContent = state.tokenShown ? t("hide") : t("show");
   $("token-show").setAttribute("aria-pressed", String(state.tokenShown));
-  $("fact-ffmpeg").textContent = snap.ffmpeg || "not found on PATH";
-  $("fact-sink").textContent = snap.sink_path || "not found";
+  $("fact-ffmpeg").textContent = snap.ffmpeg || t("notFoundOnPath");
+  $("fact-sink").textContent = snap.sink_path || t("notFound");
 };
 
 const renderLog = (snap) => {
   const pre = $("log");
   const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
-  pre.textContent = snap.log.length ? snap.log.join("\n") : "(no output yet)";
+  pre.textContent = snap.log.length ? snap.log.join("\n") : t("noOutput");
   if (atEnd) pre.scrollTop = pre.scrollHeight;
 };
 
 // ---- browser link ---------------------------------------------------------
 
-const BROWSER_NAMES = { chrome: "Chrome", edge: "Edge", brave: "Brave", other: "Browser" };
-const browserName = (id) => BROWSER_NAMES[id] ?? "Browser";
-const REG_TEXT = { registered: "registered", "not-registered": "not registered", stale: "registered for another location" };
+const BROWSER_NAMES = { chrome: "Chrome", edge: "Edge", brave: "Brave" };
+const browserName = (id) => BROWSER_NAMES[id] ?? t("browserFallback");
+const REG_KEYS = { registered: "regRegistered", "not-registered": "regNotRegistered", stale: "regStale" };
+const profileLabel = (c) => t("browserProfile", { browser: browserName(c.browser), profile: c.profile });
 
 // Page-controlled strings (titles, hosts) arrive cleaned and bounded from the app and
 // are set with textContent only. A favicon is shown only when it is an image data URL.
@@ -242,11 +303,11 @@ const renderPairing = (snap) => {
   for (const c of snap.browser.link.connections.filter((x) => !x.approved)) {
     box.append(
       el("div", { class: "notice warn", role: "alert" },
-        el("strong", { text: `${browserName(c.browser)} (profile ${c.profile}) wants to pair with streamtap.` }),
-        el("span", { text: "If you started this just now, approve it: the extension then receives the sink's port and token and can list your video tabs. Otherwise deny." }),
+        el("strong", { text: t("pairPrompt", { browser: browserName(c.browser), profile: c.profile }) }),
+        el("span", { text: t("pairBody") }),
         el("div", { class: "row" },
-          el("button", { type: "button", class: "primary", "data-fid": `pair:${c.id}:yes`, text: "Approve", onclick: () => run("Approve", () => invoke("browser_decide", { conn: c.id, approve: true })) }),
-          el("button", { type: "button", "data-fid": `pair:${c.id}:no`, text: "Deny", onclick: () => run("Deny", () => invoke("browser_decide", { conn: c.id, approve: false })) }),
+          el("button", { type: "button", class: "primary", "data-fid": `pair:${c.id}:yes`, text: t("approve"), onclick: () => run(t("approve"), () => invoke("browser_decide", { conn: c.id, approve: true })) }),
+          el("button", { type: "button", "data-fid": `pair:${c.id}:no`, text: t("deny"), onclick: () => run(t("deny"), () => invoke("browser_decide", { conn: c.id, approve: false })) }),
         )),
     );
   }
@@ -258,20 +319,20 @@ const renderBrowser = (snap) => {
   reg.replaceChildren(
     ...b.registrations.map((r) => {
       const registered = r.state === "registered";
-      const label = r.error ? `error: ${r.error}` : REG_TEXT[r.state] ?? "unknown";
+      const label = r.error ? t("regError", { error: r.error }) : t(REG_KEYS[r.state] ?? "regUnknown");
       return el("li", { class: "regrow" },
         el("strong", { text: browserName(r.browser) }),
         el("span", { class: registered ? "ok" : "muted", text: label }),
         el("span", { class: "grow" }),
         registered
-          ? el("button", { type: "button", "data-fid": `reg:${r.browser}:rm`, text: "Remove", onclick: () => run("Remove", () => invoke("browser_unregister", { browser: r.browser })) })
-          : el("button", { type: "button", class: "primary", "data-fid": `reg:${r.browser}:add`, text: r.state === "stale" ? "Register again" : "Register", disabled: !b.host_path, title: b.host_path ? "" : "streamtap-host was not found next to the app", onclick: () => run("Register", () => invoke("browser_register", { browser: r.browser })) }),
+          ? el("button", { type: "button", "data-fid": `reg:${r.browser}:rm`, text: t("remove"), onclick: () => run(t("remove"), () => invoke("browser_unregister", { browser: r.browser })) })
+          : el("button", { type: "button", class: "primary", "data-fid": `reg:${r.browser}:add`, text: r.state === "stale" ? t("registerAgain") : t("register"), disabled: !b.host_path, title: b.host_path ? "" : t("hostMissing"), onclick: () => run(t("register"), () => invoke("browser_register", { browser: r.browser })) }),
       );
     }),
   );
   const note = $("browser-note");
   const notes = [];
-  if (!b.host_path) notes.push("streamtap-host was not found next to the app (build it with scripts/build.ps1).");
+  if (!b.host_path) notes.push(t("hostMissingNote"));
   if (b.bridge_error) notes.push(b.bridge_error);
   if (b.link.store_error) notes.push(b.link.store_error);
   note.hidden = !notes.length;
@@ -281,50 +342,50 @@ const renderBrowser = (snap) => {
   list.replaceChildren(
     ...(b.link.approvals.length
       ? b.link.approvals.map((a) => el("li", { class: "regrow" },
-          el("strong", { text: `${browserName(a.browser)} (profile ${a.profile})` }),
-          el("span", { class: a.connected ? "ok" : "muted", text: a.connected ? "connected" : "not connected" }),
+          el("strong", { text: profileLabel(a) }),
+          el("span", { class: a.connected ? "ok" : "muted", text: a.connected ? t("connected") : t("notConnected") }),
           el("span", { class: "grow" }),
-          el("button", { type: "button", class: "danger", "data-fid": `rev:${a.instance}`, text: "Revoke", onclick: () => run("Revoke", () => invoke("browser_revoke", { instance: a.instance })) })))
-      : [el("li", { class: "muted", text: "No browser is paired yet." })]),
+          el("button", { type: "button", class: "danger", "data-fid": `rev:${a.instance}`, text: t("revoke"), onclick: () => run(t("revoke"), () => invoke("browser_revoke", { instance: a.instance })) })))
+      : [el("li", { class: "muted", text: t("noPaired") })]),
   );
 
   const running = snap.sink.state === "running";
   const approved = b.link.connections.filter((c) => c.approved);
   $("tabs-hint").textContent = approved.length
     ? running
-      ? "Capture reloads the tab once so that it sees the start of the stream. No previews of the page are taken (that would need access to all sites); icon and title come from the tab."
-      : "Start the sink (header) before you switch a tab to capture."
-    : "A paired and connected browser lists the tabs that hold a video here.";
+      ? t("tabsHintCapture")
+      : t("tabsHintStart")
+    : t("tabsHintNone");
   const box = $("tabs");
   box.replaceChildren(
     ...approved.map((c) =>
       el("div", { class: "browser-tabs" },
-        el("h4", { text: `${browserName(c.browser)} (profile ${c.profile})` }),
+        el("h4", { text: profileLabel(c) }),
         c.tabs.length
-          ? el("ul", { class: "plain" }, ...c.tabs.map((t) =>
+          ? el("ul", { class: "plain" }, ...c.tabs.map((tab) =>
               el("li", { class: "tabrow" },
-                faviconImg(t.favicon),
+                faviconImg(tab.favicon),
                 el("span", { class: "tabtext" },
-                  el("span", { class: "tabtitle", text: t.title || t.host || "(untitled)" }),
-                  el("span", { class: "muted", text: `${t.host}${t.active ? " - visible tab" : ""}` })),
-                t.drm ? badge("DRM", "drm") : null,
-                t.tapping ? badge("capturing", "live") : null,
+                  el("span", { class: "tabtitle", text: tab.title || tab.host || t("untitled") }),
+                  el("span", { class: "muted", text: tab.active ? t("visibleTab", { host: tab.host }) : tab.host })),
+                tab.drm ? badge(t("badgeDrm"), "drm") : null,
+                tab.tapping ? badge(t("badgeCapturing"), "live") : null,
                 el("button", {
                   type: "button",
-                  class: t.tapping ? "danger" : "primary",
-                  "data-fid": `tab:${c.id}:${t.id}`,
-                  text: t.tapping ? "Stop" : "Capture",
-                  disabled: (!t.tapping && !running) || (t.drm && !t.tapping),
-                  title: t.drm ? "DRM-protected: streamtap leaves it alone" : "",
-                  onclick: () => run("Capture", () => invoke("browser_tap", { conn: c.id, tab: t.id, on: !t.tapping })),
+                  class: tab.tapping ? "danger" : "primary",
+                  "data-fid": `tab:${c.id}:${tab.id}`,
+                  text: tab.tapping ? t("stop") : t("capture"),
+                  disabled: (!tab.tapping && !running) || (tab.drm && !tab.tapping),
+                  title: tab.drm ? t("drmTabTitle") : "",
+                  onclick: () => run(t("capture"), () => invoke("browser_tap", { conn: c.id, tab: tab.id, on: !tab.tapping })),
                 }))))
-          : el("p", { class: "muted", text: "No tab with a video yet. Open a page and start playing." })),
+          : el("p", { class: "muted", text: t("noTabs") })),
     ),
   );
 };
 
 const render = (snap) => {
-  const sig = JSON.stringify([snap, state.settings, state.tokenShown, state.busy]);
+  const sig = JSON.stringify([snap, state.settings, state.tokenShown, state.busy, I18N.lang]);
   if (sig === state.signature) return;
   state.signature = sig;
   const focusId = document.activeElement?.dataset?.fid;
@@ -343,32 +404,39 @@ const render = (snap) => {
 
 const refresh = async () => {
   try {
-    if (!state.settings) state.settings = await invoke("get_settings");
+    if (!state.settings) {
+      state.settings = await invoke("get_settings");
+      takePrefs(state.settings);
+      applyPrefs();
+    }
     state.snap = await invoke("snapshot");
     render(state.snap);
   } catch (e) {
-    $("sink-text").textContent = `App error: ${e}`;
+    $("sink-text").textContent = t("appError", { error: e });
   }
 };
 
-let pending = null;
+// The capture the delete dialog asks about (its text is redone on a language change).
+let pendingCapture = null;
+const confirmText = (c) => t("confirmText", { title: c.title || c.id, size: fmtBytes(c.bytes), id: c.id });
+
 const askDelete = (c) => {
-  pending = c.id;
-  $("confirm-text").textContent = `"${c.title || c.id}" (${fmtBytes(c.bytes)}) and its folder ${c.id} will be removed from disk. This cannot be undone.`;
+  pendingCapture = c;
+  $("confirm-text").textContent = confirmText(c);
   $("confirm").showModal();
   $("confirm-cancel").focus();
 };
 
 $("confirm").addEventListener("close", () => {
-  const id = pending;
-  pending = null;
-  if ($("confirm").returnValue === "ok" && id) run("Delete", () => invoke("delete_capture", { id }));
+  const id = pendingCapture?.id;
+  pendingCapture = null;
+  if ($("confirm").returnValue === "ok" && id) run(t("delete"), () => invoke("delete_capture", { id }));
 });
 
 $("sink-toggle").addEventListener("click", async () => {
   state.busy = true;
   const running = state.snap?.sink.state === "running";
-  await run(running ? "Stop" : "Start", () => invoke(running ? "stop_sink" : "start_sink"));
+  await run(running ? t("stop") : t("start"), () => invoke(running ? "stop_sink" : "start_sink"));
   state.busy = false;
   await refresh();
 });
@@ -388,9 +456,9 @@ $("browser-toggle").addEventListener("click", () => {
 
 $("settings-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  run("Save settings", async () => {
+  run(t("saveSettings"), async () => {
     state.settings = await invoke("save_settings", { port: Number($("port").value), capturesDir: $("dir").value });
-    toast("Settings saved");
+    toast(t("settingsSaved"));
   });
 });
 
@@ -417,13 +485,13 @@ const copyText = async (text) => {
 
 $("token-copy").addEventListener("click", async () => {
   if (!state.settings) return;
-  toast((await copyText(state.settings.token)) ? "Token copied" : "Copy failed: press Show, then Ctrl+C");
+  toast((await copyText(state.settings.token)) ? t("tokenCopied") : t("copyFailed"));
 });
 
 $("token-new").addEventListener("click", () =>
-  run("New token", async () => {
+  run(t("newToken"), async () => {
     state.settings = await invoke("regenerate_token");
-    toast("New token created. Update it in the extension popup too.");
+    toast(t("newTokenCreated"));
   }),
 );
 
@@ -437,5 +505,7 @@ const tick = async () => {
   polling = false;
 };
 
+// Until the stored preferences arrive, the page follows the webview's language.
+applyPrefs();
 tick();
 setInterval(tick, POLL_MS);
