@@ -42,6 +42,37 @@ streamtap/
   README.md
 ```
 
+## Install (Windows, from the checkout)
+
+Needs Rust (rustup) and the MSVC Build Tools. In a normal, not elevated PowerShell,
+**not** from inside an MSIX-packaged app such as a Claude session or a terminal started by
+one: such an app redirects `%APPDATA%`, `%LOCALAPPDATA%` and `HKCU` into its own container,
+and the install would exist only there (the scripts refuse inside a Claude session).
+
+```powershell
+.\scripts\build-install.ps1              # build (scripts\build.ps1), then install for you
+.\scripts\build-install.ps1 -BuildOnly   # only build desktop\target\release\*.exe
+.\scripts\uninstall.ps1                  # remove the install, keep your data
+.\scripts\uninstall.ps1 -RemoveData      # also the app's settings, token, pairings, WebView cache
+```
+
+`build-install.ps1` copies `streamtap-app.exe`, `streamtap-sink.exe` and
+`streamtap-host.exe` to `%LOCALAPPDATA%\streamtap` together with a copy of
+`uninstall.ps1`, adds a Start menu entry *streamtap* and an entry in *Settings > Apps*
+(which runs that copy). It refuses while one of the programs runs from the checkout
+or the install folder and names the PIDs: close the app first, it stops its sink.
+Your settings, token and pairings (`%APPDATA%\io.github.wkdsteve.streamtap`) and
+your captures are not touched; `uninstall.ps1` never removes a capture, not even
+with `-RemoveData` (the default captures folder lies inside the settings folder,
+so that folder then stays).
+
+After the install, open *streamtap* from the Start menu. A browser you registered
+from the checkout still starts the checkout's host (the script names it, the
+*Connect browser* panel shows "registered for another location"): press
+*Register again* there once per browser. `uninstall.ps1` removes a browser's
+registration only when it points into the install folder. Details:
+[desktop/README.md](desktop/README.md#install).
+
 ## Checks
 
 CI (`.github/workflows/ci.yml`, the author's self-hosted Windows runner, on
@@ -60,8 +91,11 @@ node extension/scripts/test-hook.mjs
 node extension/scripts/test-content.mjs
 node extension/scripts/test-pairing.mjs
 node desktop/scripts/test-sink-link.mjs
+node desktop/scripts/test-app-ui.mjs
 python -m unittest discover tools
 python tools/check-control-chars.py
+pwsh -NoProfile -File scripts/test-install.ps1   # install/uninstall in a temp folder, fake registry root
+Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Error, Warning   # PSScriptAnalyzer 1.24.0
 ```
 
 The Rust toolchain is pinned in `desktop/rust-toolchain.toml` (rustup
@@ -73,8 +107,8 @@ installs it on first use).
 2. Spike 2: segments streamed binary to a local Rust server, written per
    SourceBuffer, `ffmpeg -c copy` yields a playable MP4 (done).
 3. MVP: desktop app with a capture list, DRM flag, mux and open (started: sink control,
-   live list, mux/open/delete, browser pairing with a tab list; still to do: background
-   capture mode, installer).
+   live list, mux/open/delete, browser pairing with a tab list, build-install from the
+   checkout; still to do: background capture mode, a setup.exe from the releases).
 4. Later: more capture modes for DRM-free streams, tab capture, live ring
    buffer, Firefox.
 

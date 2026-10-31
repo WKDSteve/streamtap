@@ -14,7 +14,8 @@ cargo test --release         # unit tests of dedupe, ordering, limits, DRM refus
 `scripts/build.ps1` (repo root) is what the nvim-config's `:MyNative build`
 runs: it refuses while a sink from this checkout is running (the exe is
 locked) and gives the exe the current time after a successful build, so a
-no-op build counts as current.
+no-op build counts as current. `scripts/build-install.ps1` builds the same way and
+installs for the current user (see Install in the app section below).
 
 Workspace lints: `unsafe_code = "forbid"`, clippy `all` as `deny`, `pedantic`
 as `warn` (clean, tests included), rustfmt with Unix newlines.
@@ -371,6 +372,54 @@ looks in `target/release` and `target/debug` of the cargo target dir; a
 release build never runs a program from another directory. Running it needs WebView2 (part of
 Windows 11); building it needs nothing extra.
 
+## Install
+
+`scripts/build-install.ps1` (repo root) builds with `scripts/build.ps1` and installs
+the three exes for the current user; `scripts/uninstall.ps1` takes it away. Run both in a
+normal, not elevated PowerShell, never from inside an MSIX-packaged app (a Claude session,
+a terminal it started): the package's container redirects `%APPDATA%`, `%LOCALAPPDATA%`
+and `HKCU`, and everything would land only there. Both refuse when `CLAUDECODE` is set and
+when the session is elevated (`-AllowElevated` for a build machine); `-BuildOnly` builds
+anywhere.
+
+| What | Where | `uninstall.ps1` |
+|---|---|---|
+| `streamtap-app.exe`, `streamtap-sink.exe`, `streamtap-host.exe`, a copy of `uninstall.ps1` | `%LOCALAPPDATA%\streamtap` | removed; the folder only when nothing else is in it |
+| Start menu entry `streamtap.lnk` | the user's Start menu programs folder | removed when it starts the installed app |
+| *Settings > Apps* entry (runs the installed `uninstall.ps1` with the places of this install) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\streamtap` | removed last, when its `InstallLocation` is this folder |
+| browser registrations (`NativeMessagingHosts`) | written by the app, not by the script | removed when the manifest names a host in the install folder; another copy's stays |
+| settings, token, pairings, host manifests | `%APPDATA%\io.github.wkdsteve.streamtap` | kept; `-RemoveData` removes `config.json`, `pairings.json`, `bridge.json` and `native-messaging\*.json` |
+| WebView cache | `%LOCALAPPDATA%\io.github.wkdsteve.streamtap\EBWebView` | kept; `-RemoveData` removes it |
+| captures (default `captures\` in the settings folder) | wherever you set them | never touched |
+
+Both scripts refuse while `streamtap-app`, `-sink` or `-host` runs from the install
+folder and name the PIDs (`build.ps1` does the same for the checkout); the files are
+replaced through a `.new` copy and a rename. A second `uninstall.ps1` says there is
+nothing to do; a file it cannot remove is an error, and the *Settings > Apps* entry
+then stays for the next run.
+
+**Browsers after an install.** The app owns the registration (manifest, key,
+rollback; see "Connect browser"), so the script does not write it. A browser
+registered from the checkout keeps starting `desktop\target\release\streamtap-host.exe`;
+`build-install.ps1` lists such browsers. Open the installed app from the Start menu,
+*Connect browser*: it shows them as "registered for another location" (a manifest
+that names another copy's host counts as stale), and *Register again* points them at
+the installed host. (A non-interactive re-register flag in the app was not added: the
+browser keeps working with the checkout's host until you press the button, and the
+registration code stays in one place.)
+
+Places for tests: `-InstallDir`, `-StartMenuDir`, `-RegistryRoot` (the key that stands
+for `HKCU\Software`, below which the uninstall entry is written and the browser keys are
+read), and for `uninstall.ps1` also `-DataDir`, `-LocalDataDir`; each defaults to
+`STREAMTAP_INSTALL_DIR`, `STREAMTAP_START_MENU_DIR`, `STREAMTAP_REGISTRY_ROOT`,
+`STREAMTAP_DATA_DIR`, `STREAMTAP_LOCAL_DATA_DIR` before the real place.
+`build-install.ps1 -BuildDir <dir>` installs prebuilt exes without building.
+`scripts/test-install.ps1` (CI, job `hygiene`) installs stand-ins (copies of `cmd.exe`)
+into a temp folder with a throw-away registry root `HKCU:\Software\streamtap-test-install-<id>`
+and checks files, shortcut, entry, the browser report, the refusals (Claude session, a
+running sink, a locked file), uninstalling with the installed copy, a second uninstall, and
+that `-RemoveData` keeps captures and foreign files.
+
 What it does:
 
 - **Header:** sink state (stopped, running, crashed with its exit code), a
@@ -540,6 +589,9 @@ the extension. Three parts:
   the `winreg` crate (MIT, already in the tree through Tauri's build tooling)
   behind a trait: the tests use a fake, and one test uses a throw-away key under
   `HKCU\Software\streamtap-test-<pid>` that it removes, never the browsers' keys.
+A key and manifest that are the app's but whose manifest names another host than
+the one next to the running app (the checkout's, after an install) count as
+"registered for another location" too.
   Start the app from Explorer or the Start menu when you register: an app
   launched by a packaged (MSIX) program, such as a terminal or agent inside
   one, inherits its container, and its HKCU key, manifest and `bridge.json`

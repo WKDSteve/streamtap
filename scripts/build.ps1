@@ -11,7 +11,8 @@ bare `cargo build` gets wrong for them:
 - A no-op build leaves the exes' timestamps alone, so a build that is current
   still looks older than the newest commit and stays "stale". After a
   successful build both exes get the current time.
-Nothing is installed (spike stage); the extension is loaded unpacked.
+Nothing is installed here (scripts\build-install.ps1 builds through this script and
+installs); the extension is loaded unpacked.
 
 .EXAMPLE
 .\scripts\build.ps1
