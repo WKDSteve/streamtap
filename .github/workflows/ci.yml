@@ -67,6 +67,8 @@ jobs:
         run: git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' | xargs -0 -n1 node --check
       # The MSE hook in Node with stand-ins; needs neither a browser nor a sink.
       - run: node extension/scripts/test-hook.mjs
+      # The content script's replay for a new port, also without a browser.
+      - run: node extension/scripts/test-content.mjs
 
   # A control or invisible character in a tracked text file (a backspace in a path, a bidirectional override in
   # source) is refused (NREL-14); the tool tests itself.

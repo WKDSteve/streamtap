@@ -453,6 +453,21 @@ chrome.runtime.onConnect.addListener((port) => {
           linkSend(link, item);
           return;
         }
+        if (msg.t === "lost" && msg.header && typeof msg.header === "object") {
+          // content.js could not keep this SourceBuffer's init for a new
+          // port (a restarted worker): handled like an evicted one.
+          const sb = msg.header.sb;
+          if (!Number.isSafeInteger(sb) || sb < 0 || link.inits.has(sb)) return;
+          if (link.ws && link.ws.readyState === WebSocket.OPEN) {
+            if (!link.lostInit.has(sb) && linkAdmit(link)) {
+              linkSend(link, { blob: sinkFrame({ type: "event", name: "initlost", sb }), sb: null, isInit: false, initCont: false });
+            }
+            link.lostInit.add(sb);
+          } else {
+            link.evicted.add(sb);
+          }
+          return;
+        }
         if (msg.t === "event" && msg.header && typeof msg.header === "object") {
           const name = msg.header.name === "endofstream" || msg.header.name === "changetype" ? msg.header.name : null;
           if (name && linkAdmit(link)) {

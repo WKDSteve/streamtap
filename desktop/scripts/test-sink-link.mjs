@@ -16,6 +16,8 @@
 //   evicted     the kept init was dropped for the budget: the new socket says
 //               initlost, drops queued media up to the next queued init and
 //               takes everything after it.
+//   unkept      a new port (restarted worker) whose content script could not
+//               keep an init: initlost, media dropped up to the next init.
 //   kept        (no sockets) a page or an ad frame filling the kept-init
 //               budget loses its own inits, not another tab's or frame's.
 // Usage:
@@ -257,6 +259,29 @@ const half = Math.ceil(segments.length / 2);
       ? readFileSync(join(captures, dirs[1], "events.jsonl"), "utf8")
       : "";
     check(events.includes('"initlost"'), "evicted: the sink is told (initlost)");
+  }
+}
+
+// --- unkept init after a worker restart ---------------------------------------
+{
+  // content.js could not keep sb1's init (too large) for this new port.
+  const p = fakePort(6, "unkept-a");
+  p.onMessage({ t: "lost", header: { sb: 1 } });
+  seg(p, segments[0], false);
+  seg(p, init, true);
+  seg(p, segments[1], false);
+  await sleep(1000);
+  p.onDisconnect();
+  await sleep(500);
+  const dirs = newDirs("unkept-a");
+  check(dirs.length === 1, `unkept: one capture directory (got ${dirs.length})`);
+  if (dirs.length === 1) {
+    const shape = rows(dirs[0]).map((x) => (x.is_init ? "I" : "M")).join("");
+    check(shape === "IM", `unkept: media before the next init dropped (got ${shape})`);
+    const events = existsSync(join(captures, dirs[0], "events.jsonl"))
+      ? readFileSync(join(captures, dirs[0], "events.jsonl"), "utf8")
+      : "";
+    check(events.includes('"initlost"'), "unkept: the sink is told (initlost)");
   }
 }
 

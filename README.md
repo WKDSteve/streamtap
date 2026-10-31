@@ -46,6 +46,7 @@ cargo deny check                # cargo install cargo-deny; policy in desktop/de
 cd ..
 git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' | xargs -0 -n1 node --check
 node extension/scripts/test-hook.mjs
+node extension/scripts/test-content.mjs
 python -m unittest discover tools
 python tools/check-control-chars.py
 ```

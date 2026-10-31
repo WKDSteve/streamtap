@@ -324,6 +324,14 @@ sb12b.appendBuffer(ab(box("styp", Buffer.from("msdh"))));
 check(last().tsoSet === false, "so does a styp on its own");
 sb12b.appendBuffer(ab(media(0)));
 check(last().tsoSet === true, "the samples after them carry it");
+// A segment cut inside its styp: the first piece starts the segment and
+// takes the set offset, the rest does not.
+sb12b.timestampOffset = 8;
+const cutSeg = Buffer.concat([box("styp", Buffer.from("msdhmsdhmsdh")), media(90000)]);
+sb12b.appendBuffer(ab(cutSeg.subarray(0, 12)));
+check(last().tsoSet === true, "a cut styp piece starts the segment: it takes the set offset");
+sb12b.appendBuffer(ab(cutSeg.subarray(12)));
+check(last().tsoSet === false, "the rest of the cut segment does not");
 
 // The head of a new split init does not carry the previous init's timescale.
 sb8.appendBuffer(ab(clear8.subarray(0, 20)));

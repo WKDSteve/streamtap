@@ -155,6 +155,9 @@
         // sb -> [{ header, payload }, ...]: the init in effect at the end of
         // the chain, with its continuation chunks (an init split across appends)
         inits: new Map(),
+        // sb whose init in effect could not be kept (too large, or more
+        // than MAX_KEPT_INITS): a new port is told, so it waits for the next
+        unkept: new Set(),
         chain: Promise.resolve(),
         closed: false,
       };
@@ -187,6 +190,9 @@
     });
     port.postMessage({ t: "hello", session: link.session, title: document.title.slice(0, 300) });
     if (link.ports > 1) {
+      // An init that cannot be replayed: its media is useless on the new
+      // port until the next init (the service worker says initlost).
+      for (const sb of link.unkept) port.postMessage({ t: "lost", header: { sb } });
       for (const chunks of link.inits.values()) {
         for (const { header, payload } of chunks) {
           port.postMessage({ t: "segment", header, payload: await toDataUrl(payload) });
@@ -216,18 +222,22 @@
   // behind it belongs to it, media before it to the previous one.
   // A continuation chunk joins the kept init; a new init replaces it. An init
   // too large to keep also drops the old one, so the old quality's init is
-  // never replayed in front of the new quality's media.
+  // never replayed in front of the new quality's media; it is noted in
+  // `unkept`.
   const keepInit = (link, header, payload) => {
     if (header.initCont) {
       const chunks = link.inits.get(header.sb);
       if (!chunks) return;
       const kept = chunks.reduce((n, c) => n + c.payload.byteLength, 0);
-      if (kept + payload.byteLength > MAX_INIT_BYTES) link.inits.delete(header.sb);
-      else chunks.push({ header, payload });
+      if (kept + payload.byteLength > MAX_INIT_BYTES) {
+        link.inits.delete(header.sb);
+        link.unkept.add(header.sb);
+      } else chunks.push({ header, payload });
       return;
     }
     if (!header.isInit) return;
     link.inits.delete(header.sb);
+    link.unkept.add(header.sb);
     // An init+media append (video.js VHS) keeps only its init part.
     let init = { header, payload };
     if (header.initLen && header.initLen < payload.byteLength) {
@@ -238,7 +248,12 @@
     }
     if (init.payload.byteLength > MAX_INIT_BYTES) return;
     link.inits.set(header.sb, [init]);
-    while (link.inits.size > MAX_KEPT_INITS) link.inits.delete(link.inits.keys().next().value);
+    link.unkept.delete(header.sb);
+    while (link.inits.size > MAX_KEPT_INITS) {
+      const oldest = link.inits.keys().next().value;
+      link.inits.delete(oldest);
+      link.unkept.add(oldest);
+    }
   };
 
   const sendSegment = (header, payload) => {

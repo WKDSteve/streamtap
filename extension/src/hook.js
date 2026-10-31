@@ -393,22 +393,24 @@
 
   const initEnd = (u8, kind) => (kind === "webm" ? webmInitEnd(u8) : mp4InitEnd(u8));
 
-  // Whether media bytes hold samples: a moof or mdat at the top level, also
-  // when it is cut off (MP4); not only boxes in front of them (styp, sidx,
-  // emsg, prft). Other kinds always count as samples.
+  // Whether media bytes may hold samples: anything but a run of complete
+  // boxes that go in front of samples (styp, sidx, ssix, emsg, prft), the
+  // same rule as the sink's held segment head. A piece of a cut segment
+  // (a box running past the end, bytes that are no box) counts as samples.
+  // Other kinds always do.
+  const HEAD_BOXES = ["styp", "sidx", "ssix", "emsg", "prft"];
   const hasSamples = (u8, kind) => {
-    if (kind !== "mp4") return true;
+    if (kind !== "mp4" || u8.byteLength === 0) return true;
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     let off = 0;
-    while (off + 8 <= u8.byteLength) {
-      const type = ascii(u8, off + 4);
-      if (type === "moof" || type === "mdat") return true;
+    while (off < u8.byteLength) {
+      if (off + 8 > u8.byteLength || !HEAD_BOXES.includes(ascii(u8, off + 4))) return true;
       let size = dv.getUint32(off);
       if (size === 1) {
-        if (off + 16 > u8.byteLength) return false;
+        if (off + 16 > u8.byteLength) return true;
         size = Number(dv.getBigUint64(off + 8));
       }
-      if (size < 8) return false;
+      if (size < 8 || off + size > u8.byteLength) return true;
       off += size;
     }
     return false;
