@@ -47,6 +47,12 @@ class ControlCharacters(unittest.TestCase):
         self.assertEqual(check.problems("x", b"\x00\x01\x02"), [])
         self.assertEqual(check.problems("x", b"\xff\xfe\x01"), [])
 
+    def test_a_nul_byte_in_a_text_file_is_a_finding_not_a_reason_to_skip_it(self):
+        # A NUL in a source file must not hide a bidi override behind it.
+        data = ("a\0b\nx" + chr(0x202E) + "y").encode("utf-8")
+        self.assertEqual(check.problems("src/main.rs", data), [(1, 0), (2, 0x202E)])
+        self.assertEqual(check.problems("data.bin", data), [])
+
     def test_ordinary_non_ascii_text_passes(self):
         self.assertEqual(found("Gr\u00fc\u00dfe \u2014 \u65e5\u672c\u8a9e \U0001F600"), [])
 

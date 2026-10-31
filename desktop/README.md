@@ -411,7 +411,11 @@ Security:
   The app lists a capture as `live` only while it is `open`, written by the
   sink process the app runs (`sink_pid`) and that sink is running. A sink that
   was killed hard cannot write the end; its captures stay `open` on disk but
-  are not live, because that process is gone. Captures of older sinks have no
+  are not live, because that process is gone. Windows reuses process ids, so a
+  capture must also have begun after the app started the sink it belongs to
+  (`started` is not older than that start). When the rename that writes the end
+  fails (a virus scanner holding the file), it is tried again and then
+  replaced in place: not atomic, but the capture is not left `open`. Captures of older sinks have no
   `state`: for those the app keeps the old rule (live = the sink runs and wrote
   into the capture within 10 s). Readers that do not know the fields ignore them.
 - **Children die with the app:** on Windows the app puts the sink and every

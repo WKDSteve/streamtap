@@ -4,7 +4,7 @@
 A tab and a backspace in the path of a README (an install folder) went by
 unseen; a bidirectional override in source hides what the code does (the
 "Trojan Source" trick). This reads every file `git ls-files` lists, skips
-binary files (a NUL byte, or not UTF-8), and rejects:
+binary files (a NUL byte in a file that is not named like text, or not UTF-8), and rejects:
 
   * C0 controls except line feed and carriage return, and DEL; a TAB too, except in the files
     whose format needs it (Makefile, *.mk, *.tsv, .gitmodules);
@@ -60,6 +60,10 @@ ALLOWED: dict[str, str] = {}
 TAB_FILE_NAMES = ("Makefile", "GNUmakefile", ".gitmodules")
 TAB_FILE_SUFFIXES = (".mk", ".tsv")
 
+# Files with these suffixes are text even when they hold a NUL byte, which is then a finding.
+TEXT_SUFFIXES = (".rs", ".js", ".mjs", ".py", ".md", ".toml", ".json", ".html", ".css", ".yml",
+                 ".yaml", ".ps1", ".txt", ".lock")
+
 
 def tracked_files():
     try:
@@ -79,7 +83,9 @@ def name_problems(path):
 
 def problems(path, data):
     """The (line, code point) pairs of the bad characters of one file's bytes."""
-    if b"\0" in data:
+    # A NUL byte marks a binary file, except in a file whose name says it is text: there it must not
+    # blind this check to the rest of the file (a NUL planted in a source file hides what follows).
+    if b"\0" in data and not path.endswith(TEXT_SUFFIXES):
         return []
     try:
         text = data.decode("utf-8")

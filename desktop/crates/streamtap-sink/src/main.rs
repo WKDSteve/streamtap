@@ -1123,6 +1123,31 @@ fn write_session_file(dir: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(&tmp, dir.join("session.json"))
 }
 
+/// Replaces an existing `session.json`. The rename fails while another
+/// process (a virus scanner, a reader that did not share deletion) has the
+/// file open; that is tried again a few times and then given up for an
+/// in-place write, which is not atomic but is better than a capture that
+/// stays `open` for as long as the sink runs.
+fn replace_session_file(dir: &Path, bytes: &[u8]) -> io::Result<()> {
+    const ATTEMPTS: u32 = 5;
+    const PAUSE: Duration = Duration::from_millis(20);
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        match write_session_file(dir, bytes) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(PAUSE);
+        }
+    }
+    let _ = fs::remove_file(dir.join("session.json.tmp"));
+    fs::write(dir.join("session.json"), bytes).map_err(|e| {
+        let first = last.map_or_else(String::new, |l| format!(" (rename: {l})"));
+        io::Error::new(e.kind(), format!("{e}{first}"))
+    })
+}
+
 impl Drop for Session {
     /// Runs when the connection is over, also after a panic or a write error.
     fn drop(&mut self) {
@@ -1146,7 +1171,7 @@ impl Session {
         self.meta["ended"] = secs.into();
         let written = serde_json::to_vec_pretty(&self.meta)
             .map_err(io::Error::from)
-            .and_then(|bytes| write_session_file(&self.dir, &bytes));
+            .and_then(|bytes| replace_session_file(&self.dir, &bytes));
         if let Err(e) = written {
             eprintln!("{}: session end not recorded: {e}", self.dir.display());
         }
@@ -5269,6 +5294,45 @@ built with gcc"),
         // Everything else is kept, and no temp file is left behind.
         assert_eq!(done["url"], "https://x/v");
         assert_eq!(done["title"], "T");
+        assert!(!dir.join("session.json.tmp").exists());
+    }
+
+    /// A reader that keeps `session.json` open without sharing deletion (a
+    /// virus scanner does the same for a moment) makes the rename fail.
+    #[cfg(windows)]
+    #[test]
+    fn the_end_is_recorded_although_a_reader_blocks_the_rename() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let out = temp_dir("endblocked");
+        let s = Session::open(
+            &out,
+            "sid",
+            "https://x/v",
+            "T",
+            &budget(GIB, GIB),
+            &refusals(),
+        )
+        .expect("open")
+        .expect("within budget");
+        let dir = s.dir.clone();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, but not FILE_SHARE_DELETE.
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(dir.join("session.json"))
+            .expect("hold the file");
+        fs::write(dir.join("probe.tmp"), b"x").expect("probe");
+        assert!(
+            fs::rename(dir.join("probe.tmp"), dir.join("session.json")).is_err(),
+            "sanity: replacing the held file by rename does not work"
+        );
+        fs::remove_file(dir.join("probe.tmp")).expect("remove probe");
+        drop(s);
+        drop(reader);
+        let done: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("session.json")).expect("read"))
+                .expect("json");
+        assert_eq!(done["state"], "ended", "the end was lost: {done}");
         assert!(!dir.join("session.json.tmp").exists());
     }
 
