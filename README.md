@@ -37,10 +37,43 @@ streamtap/
   desktop/     Rust workspace: streamtap-sink (WebSocket receiver, segment store, mux),
                streamtap-app (Tauri 2 shell + static UI in crates/streamtap-app/ui),
                streamtap-host (native messaging host: browser <-> app relay)
-  tools/       repository checks (control-character guard)
+  scripts/     build, install, uninstall, package-release (the release zip) and their tests
+  tools/       repository checks (control-character guard, workflow rules)
   LICENSE
   README.md
 ```
+
+## Download and install (Windows, from a release)
+
+For private machines. **Not for the Tricentis workstation** (no unsigned program is built, installed or
+started there; the app is never run on it). The release is a **zip with install scripts, not a
+setup.exe**, and nothing in it is code-signed.
+
+1. Get the zip from the repository's *Releases* (the repository is private: sign in, or
+   `gh release download <tag>`): `streamtap-<version>-x86_64-pc-windows-msvc.zip` for a release, or
+   `streamtap-windows-x86_64.zip` from the pre-release **latest** (the rolling build of the newest
+   green commit of `main`). Check it against `SHA256SUMS` of the same release:
+   `(Get-FileHash .\streamtap-*.zip).Hash` must equal the hash listed there.
+2. Install **ffmpeg** first; it is a prerequisite and not in the zip: `scoop install ffmpeg`, or put
+   `ffmpeg.exe` on the `PATH`. The app shows "ffmpeg not found" until it can start it.
+3. Unpack the zip, open a normal (not elevated) PowerShell in the unpacked folder and run
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1`. It installs for you only, without
+   administrator rights, to `%LOCALAPPDATA%\streamtap` (programs in `bin\`, the extension in
+   `extension\`), and adds a Start menu entry and an entry in *Settings > Apps* (uninstall).
+4. **Load the extension unpacked** (Chrome has no store entry for it): `chrome://extensions`, turn on
+   *Developer mode*, *Load unpacked*, pick `%LOCALAPPDATA%\streamtap\extension`. Then open *streamtap*
+   from the Start menu and use *Connect browser*; no command line is needed from here on.
+
+**SmartScreen.** The programs and scripts are unsigned, so Windows may stop a file that came from the
+internet ("Windows protected your PC": *More info*, then *Run anyway*), or refuse the script under
+a strict execution policy (hence `-ExecutionPolicy Bypass`; `Get-ChildItem -Recurse | Unblock-File`
+in the unpacked folder removes the mark). The checksum above is how you know the zip is the
+release's; it is no signature. Uninstall: *Settings > Apps > streamtap*, or the `uninstall.ps1`
+the install put in `%LOCALAPPDATA%\streamtap` (your settings and captures stay; `-RemoveData`
+also removes settings, token and pairings). Details: [desktop/README.md](desktop/README.md#install).
+
+A release is cut by pushing a `v*` tag whose version is the one in
+`desktop/crates/streamtap-app/Cargo.toml`; the workflow only makes a **draft**, which is published by hand.
 
 ## Install (Windows, from the checkout)
 
@@ -62,10 +95,11 @@ scripts\build-install.ps1` (or `pwsh` instead of `powershell`, as `:MyNative ins
 Close a streamtap app started from the checkout first: the build refuses while
 `desktop\target\release\streamtap-*.exe` runs.
 
-`build-install.ps1` copies `streamtap-app.exe`, `streamtap-sink.exe` and
-`streamtap-host.exe` to `%LOCALAPPDATA%\streamtap` together with a copy of
-`uninstall.ps1`, adds a Start menu entry *streamtap* and an entry in *Settings > Apps*
-(which runs that copy). It refuses while one of the programs runs from the checkout
+`build-install.ps1` stages the build like the release zip and runs the same `install.ps1`: it copies
+`streamtap-app.exe`, `streamtap-sink.exe` and `streamtap-host.exe` to `%LOCALAPPDATA%\streamtap\bin`,
+the extension (load it unpacked from `extension\`) and a copy of
+`uninstall.ps1` to `%LOCALAPPDATA%\streamtap`, adds a Start menu entry *streamtap* and an entry in
+*Settings > Apps* (which runs that copy). It refuses while one of the programs runs from the checkout
 or the install folder and names the PIDs: close the app first, it stops its sink.
 Your settings, token and pairings (`%APPDATA%\io.github.wkdsteve.streamtap`) and
 your captures are not touched; `uninstall.ps1` never removes a capture, not even
@@ -100,7 +134,9 @@ node desktop/scripts/test-sink-link.mjs
 node desktop/scripts/test-app-ui.mjs
 python -m unittest discover tools
 python tools/check-control-chars.py
+python tools/check-workflows.py --online          # pins, self-hosted runner, drafts only
 pwsh -NoProfile -File scripts/test-install.ps1   # install/uninstall in a temp folder, fake registry root
+pwsh -NoProfile -File scripts/test-release.ps1   # the release zip: contents, checksums, install from it
 Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Error, Warning   # PSScriptAnalyzer 1.24.0
 ```
 
@@ -114,7 +150,7 @@ installs it on first use).
    SourceBuffer, `ffmpeg -c copy` yields a playable MP4 (done).
 3. MVP: desktop app with a capture list, DRM flag, mux and open (started: sink control,
    live list, mux/open/delete, browser pairing with a tab list, build-install from the
-   checkout; still to do: background capture mode, a setup.exe from the releases).
+   checkout, a release zip with install scripts and a rolling build; still to do: background capture mode).
 4. Later: more capture modes for DRM-free streams, tab capture, live ring
    buffer, Firefox.
 

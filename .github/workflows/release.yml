@@ -1,0 +1,164 @@
+# A release is a deliberate act: it starts with a tag `vX.Y.Z` and ends as a DRAFT that a person
+# opens, installs from and clicks through before publishing it (rule NREL-07). Nothing here
+# publishes.
+#
+# What it makes (a zip with install scripts, not a setup.exe: an unsigned setup is stopped by SmartScreen
+# like the programs themselves, and install.ps1 already does the per-user install):
+#   streamtap-X.Y.Z-x86_64-pc-windows-msvc.zip   bin\ (app, sink, host), extension\, install.ps1,
+#                                                uninstall.ps1, LICENSE, README.md, VERSION
+#   SHA256SUMS                                   the checksum of the zip
+# The kit's own stamped install.ps1 is not used: it needs a program with an `install` command (kind hub) or a
+# setup (nsis, inno), and a multi-file zip with the extension is neither. The install script is in the zip.
+#
+# Runs on the self-hosted Windows runner of the maintainer (`runs-on: [self-hosted, windows]`, the repository is
+# private), so only Windows is built. The release-kit actions run there by Git Bash. appkit is public and read
+# without credentials.
+#
+# Before anything is built: the tag, the version in desktop/crates/streamtap-app/Cargo.toml (and tauri.conf.json)
+# and the main branch agree, and the CI of main was green for this very commit (NREL-08). The draft, its files
+# and the checksums are made by the action publish of appkit's release-kit; a published release is never touched
+# again (NREL-10). streamtap has no appkit crate: the pin of that action is checked by tools/check-workflows.py
+# (every action is pinned by a full commit, all appkit actions by the same one, the tag names that commit).
+#
+# Actions are pinned by commit (NREL-03); a job gets only the rights it needs.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `shell: bash` resolves to the WSL launcher on this machine; Git Bash is named explicitly, in 8.3 form because the
+# shell string is split at spaces.
+defaults:
+  run:
+    shell: C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+
+jobs:
+  check:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.facts.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag, the version and the CI of this commit agree
+        id: facts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="$GITHUB_REF_NAME"
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::the tag $tag is not vX.Y.Z"; exit 1 ;;
+          esac
+          version="${tag#v}"
+          crate="$(sed -n 's/^version *= *"\(.*\)"/\1/p' desktop/crates/streamtap-app/Cargo.toml | head -n 1)"
+          if [ "$version" != "$crate" ]; then
+            echo "::error::the tag says $version but desktop/crates/streamtap-app/Cargo.toml says $crate (bump it in its own commit first)"
+            exit 1
+          fi
+          tauri="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' desktop/crates/streamtap-app/tauri.conf.json | head -n 1)"
+          if [ "$version" != "$tauri" ]; then
+            echo "::error::the tag says $version but desktop/crates/streamtap-app/tauri.conf.json says $tauri"
+            exit 1
+          fi
+          # A release comes from main, never from a side branch.
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::the commit of the tag is not on main"
+            exit 1
+          fi
+          green="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq 'length')"
+          if [ "$green" -lt 1 ]; then
+            echo "::error::no green CI run for $GITHUB_SHA: wait for it, or fix main, then tag again"
+            exit 1
+          fi
+          # A published release is never cut again: stop before anything is built.
+          if draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" && [ "$draft" != "true" ]; then
+            echo "::error::the release $tag is published: it is never cut again (NREL-10), make a patch release"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          persist-credentials: false
+      # Installs the toolchain of rust-toolchain.toml when it is missing.
+      - name: Toolchain
+        working-directory: desktop
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build the programs
+        working-directory: desktop
+        run: cargo build --release --locked
+      - name: Pack
+        id: pack
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -eu
+          pwsh -NoProfile -File scripts/package-release.ps1 -BuildDir desktop/target/release -OutDir dist -Version "$VERSION"
+          name="streamtap-${VERSION}-x86_64-pc-windows-msvc.zip"
+          test -f "dist/$name"
+          echo "file=dist/$name" >> "$GITHUB_OUTPUT"
+      # What the archive holds, without installing it on the runner: the zip is unpacked into a temp folder, its
+      # install.ps1 runs into temp places with a throw-away registry key (the runner's own Start menu, uninstall
+      # entries and browser keys are left alone), and the install is removed again by the installed uninstall.ps1.
+      - name: Check the archive
+        env:
+          FILE: ${{ steps.pack.outputs.file }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: pwsh -NoProfile -File scripts/test-release.ps1 -BuildDir desktop/target/release -Zip "$FILE" -Label "$VERSION"
+      # Only the zip goes on: the SHA256SUMS next to it is made again, for the release, by the publish action.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-windows
+          path: ${{ steps.pack.outputs.file }}
+          if-no-files-found: error
+          retention-days: 3
+
+  # The draft (made here when there is none), the archive and the checksums.
+  publish:
+    needs: [check, build]
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          persist-credentials: false
+      # The folder must hold the one downloaded zip and nothing from an earlier job of this runner.
+      - name: Empty dist
+        run: rm -rf dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - uses: WKDSteve/appkit/release-kit/publish@518092716d00fb3fc18ce1b418032f71c3414817 # v0.27.0
+        with:
+          token: ${{ github.token }}
+          tag: ${{ github.ref_name }}
+          files: dist
+          expect: 1
+          app: streamtap
+          notes-file: .github/release-notes.md

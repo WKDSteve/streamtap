@@ -3,7 +3,8 @@
 Remove streamtap for the current user on Windows, without administrator rights.
 
 .DESCRIPTION
-Takes away what scripts/build-install.ps1 made: the programs and the copy of this script in
+Takes away what scripts/install.ps1 made (also through build-install.ps1): the programs in bin\, the
+extension folder and the copy of this script, LICENSE, README.md and VERSION in
 %LOCALAPPDATA%\streamtap (and the .new and .old files of an install that was cut short), the Start
 menu entry and the entry in Settings > Apps (which runs this
 script from there). A browser's native messaging key is removed only when its manifest names a
@@ -209,9 +210,17 @@ if (Test-Path -LiteralPath $link -PathType Leaf) {
     }
 }
 
-# 3. The files build-install.ps1 puts there; a folder that holds anything else stays.
-# The .new and .old files are what an install that was cut short leaves.
-$installed = @($programs | ForEach-Object { "$_.exe" }) + @('uninstall.ps1')
+# 3. The files install.ps1 puts there; a folder that holds anything else stays. The extension folder
+# is wholly the install's own (the browser loads it from there): it goes with everything in it.
+# The .new and .old files are what an install that was cut short leaves. The programs of the layout
+# before bin\ (directly in the install folder) go too.
+$extensionDir = Join-Path $InstallDir 'extension'
+if (Test-Path -LiteralPath $extensionDir) {
+    Invoke-Removal $extensionDir -Recurse
+    $removed += $extensionDir
+}
+$binDir = Join-Path $InstallDir 'bin'
+$installed = @($programs | ForEach-Object { "bin\$_.exe"; "$_.exe" }) + @('uninstall.ps1', 'LICENSE', 'README.md', 'VERSION')
 foreach ($name in $installed | ForEach-Object { $_; "$_.new"; "$_.old" }) {
     $file = Join-Path $InstallDir $name
     if (Test-Path -LiteralPath $file) {
@@ -219,6 +228,7 @@ foreach ($name in $installed | ForEach-Object { $_; "$_.new"; "$_.old" }) {
         if ($installed -contains $name) { $removed += $file }
     }
 }
+Invoke-EmptyFolderRemoval $binDir
 Invoke-EmptyFolderRemoval $InstallDir
 
 # 4. The Settings > Apps entry last: while anything above fails, it stays to run again.

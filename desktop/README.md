@@ -374,17 +374,21 @@ Windows 11); building it needs nothing extra.
 
 ## Install
 
-`scripts/build-install.ps1` (repo root) builds with `scripts/build.ps1` and installs
-the three exes for the current user; `scripts/uninstall.ps1` takes it away. Run both in a
-normal, not elevated PowerShell, never from inside an MSIX-packaged app (a Claude session,
-a terminal it started): the package's container redirects `%APPDATA%`, `%LOCALAPPDATA%`
-and `HKCU`, and everything would land only there. Both refuse when `CLAUDECODE` is set and
-when the session is elevated (`-AllowElevated` for a build machine); `-BuildOnly` builds
-anywhere.
+Two ways to the same install, one installer. `scripts/build-install.ps1` (repo root) builds
+with `scripts/build.ps1`, stages the build in the shape of the release zip
+(`scripts/package-release.ps1 -NoZip`) and runs `scripts/install.ps1` on it; the release zip
+(see "Release" below) carries that same `install.ps1`, run from the unpacked folder.
+`scripts/uninstall.ps1` takes it away. Run them in a normal, not elevated PowerShell, never from
+inside an MSIX-packaged app (a Claude session, a terminal it started): the package's container
+redirects `%APPDATA%`, `%LOCALAPPDATA%` and `HKCU`, and everything would land only there. They
+refuse when `CLAUDECODE` is set and when the session is elevated (`-AllowElevated` for a build
+machine); `-BuildOnly` builds anywhere.
 
 | What | Where | `uninstall.ps1` |
 |---|---|---|
-| `streamtap-app.exe`, `streamtap-sink.exe`, `streamtap-host.exe`, a copy of `uninstall.ps1` | `%LOCALAPPDATA%\streamtap` | removed; the folder only when nothing else is in it |
+| `streamtap-app.exe`, `streamtap-sink.exe`, `streamtap-host.exe` | `%LOCALAPPDATA%\streamtap\bin` | removed (also from the root, where the earlier layout had them); `bin` only when empty |
+| the extension, unpacked (`manifest.json`, `popup\`, `src\`; no tests, no README) | `%LOCALAPPDATA%\streamtap\extension` | removed with everything in it |
+| a copy of `uninstall.ps1`, `LICENSE`, `README.md`, `VERSION` | `%LOCALAPPDATA%\streamtap` | removed; the folder only when nothing else is in it |
 | Start menu entry `streamtap.lnk` | the user's Start menu programs folder | removed when it starts the installed app |
 | *Settings > Apps* entry (runs the installed `uninstall.ps1` with the places of this install) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\streamtap` | removed last, when its `InstallLocation` is this folder |
 | browser registrations (`NativeMessagingHosts`) | written by the app, not by the script | removed when the manifest names a host in the install folder; another copy's stays |
@@ -392,11 +396,18 @@ anywhere.
 | WebView cache | `%LOCALAPPDATA%\io.github.wkdsteve.streamtap\EBWebView` | kept; `-RemoveData` removes it |
 | captures (default `captures\` in the settings folder) | wherever you set them | never touched |
 
+The programs live in `bin\` (the layout the hub of the desktop apps looks for); the app finds the sink
+and the host next to itself. An install of the earlier layout (programs directly in the install
+folder) is moved to `bin\` by the next install, which names a browser that still starts the old host.
+`install.ps1` refuses a folder that is not the shape of a release (a foreign file at its top or in
+`bin\`, a missing program, a `VERSION` that is no version) before it writes anything.
+
 Both scripts refuse while `streamtap-app`, `-sink` or `-host` runs from the install
 folder and name the PIDs (`build.ps1` does the same for the checkout); the files are
 first all copied to `.new`, then each old one is renamed to `.old` and its `.new` takes
 its place. A copy or a rename that fails puts back what was swapped, so the install is
-never a mix of an old and a new program; `uninstall.ps1` also removes `.new` and `.old`
+never a mix of an old and a new program; a file the new release no longer has in `extension\`
+is removed after a successful swap; `uninstall.ps1` also removes `.new` and `.old`
 files left behind. There is one *Settings > Apps* entry: an install into another folder
 takes it over and names the install that lost it (its files stay). A second
 `uninstall.ps1` says there is nothing to do; a file it cannot remove is an error, and the
@@ -405,10 +416,18 @@ go (a terminal whose current folder it is) stays with a note, the entry goes any
 `-RemoveData` while a streamtap app of another copy (the checkout's) runs: that app uses
 the same settings folder and keeps its WebView cache open, so close every copy first.
 
+**Extension.** Chrome loads it unpacked only (no store): `chrome://extensions`, *Developer mode*,
+*Load unpacked*, `%LOCALAPPDATA%\streamtap\extension` (`install.ps1` ends by naming that folder).
+The extension id stays the same (the manifest carries the public key), so the host's
+`allowed_origins` fits. After an update press *Reload* on its card.
+
+**ffmpeg** is a prerequisite and not part of the install (`scoop install ffmpeg` or ffmpeg on the
+`PATH`); `install.ps1` says when it finds none, and the app shows "ffmpeg not found".
+
 **Browsers after an install.** The app owns the registration (manifest, key,
 rollback; see "Connect browser"), so the script does not write it. A browser
 registered from the checkout keeps starting `desktop\target\release\streamtap-host.exe`;
-`build-install.ps1` lists such browsers. Open the installed app from the Start menu,
+`install.ps1` lists such browsers. Open the installed app from the Start menu,
 *Connect browser*: it shows them as "registered for another location" (a manifest
 that names another copy's host counts as stale), and *Register again* points them at
 the installed host. (A non-interactive re-register flag in the app was not added: the
@@ -420,15 +439,47 @@ for `HKCU\Software`, below which the uninstall entry is written and the browser 
 read), and for `uninstall.ps1` also `-DataDir`, `-LocalDataDir`; each defaults to
 `STREAMTAP_INSTALL_DIR`, `STREAMTAP_START_MENU_DIR`, `STREAMTAP_REGISTRY_ROOT`,
 `STREAMTAP_DATA_DIR`, `STREAMTAP_LOCAL_DATA_DIR` before the real place.
-`build-install.ps1 -BuildDir <dir>` installs prebuilt exes without building.
+`build-install.ps1 -BuildDir <dir>` installs prebuilt exes without building;
+`install.ps1 -PayloadDir <dir>` installs a staged or unpacked release folder.
 `scripts/test-install.ps1` (CI, job `hygiene`) installs stand-ins (copies of `cmd.exe`)
 into a temp folder with a throw-away registry root `HKCU:\Software\streamtap-test-install-<id>`
 and checks files, shortcut, entry, the browser report, the refusals (Claude session, a
-running sink, a locked file, a drive root, a registry root outside `HKCU`), a copy and a
-rename that fail (all old again), the entry taken over by another folder, uninstalling
-with the entry's command line as Windows runs it (Windows PowerShell 5.1, places with a
-space and a non-ASCII letter, the pause on an error), from inside the install folder, a
-second uninstall, and that `-RemoveData` keeps captures and foreign files.
+running sink, a locked file, a drive root, a registry root outside `HKCU`, a folder that is no
+release), a copy and a rename that fail (all old again), the entry taken over by another
+folder, the move from the earlier layout, uninstalling with the entry's command line as
+Windows runs it (Windows PowerShell 5.1, places with a space and a non-ASCII letter, the
+pause on an error), from inside the install folder, a second uninstall, and that
+`-RemoveData` keeps captures and foreign files.
+
+### Release
+
+A release is a **zip with install scripts, not a setup.exe** (an unsigned setup is stopped by
+SmartScreen like the programs, and the scripts already do the per-user install).
+`scripts/package-release.ps1` packs `streamtap-<version>-x86_64-pc-windows-msvc.zip` from built
+programs (`-BuildDir`, default `desktop\target\release`; it builds nothing unless `-Build`): `bin\` with
+the three programs, `extension\`, `install.ps1`, `uninstall.ps1`, `LICENSE`, `README.md` (how to
+install) and `VERSION`. The zip is reproducible (sorted entries, fixed timestamp), a `SHA256SUMS`
+is written next to it, and the version must be the one of `streamtap-app/Cargo.toml` and
+`tauri.conf.json`. `-Rolling -Sha <commit>` packs the rolling build: the fixed name
+`streamtap-windows-x86_64.zip` and the version label `<version>+<short commit>`.
+
+`.github/workflows/release.yml` (tag `v*`): checks that the tag is the version of `Cargo.toml` and
+`tauri.conf.json`, the commit is on `main`, its CI run is green and the release is not published
+already; builds; packs; runs `scripts/test-release.ps1` on the zip; and makes a **draft** release
+with the zip and `SHA256SUMS` through the publish action of appkit's release-kit. It never publishes;
+a person opens the draft, installs from it and publishes it. `.github/workflows/rolling.yml`:
+after a green `ci` on `main` the pre-release `latest` gets the zip of that commit (the tip of
+`main` only) and `SHA256SUMS`, replaced each time. Both run on the self-hosted Windows runner
+(the repository is private). The kit's own stamped `install.ps1` is not used (it needs a program
+with an `install` command or a setup); `install.ps1` is in the zip. streamtap has no appkit crate,
+so `tools/check-workflows.py` (CI, job `hygiene`; `--online` asks GitHub whether each action's tag
+still names the pinned commit) takes the place of `check-appkit-pin.py`: every action is pinned by
+a full commit with its tag in a comment (NREL-03), all of the kit's actions by the same one, every
+job on `[self-hosted, windows]`, no pull request trigger, and a release stays a draft (NREL-07).
+`scripts/test-release.ps1` (CI, job `hygiene`) packs stand-in programs and checks the zip's contents
+(no tests, no keys, no README of the extension), checksums, reproducibility, the refusals (wrong
+version, rolling without a commit, a key file or a file of an unexpected type in the extension, a
+manifest naming a missing file), then installs the unpacked zip into temp places and uninstalls.
 
 What it does:
 

@@ -87,12 +87,22 @@ jobs:
           persist-credentials: false
       - run: python -m unittest discover tools
       - run: python tools/check-control-chars.py
-      # scripts/build-install.ps1 and uninstall.ps1 against stand-in programs: install folder, Start menu folder and
+      # The rules of the workflows (release.yml, rolling.yml, this one): actions pinned by commit, appkit's release-kit
+      # on one commit, self-hosted runner only, no pull request trigger, a release stays a draft; --online asks each
+      # action's repository whether its tag still names the pinned commit.
+      - run: python tools/check-workflows.py --online
+      # scripts/install.ps1, build-install.ps1 and uninstall.ps1 against stand-in programs: install folder, Start menu folder and
       # data folders in a temp folder of the test, the registry root a throw-away HKCU key it removes; the runner's
       # own Start menu, uninstall entries and browser keys are left alone, nothing is built.
       - name: Install and uninstall scripts
         shell: pwsh
         run: pwsh -NoProfile -File scripts/test-install.ps1
+      # scripts/package-release.ps1 against stand-in programs (nothing is built): the zip's contents, checksums,
+      # reproducibility, the refusals, then the unpacked zip's install.ps1 into temp places and the uninstall. The
+      # release and rolling workflows run it again on the zip they are about to publish.
+      - name: Release packaging
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test-release.ps1
       - name: PSScriptAnalyzer on the scripts
         shell: pwsh
         run: |
