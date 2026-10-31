@@ -954,6 +954,10 @@ impl Session {
                 hi.tfdt = None;
                 hi.dur = None;
                 self.write_segment(&hi, init)?;
+                // The init ends where the media starts: decide it now, so an
+                // untimed media part (a moof without tfdt) is not taken for
+                // its continuation.
+                self.flush_init(h.sb)?;
                 let mut hm = h.clone();
                 hm.is_init = false;
                 hm.init_cont = false;
@@ -2526,6 +2530,31 @@ mod tests {
         write(&mut s, &seg(1, false, Some(1000), None), &moof(1000));
         assert_eq!(index_lines(&s.dir), 4, "nothing refused");
         assert!(!s.tracks[&1].refused);
+    }
+
+    #[test]
+    fn untimed_media_of_a_combined_append_is_not_init_bytes() {
+        // Init and a segment in one append, the moof without a tfdt: the
+        // media part is not a continuation of the init, so its mdat bytes
+        // are not scanned for init markers and not hashed into the init.
+        let mut s = session("vhsnotfdt");
+        let mut append = init_with_traks(1);
+        append.extend(mp4_box(*b"moof", &mp4_box(*b"traf", b"")));
+        append.extend(mp4_box(*b"mdat", b"xxxxencvxxxx"));
+        write(&mut s, &seg(1, true, None, None), &append);
+        write(&mut s, &seg(1, false, Some(1000), None), &moof(1000));
+        assert!(!s.tracks[&1].refused, "no false DRM from mdat bytes");
+        let rows: Vec<serde_json::Value> = fs::read_to_string(s.dir.join("index.jsonl"))
+            .expect("index")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        let inits: Vec<bool> = rows.iter().map(|r| r["is_init"] == true).collect();
+        assert_eq!(
+            inits,
+            [true, false, false],
+            "init row, media row, media row"
+        );
     }
 
     #[test]

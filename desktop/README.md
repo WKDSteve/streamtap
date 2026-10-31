@@ -67,7 +67,8 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
 ### Dedupe and parts
 
 - An init appended together with media (video.js VHS) is stored as two rows:
-  the init part and the media part.
+  the init part and the media part. The init is decided right there, so the
+  media part never counts as its continuation (also without a `tfdt`).
 - An init is decided once it is complete: its chunks (an init split across
   appends: the untimed chunks right after it, or chunks the extension flags
   `initCont`) are held, up to 4 MiB, until the next media, then compared as a
