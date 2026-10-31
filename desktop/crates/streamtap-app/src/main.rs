@@ -215,23 +215,27 @@ struct BrowserSnapshot {
 
 fn browser_snapshot(g: &Inner) -> BrowserSnapshot {
     let reg = registration::WinRegistry::real();
+    let host = sink::find_host();
+    let ours = host.as_deref();
     let registrations = Browser::ALL
         .into_iter()
-        .map(|b| match registration::state(&reg, &g.config_dir, b) {
-            Ok(state) => Registration {
-                browser: b.id(),
-                state: Some(state),
-                error: None,
+        .map(
+            |b| match registration::state(&reg, &g.config_dir, b, ours) {
+                Ok(state) => Registration {
+                    browser: b.id(),
+                    state: Some(state),
+                    error: None,
+                },
+                Err(e) => Registration {
+                    browser: b.id(),
+                    state: None,
+                    error: Some(e),
+                },
             },
-            Err(e) => Registration {
-                browser: b.id(),
-                state: None,
-                error: Some(e),
-            },
-        })
+        )
         .collect();
     BrowserSnapshot {
-        host_path: sink::find_host().map(|p| p.display().to_string()),
+        host_path: host.map(|p| p.display().to_string()),
         bridge_error: g.bridge_error.clone(),
         registrations,
         link: g.hub.view(),

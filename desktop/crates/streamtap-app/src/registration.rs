@@ -64,7 +64,8 @@ pub(crate) enum State {
     NotRegistered,
     Registered,
     /// A key exists but does not lead to this app's current manifest (an
-    /// older install, or the manifest file is gone): register again.
+    /// older install, the manifest file is gone, or it names the host of
+    /// another copy of the app): register again.
     Stale,
 }
 
@@ -116,11 +117,39 @@ fn write_atomic(path: &Path, text: &[u8]) -> Result<(), String> {
     })
 }
 
-pub(crate) fn state(reg: &impl Registry, dir: &Path, browser: Browser) -> Result<State, String> {
+/// Whether the manifest at `manifest` names `host_exe` as its program (letter
+/// case aside, as Windows paths). An unreadable manifest names nothing.
+fn manifest_names(manifest: &Path, host_exe: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(manifest) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    value["path"]
+        .as_str()
+        .is_some_and(|p| p.eq_ignore_ascii_case(&plain(host_exe).to_string_lossy()))
+}
+
+/// `host_exe` is the host next to this app, when there is one: a manifest that
+/// names another host (the checkout's, after the app was installed elsewhere)
+/// is `Stale`, so *Register again* points the browser at this app's host.
+pub(crate) fn state(
+    reg: &impl Registry,
+    dir: &Path,
+    browser: Browser,
+    host_exe: Option<&Path>,
+) -> Result<State, String> {
     let manifest = manifest_path(dir, browser);
     match reg.get_default(&browser.key_path())? {
         None => Ok(State::NotRegistered),
-        Some(v) if Path::new(&v) == manifest && manifest.is_file() => Ok(State::Registered),
+        Some(v)
+            if Path::new(&v) == manifest
+                && manifest.is_file()
+                && host_exe.is_none_or(|h| manifest_names(&manifest, h)) =>
+        {
+            Ok(State::Registered)
+        }
         Some(_) => Ok(State::Stale),
     }
 }
@@ -346,7 +375,7 @@ mod tests {
         let host = fake_host(&d);
         let mut reg = FakeRegistry::default();
         assert_eq!(
-            state(&reg, &d, Browser::Chrome).unwrap(),
+            state(&reg, &d, Browser::Chrome, Some(&host)).unwrap(),
             State::NotRegistered
         );
         register(&mut reg, &d, Browser::Chrome, &host).unwrap();
@@ -358,10 +387,13 @@ mod tests {
                 .map(String::as_str),
             manifest.to_str()
         );
-        assert_eq!(state(&reg, &d, Browser::Chrome).unwrap(), State::Registered);
+        assert_eq!(
+            state(&reg, &d, Browser::Chrome, Some(&host)).unwrap(),
+            State::Registered
+        );
         // Only the chosen browser.
         assert_eq!(
-            state(&reg, &d, Browser::Edge).unwrap(),
+            state(&reg, &d, Browser::Edge, Some(&host)).unwrap(),
             State::NotRegistered
         );
         assert_eq!(reg.keys.len(), 1);
@@ -382,7 +414,10 @@ mod tests {
             register(&mut reg, &d, b, &host).unwrap();
         }
         unregister(&mut reg, &d, Browser::Chrome).unwrap();
-        assert_eq!(state(&reg, &d, Browser::Brave).unwrap(), State::Registered);
+        assert_eq!(
+            state(&reg, &d, Browser::Brave, Some(&host)).unwrap(),
+            State::Registered
+        );
         assert!(manifest_path(&d, Browser::Brave).is_file());
         fs::remove_dir_all(&d).unwrap();
     }
@@ -405,10 +440,63 @@ mod tests {
         let mut reg = FakeRegistry::default();
         reg.keys
             .insert(Browser::Chrome.key_path(), r"C:\old\manifest.json".into());
-        assert_eq!(state(&reg, &d, Browser::Chrome).unwrap(), State::Stale);
+        assert_eq!(
+            state(&reg, &d, Browser::Chrome, Some(&host)).unwrap(),
+            State::Stale
+        );
         register(&mut reg, &d, Browser::Chrome, &host).unwrap();
         fs::remove_file(manifest_path(&d, Browser::Chrome)).unwrap();
-        assert_eq!(state(&reg, &d, Browser::Chrome).unwrap(), State::Stale);
+        assert_eq!(
+            state(&reg, &d, Browser::Chrome, Some(&host)).unwrap(),
+            State::Stale
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// After an install the key and the manifest are this app's, but the
+    /// manifest still names the checkout's host: that is not "registered".
+    #[test]
+    fn a_manifest_that_names_another_host_is_stale() {
+        let d = dir("otherhost");
+        let checkout = d.join("checkout");
+        let installed = d.join("installed");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&installed).unwrap();
+        let old_host = fake_host(&checkout);
+        let new_host = fake_host(&installed);
+        let mut reg = FakeRegistry::default();
+        register(&mut reg, &d, Browser::Edge, &old_host).unwrap();
+        assert_eq!(
+            state(&reg, &d, Browser::Edge, Some(&old_host)).unwrap(),
+            State::Registered
+        );
+        assert_eq!(
+            state(&reg, &d, Browser::Edge, Some(&new_host)).unwrap(),
+            State::Stale
+        );
+        // Without a host next to the app only the key and the file count.
+        assert_eq!(
+            state(&reg, &d, Browser::Edge, None).unwrap(),
+            State::Registered
+        );
+        // Letter case of a Windows path does not make it another host.
+        let upper = PathBuf::from(old_host.to_string_lossy().to_uppercase());
+        assert_eq!(
+            state(&reg, &d, Browser::Edge, Some(&upper)).unwrap(),
+            State::Registered
+        );
+        // A manifest that cannot be read names no host.
+        fs::write(manifest_path(&d, Browser::Edge), b"{ not json").unwrap();
+        assert_eq!(
+            state(&reg, &d, Browser::Edge, Some(&old_host)).unwrap(),
+            State::Stale
+        );
+        // Register again points it at the new host.
+        register(&mut reg, &d, Browser::Edge, &new_host).unwrap();
+        assert_eq!(
+            state(&reg, &d, Browser::Edge, Some(&new_host)).unwrap(),
+            State::Registered
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -466,7 +554,10 @@ mod tests {
             before,
             "the old manifest is back"
         );
-        assert_eq!(state(&ro, &d, Browser::Edge).unwrap(), State::Registered);
+        assert_eq!(
+            state(&ro, &d, Browser::Edge, Some(&host)).unwrap(),
+            State::Registered
+        );
         assert!(
             !manifest.with_extension("json.tmp").exists(),
             "no temporary file is left"
@@ -513,14 +604,17 @@ mod tests {
         let host = fake_host(&d);
         let mut reg = WinRegistry::under(&root);
         register(&mut reg, &d, Browser::Brave, &host).unwrap();
-        assert_eq!(state(&reg, &d, Browser::Brave).unwrap(), State::Registered);
         assert_eq!(
-            state(&reg, &d, Browser::Chrome).unwrap(),
+            state(&reg, &d, Browser::Brave, Some(&host)).unwrap(),
+            State::Registered
+        );
+        assert_eq!(
+            state(&reg, &d, Browser::Chrome, Some(&host)).unwrap(),
             State::NotRegistered
         );
         unregister(&mut reg, &d, Browser::Brave).unwrap();
         assert_eq!(
-            state(&reg, &d, Browser::Brave).unwrap(),
+            state(&reg, &d, Browser::Brave, Some(&host)).unwrap(),
             State::NotRegistered
         );
         // The throw-away root itself goes too.
