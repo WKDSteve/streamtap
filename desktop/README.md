@@ -331,3 +331,81 @@ read and handshake timeouts, the token on the command line (visible to other
 processes; pairing replaces it), the core/sink/testkit split, the Tauri
 shell and UI. The security tests, CI and the split come first, before new
 features.
+
+# desktop: streamtap-app
+
+A Tauri 2 desktop app (`crates/streamtap-app`) around the sink. The sink stays
+a separate process: the app starts and stops it, reads its capture directory
+and runs `streamtap-sink mux` on request. The UI is plain static HTML, CSS and
+JS in `crates/streamtap-app/ui/` (no npm, no bundler, no network).
+
+```
+cargo run -p streamtap-app            # development (needs the sink built: cargo build --workspace)
+..\scripts\build.ps1                  # release build of both exes
+target\release\streamtap-app.exe
+```
+
+The app finds the sink next to its own exe, else in `target/release` or
+`target/debug` of the cargo target dir. Running it needs WebView2 (part of
+Windows 11); building it needs nothing extra.
+
+What it does:
+
+- **Header:** sink state (stopped, running, crashed with its exit code), a
+  Start/Stop button, and a Settings panel with port, captures folder, the
+  token (masked, Show, Copy, New token), whether ffmpeg is on `PATH` and which
+  sink exe is used. Paste port and token into the extension popup. Settings
+  are locked while the sink runs. They live in `config.json` in the app config
+  dir (`%APPDATA%\io.github.wkdsteve.streamtap`); the token is generated on
+  first run. A config that does not parse is not overwritten: defaults run and
+  the UI says so.
+- **Captures:** every directory in the captures folder, newest first, refreshed
+  every 2 s: title, page host, start time, duration, size, segments,
+  SourceBuffers (kind, MIME, size), and badges: `live` (the sink runs and wrote
+  into it within 10 s; the sink keeps no connection flag on disk, so a paused
+  video shows `done` after a pause), `DRM refused` (see below), `muxed` (an
+  `out.mp4` exists). `index.jsonl` is read incrementally (only the lines
+  appended since the last poll).
+- **Per capture:** Mux (runs `streamtap-sink mux <dir>`, shows running, ok or
+  failed with the exit code's meaning (0..6, as in the Mux section) and the last
+  4 KiB of stderr), Open result, Open folder, Delete (asks first).
+- **Empty and error states** say what to do: sink stopped, waiting for the
+  extension (copy the token, set it in the popup), sink missing, ffmpeg
+  missing, sink crashed (often the port is taken), captures folder unreadable.
+- **DRM badge:** the sink only logs refusals to stderr. The app reads that log
+  and writes `app-drm.flag` into the capture, so the badge survives a restart.
+  A refusal logged before the app started the sink is not seen.
+
+Security:
+
+- The webview may call the app's own ten commands and nothing else
+  (`build.rs` + `capabilities/main.json`; no fs, shell or opener plugin). CSP is
+  `default-src 'none'` with scripts, styles and images from the app only and
+  IPC as the one connection; the UI sets every disk or page string with
+  `textContent`.
+- Commands take a capture **id** (the directory name), never a path. An id is
+  plain `[A-Za-z0-9_.-]` (no leading or trailing dot); it is joined to the
+  captures folder, must be a real directory (no symlink or junction) and its
+  canonical form must lie directly inside the canonical captures folder.
+  Delete additionally refuses a live capture or one that is being muxed.
+- Children are started without a shell and, on Windows, without a console
+  window (`CREATE_NO_WINDOW`). Open result / Open folder start `explorer.exe`
+  with the path as one argument. The sink binds 127.0.0.1 only (its own rule).
+- The token is random per install (std `RandomState`, seeded by the OS, mixed
+  with time and pid), is never logged (sink output is scrubbed of it) and is
+  passed to the sink on its command line, like for a hand-started sink: other
+  local processes of the same user can read it there. That limit stays until
+  the sink takes it another way (pairing).
+
+Limits: closing the app stops the sink, but if the app is killed the sink
+keeps running (no job object yet; stop it in the task manager). A mux in
+progress is not stopped on exit (it ends by its own timeout). The sink's
+`session.json` has no end marker, hence the 10 s heuristic for `live`.
+
+Checks in CI and locally: the unit tests cover the capture scanner (incremental
+index reading, partial lines, replaced files, state flags), id and path
+validation (traversal, separators, drive syntax, junction), settings and token,
+DRM line parsing, exit-code mapping and the log scrubbing. `cargo deny` checks
+the Windows target graph only (`targets` in `deny.toml`); the two Linux-only
+advisories of Tauri's GTK backend are ignored for `cargo audit` in
+`.cargo/audit.toml` with their reasons.

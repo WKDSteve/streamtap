@@ -18,14 +18,17 @@ Chrome on the ARD Mediathek (hls.js). Content protected by EME/DRM
   receives segments over a loopback WebSocket, writes them per SourceBuffer
   and remuxes with `ffmpeg -c copy`, reordering after seeks. See
   [desktop/README.md](desktop/README.md).
+- MVP, first step (done): desktop/crates/streamtap-app, a Tauri 2 app that starts and stops the sink,
+  lists the captures live and muxes, opens or deletes them. See the app section of
+  [desktop/README.md](desktop/README.md).
 
 Layout:
 
 ```
 streamtap/
   extension/   MV3 extension (hook, content script, service worker, popup)
-  desktop/     Rust workspace: streamtap-sink (WebSocket receiver, segment store, mux);
-               later the Tauri 2 app
+  desktop/     Rust workspace: streamtap-sink (WebSocket receiver, segment store, mux),
+               streamtap-app (Tauri 2 shell + static UI in crates/streamtap-app/ui)
   tools/       repository checks (control-character guard)
   LICENSE
   README.md
@@ -44,7 +47,7 @@ cargo test --workspace --locked
 cargo audit --deny warnings     # cargo install cargo-audit
 cargo deny check                # cargo install cargo-deny; policy in desktop/deny.toml
 cd ..
-git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' | xargs -0 -n1 node --check
+git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' 'desktop/crates/streamtap-app/ui/*.js' | xargs -0 -n1 node --check
 node extension/scripts/test-hook.mjs
 node extension/scripts/test-content.mjs
 python -m unittest discover tools
@@ -59,7 +62,8 @@ installs it on first use).
 1. Spike 1: hook sees segments, timeline parses (done, see extension README).
 2. Spike 2: segments streamed binary to a local Rust server, written per
    SourceBuffer, `ffmpeg -c copy` yields a playable MP4 (done).
-3. MVP: desktop app with a tab/video list, background capture mode, DRM flag.
+3. MVP: desktop app with a capture list, DRM flag, mux and open (started: sink control,
+   live list, mux/open/delete; still to do: tab list, background capture mode, installer).
 4. Later: download modes (yt-dlp, manifest replay), tab capture, live ring
    buffer, Firefox.
 
