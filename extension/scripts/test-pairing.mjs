@@ -58,6 +58,7 @@ const makeWorld = (opts = {}) => {
     favicon: "favicon" in opts ? opts.favicon : png,
     faviconCalls: 0,
     failConnect: () => (nextConnectThrows = true),
+    setLastError: (m) => (chrome.runtime.lastError = m === null ? null : { message: m }),
   };
   const chrome = {
     runtime: {
@@ -443,6 +444,19 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   w.port().emit({ v: 1, t: "error", code: "app-not-running".repeat(10) });
   await flush();
   check(w.run("npStatus()").error.length <= 32, "an error code is bounded");
+}
+
+// --- the browser's reason for a failed connect reaches the popup, bounded --------------------
+{
+  const w = makeWorld();
+  w.start();
+  await flush();
+  w.setLastError("Specified native messaging host not found.\u0000\n" + "x".repeat(500));
+  w.port().drop();
+  const s = w.run("npStatus()");
+  check(s.error === "host-unavailable", "a failed connect is reported as host-unavailable");
+  check(s.detail.startsWith("Specified native messaging host not found.") && s.detail.length <= 120 && !/[\u0000-\u001f]/.test(s.detail), "the browser's reason is shown, bounded and without control characters");
+  check(!JSON.stringify(s).includes(SECRET), "the reason never carries the token");
 }
 
 // --- content.js: the tapping gate ----------------------------------------------------------

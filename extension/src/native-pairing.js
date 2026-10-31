@@ -382,6 +382,9 @@ const npConnect = () => {
     np.status.connected = false;
     np.status.pairing = null;
     if (!np.status.error && reason) np.status.error = "host-unavailable";
+    // The browser's own text ("Specified native messaging host not found.",
+    // "Native host has exited." ...), shown in the popup to tell the causes apart.
+    if (reason) np.status.detail = String(reason).replace(/[^\x20-\x7e]/g, "").slice(0, 120);
     if (np.sendTimer) {
       clearTimeout(np.sendTimer);
       np.sendTimer = null;
@@ -400,6 +403,7 @@ const npStatus = () => ({
   connected: np.status.connected,
   pairing: np.status.pairing,
   error: np.status.error,
+  detail: np.status.detail || null,
   paused: Date.now() < np.pausedUntil,
   tapped: np.selected.size,
 });

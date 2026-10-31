@@ -75,7 +75,7 @@ const load = async () => {
     if (!s) return (pairLine.textContent = "app pairing: unavailable");
     const how = !s.connected
       ? s.error === "host-unavailable"
-        ? "the connector is not registered, or the app is not running (Connect browser in the app)"
+        ? `the connector is not registered, or the app is not running (Connect browser in the app)${s.detail ? ` - browser says: ${s.detail}` : ""}`
         : "not connected"
       : s.pairing === "approved"
         ? `paired${s.tapped ? `, ${s.tapped} tab(s) captured` : ""}`
