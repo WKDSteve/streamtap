@@ -20,6 +20,11 @@ use crate::jobs::KillOnClose;
 const SINK_EXE: &str = "streamtap-sink.exe";
 #[cfg(not(windows))]
 const SINK_EXE: &str = "streamtap-sink";
+/// Name of the native messaging host executable next to this one.
+#[cfg(windows)]
+const HOST_EXE: &str = "streamtap-host.exe";
+#[cfg(not(windows))]
+const HOST_EXE: &str = "streamtap-host";
 #[cfg(windows)]
 const FFMPEG_EXE: &str = "ffmpeg.exe";
 #[cfg(not(windows))]
@@ -57,16 +62,20 @@ pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
 /// target dir and in the source tree (development); a release build never
 /// runs a program from a sibling directory that is not its own.
 fn sink_candidates(exe_dir: &Path, dev: bool) -> Vec<PathBuf> {
-    let mut candidates = vec![exe_dir.join(SINK_EXE)];
+    candidates(SINK_EXE, exe_dir, dev)
+}
+
+fn candidates(name: &str, exe_dir: &Path, dev: bool) -> Vec<PathBuf> {
+    let mut candidates = vec![exe_dir.join(name)];
     if dev {
         if let Some(target) = exe_dir.parent() {
-            candidates.push(target.join("release").join(SINK_EXE));
-            candidates.push(target.join("debug").join(SINK_EXE));
+            candidates.push(target.join("release").join(name));
+            candidates.push(target.join("debug").join(name));
         }
         candidates.push(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/release")
-                .join(SINK_EXE),
+                .join(name),
         );
     }
     candidates
@@ -76,6 +85,14 @@ fn sink_candidates(exe_dir: &Path, dev: bool) -> Vec<PathBuf> {
 pub(crate) fn find_sink() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
     sink_candidates(exe.parent()?, cfg!(debug_assertions))
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// Where the native messaging host executable is (same places as the sink).
+pub(crate) fn find_host() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    candidates(HOST_EXE, exe.parent()?, cfg!(debug_assertions))
         .into_iter()
         .find(|p| p.is_file())
 }

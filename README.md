@@ -21,6 +21,11 @@ Chrome on the ARD Mediathek (hls.js). Content protected by EME/DRM
 - MVP, first step (done): desktop/crates/streamtap-app, a Tauri 2 app that starts and stops the sink,
   lists the captures live and muxes, opens or deletes them. See the app section of
   [desktop/README.md](desktop/README.md).
+- Browser pairing (code done, hand run in Chrome pending): the app registers a native
+  messaging host for Chrome, Edge or Brave (per user, no admin), the extension pairs with
+  the app after you approve it there and receives port and token by itself, and the app
+  lists the tabs that hold a video so you pick the one to capture. See "Connect browser"
+  in [desktop/README.md](desktop/README.md) and [extension/README.md](extension/README.md).
 
 Layout:
 
@@ -28,7 +33,8 @@ Layout:
 streamtap/
   extension/   MV3 extension (hook, content script, service worker, popup)
   desktop/     Rust workspace: streamtap-sink (WebSocket receiver, segment store, mux),
-               streamtap-app (Tauri 2 shell + static UI in crates/streamtap-app/ui)
+               streamtap-app (Tauri 2 shell + static UI in crates/streamtap-app/ui),
+               streamtap-host (native messaging host: browser <-> app relay)
   tools/       repository checks (control-character guard)
   LICENSE
   README.md
@@ -50,6 +56,8 @@ cd ..
 git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' 'desktop/crates/streamtap-app/ui/*.js' | xargs -0 -n1 node --check
 node extension/scripts/test-hook.mjs
 node extension/scripts/test-content.mjs
+node extension/scripts/test-pairing.mjs
+node desktop/scripts/test-sink-link.mjs
 python -m unittest discover tools
 python tools/check-control-chars.py
 ```
@@ -63,7 +71,8 @@ installs it on first use).
 2. Spike 2: segments streamed binary to a local Rust server, written per
    SourceBuffer, `ffmpeg -c copy` yields a playable MP4 (done).
 3. MVP: desktop app with a capture list, DRM flag, mux and open (started: sink control,
-   live list, mux/open/delete; still to do: tab list, background capture mode, installer).
+   live list, mux/open/delete, browser pairing with a tab list; still to do: background
+   capture mode, installer).
 4. Later: download modes (yt-dlp, manifest replay), tab capture, live ring
    buffer, Firefox.
 

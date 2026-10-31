@@ -18,12 +18,26 @@
   </div>
   <div class="bar-actions">
     <button id="sink-toggle" type="button" class="primary" disabled>Start</button>
+    <button id="browser-toggle" type="button" aria-expanded="false" aria-controls="browser">Connect browser</button>
     <button id="settings-toggle" type="button" aria-expanded="false" aria-controls="settings">Settings</button>
   </div>
 </header>
 
 <main>
   <div id="notices" class="notices"></div>
+  <div id="pairing" class="notices" aria-live="assertive"></div>
+
+  <section id="browser" class="panel" aria-labelledby="browser-h" hidden>
+    <h2 id="browser-h">Connect browser</h2>
+    <p class="hint">Register the connector for a browser once. After that the streamtap extension pairs itself with this app (you approve it here) and receives port and token without copy and paste. Chrome, Edge and Brave; reload the extension on <code>chrome://extensions</code> after updating it. The extension popup stays available as a manual fallback.</p>
+    <ul id="browser-reg" class="plain"></ul>
+    <p id="browser-note" class="hint" hidden></p>
+    <h3>Paired browsers</h3>
+    <ul id="approvals" class="plain"></ul>
+    <h3>Tabs with video</h3>
+    <p id="tabs-hint" class="hint"></p>
+    <div id="tabs"></div>
+  </section>
 
   <section id="settings" class="panel" aria-labelledby="settings-h" hidden>
     <h2 id="settings-h">Settings</h2>
@@ -45,7 +59,7 @@
           <button id="token-copy" type="button">Copy</button>
           <button id="token-new" type="button">New token</button>
         </div>
-        <p class="hint">Paste port and token into the streamtap extension popup, then reload the video page.</p>
+        <p class="hint">A browser paired through Connect browser gets port and token by itself. Otherwise paste them into the streamtap extension popup, then reload the video page.</p>
       </div>
       <div class="row">
         <button id="settings-save" type="submit" class="primary">Save</button>

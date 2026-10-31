@@ -25,7 +25,8 @@ The concept and the DRM primer live in the nvim-config vault under
 | `src/content.js` | isolated world | Forwards bounded, type-checked copies of the records to the service worker (pages can forge records) and tells the hook whether to tap. Opens one runtime port `vc-sink` per MediaSource (one sink session per video, ended by `msclose`; at most 8 at a time) and posts every segment as a `data:` URL (extension messaging is JSON, it cannot carry an `ArrayBuffer`) in append order. Until it has read whether a sink token is set, appends are held (at most 64 MiB) instead of dropped; a full queue drops media, not small init bytes, and of an init+media append it still sends the init part. Init bytes dropped anyway (full queue, a post that fails, held beyond 64 MiB) are noted at their place in the stream: the kept init is dropped, the service worker gets `lost` with `drop` (it says `initlost`), and that SourceBuffer's media is not sent until its next init. Replays the init in effect (only the init part of an init+media append, with its continuation chunks) on a new port (restarted service worker); an init too large to keep (over 1 MiB, also when its continuation chunks take it there) drops the kept one instead of leaving a stale one, and so does one beyond the 16 kept per MediaSource; for such a SourceBuffer the new port is told first (`lost`), and the service worker says `initlost` and takes nothing of it until its next init. |
 | `src/background.js` | service worker | Per-tab registry (in memory, bounded in entries and string sizes, frame URLs from the browser), badge with the number of SourceBuffers that received media (the rest of a split init counts with its init, not as media). SourceBuffer ids count per frame, so a `changetype` renames only the sending frame's SourceBuffer. Red badge when DRM was seen. Loads `sink-link.js`. |
 | `src/sink-link.js` | service worker | One WebSocket to `ws://127.0.0.1:<port>/` per port: `hello` with the token and the frame URL from the browser (not from the page), then one binary message per segment, header fields whitelisted. Every socket, the first one included, first sends the init segments in effect at that point of the stream (the init part only, with continuation chunks), because the sink starts a new capture directory. Queues at most 64 MiB per link and 128 MiB in all while connecting; at most 128 MiB of received payloads wait for decoding in the whole worker; on an open socket media is dropped beyond 64 MiB unsent; small init bytes may go to twice the decoding, the open-socket and the connecting-queue limits, and of an init+media append dropped on an open socket or while connecting the init part (at most 1 MiB) still goes out or is queued and is kept, so that rendition's next media is not lost. When init bytes are dropped anyway (here, also when too much waits for decoding, or in the content script, which says `lost` with `drop`), that SourceBuffer takes nothing until its next init (its media would be filed under the previous one), its kept init is not replayed, and the sink gets an `initlost` event (mux names the SourceBuffer): on an open socket at once, past the limit; while connecting behind what is already queued of that SourceBuffer, which still goes out under its own init; with nothing of it in flight (no socket yet, retry window) on the next socket. Only init bytes this worker decoded and then dropped with nothing of that SourceBuffer in flight are the init in effect: they are kept for the next socket instead. Kept init bytes are bounded worker-wide (64 MiB, parked links included); when full, the largest init of the frame that keeps the most bytes within the tab that keeps the most is dropped first, the keeping tab and frame counted with the init they are about to keep (never that init itself), so one page forging inits loses its own and cannot keep another tab's current init out, nor an ad frame the player frame's; a link whose init was dropped or not kept that way, or was too large to keep (over 1 MiB), tells the sink `initlost` on its next socket, drops what it had queued for that SourceBuffer up to the next queued init, and takes everything from that init on. A link whose port has gone keeps no new init; what it posted is still handled like before once decoded, and a socket that was still connecting or that such a late item starts (after the retry window) first replays the inits kept so far, then sends its queue and closes; those inits are dropped once no socket of the link is being set up. A link takes segments and `lost` messages of at most 32 SourceBuffer ids (as many as the registry keeps per MediaSource); those of further ids are dropped and counted, so forged ids cannot make it keep or announce (`initlost`) more. Backoff resets only after a socket stayed open 5 s (a wrong token is not hammered). At most 16 tapping links per worker: a port beyond that is parked without a socket (it keeps its init bytes, drops media) and admitted on a later segment once a slot frees up. Answers the popup's link status. |
-| `popup/` | action popup | Shows the registry for the current tab. |
+| `src/native-pairing.js` | service worker | Pairing with the desktop app over native messaging (`connectNative` to `io.github.wkdsteve.streamtap`, started by the app's *Connect browser*): says hello with a random per-profile instance id, stores the port and token the app sends **after you approved there** exactly like the popup does (plus `sinkPaired: true`, `tapMode: "selected"`), reports the tabs that hold a MediaSource (title cleaned and cut, host only, favicon as a small PNG data URL from the browser's `_favicon` service, DRM flag, whether tapped, whether visible) and switches capture per tab when the app asks (the tab is reloaded once when switched on, so the capture sees the init segment). Every message from the host is checked field by field; credentials are accepted only in the approved state; a denial or revocation pauses asking for ten minutes (the popup's *pair now* overrides), a revocation removes credentials the pairing gave (a token typed into the popup stays). Reconnects back off from 5 s to 5 min. The token is never logged and never in the status the popup reads. |
+| `popup/` | action popup | Shows the registry for the current tab, the pairing state with *pair now*, and the manual port/token fields (fallback; saving them taps every tab as before). |
 
 ## Load it (Chrome / Edge / Brave)
 
@@ -40,11 +41,30 @@ The concept and the DRM primer live in the nvim-config vault under
 
 5. Click the extension icon for the per-tab summary (SourceBuffers, init /
    media segment counts, bytes, covered time range).
-6. To capture: start `streamtap-sink serve --token <secret>` (see
-   `../desktop/README.md`), enter port and token in the popup, **save**, reload
-   the video page. The popup's sink line shows connected / sent / dropped.
+6. To capture, either pair with the desktop app (below) or: start
+   `streamtap-sink serve --token <secret>` (see `../desktop/README.md`), enter
+   port and token in the popup, **save**, reload the video page. The popup's sink line shows connected / sent / dropped.
    After the video ended (or you close the tab) run
    `streamtap-sink mux captures/<dir>` and open the MP4 in mpv.
+
+## Pair with the desktop app (no copy and paste)
+
+1. Build and start the app (`..\scripts\build.ps1`), press **Connect browser**, **Register**
+   for your browser (Chrome, Edge or Brave; per user, no admin) and **Start** the sink.
+2. **Reload the extension** on `chrome://extensions` (0.3 adds the `nativeMessaging` and
+   `favicon` permissions; Chrome asks again or disables the extension until you accept).
+3. The app shows *"<browser> (profile …) wants to pair"*: **Approve**. The extension stores
+   port and token itself; the popup shows `app pairing: paired`.
+4. The app lists the tabs that hold a video; **Capture** one. That tab is reloaded once and
+   from then on tapped; the other tabs are not (mode `selected`). **Stop** ends it.
+
+Notes: a browser paired this way taps only the tabs you chose; entering port and token in the
+popup (**save**) returns to the old behaviour (every tab). Tabs are listed from what the
+content scripts report (`sender.tab`), so the extension needs no `tabs` permission and no
+access to all sites for this; for the same reason there are **no page previews** (a screenshot
+needs `activeTab` on a click or host access to all sites), only the favicon (permission
+`favicon`) and the title. An open native port keeps the service worker alive while the app
+runs. Firefox is not supported.
 
 After editing a file, hit the reload icon on `chrome://extensions` and reload
 the page.
@@ -85,6 +105,8 @@ service worker, so the sink link does not run there; it also ignores `key`
 - Test what the content script sends a new port (restarted service worker)
   and after a dropped init, and the registry's counts:
   `node scripts/test-content.mjs`.
+- Test the pairing module (fake native port, storage and timers) and the
+  per-tab tapping gate of the content script: `node scripts/test-pairing.mjs`.
 - Test the sink link's lost-init and drain paths with a fake WebSocket (no
   sink needed): `node ../desktop/scripts/test-sink-link.mjs` without
   arguments.

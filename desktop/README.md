@@ -382,7 +382,7 @@ What it does:
 
 Security:
 
-- The webview may call the app's own ten commands and nothing else
+- The webview may call the app's own fifteen commands and nothing else
   (`build.rs` + `capabilities/main.json`; no fs, shell or opener plugin). CSP is
   `default-src 'none'` with scripts, styles and images from the app only and
   IPC as the one connection; the UI sets every disk or page string with
@@ -428,6 +428,88 @@ Security:
   app cannot clean it up; the next mux overwrites it). If the job cannot be set
   up, the sink log says so. Other platforms have no such guard (Windows-only
   for now).
+
+## Connect browser (native messaging)
+
+Instead of copying port and token into the extension popup, the app pairs with
+the extension. Three parts:
+
+- **`streamtap-host`** (`crates/streamtap-host`, its own small crate) is the
+  native messaging host the browser starts. It is a separate console program,
+  not the app with a flag, on purpose: the browser starts it on every
+  `connectNative`, so it must start in milliseconds and without a webview; a
+  Windows GUI-subsystem exe (the app) has no reliable stdio for the pipes; and
+  it has no dependency but `serde`. It speaks the browser's framing on stdin and
+  stdout (4 byte little-endian length + JSON) and a line protocol over a
+  loopback socket to the app. The host knows **no secret**: it checks the origin
+  the browser passes (only `chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia/`,
+  else it answers `origin-not-allowed` and exits), forwards the extension's
+  messages and hands the app's answers back. Port and token come only from the
+  app, after you approved. (The task text said the host reads them from the app
+  config; the app sends them instead, so that the approval is enforced in one
+  place, the app, and the host needs no knowledge of the config file.)
+- **The bridge** (`hub.rs`): when the app starts it listens on a random
+  `127.0.0.1` port and writes `{"port":n}` into `bridge.json` in its config dir
+  (`%APPDATA%\io.github.wkdsteve.streamtap`; removed on exit). A host finds the
+  app there; without the file or the app, the extension is told
+  `app-not-running`.
+- **Registration** (`registration.rs`): the *Connect browser* panel registers or
+  removes the host for Chrome, Edge or Brave. That writes a manifest
+  (`native-messaging/<browser>.json` in the config dir; `name`, `path` of
+  `streamtap-host.exe` next to the app, `type: stdio`, `allowed_origins` with
+  exactly the extension's origin, no wildcard) and points
+  `HKCU\Software\<vendor>\<browser>\NativeMessagingHosts\io.github.wkdsteve.streamtap`
+  at it (Chrome `Google\Chrome`, Edge `Microsoft\Edge`, Brave
+  `BraveSoftware\Brave-Browser`). Per user, no administrator rights. Remove deletes
+  key and manifest. A key that points elsewhere (an older install) shows as
+  "registered for another location" with *Register again*. The registry access is
+  the `winreg` crate (MIT, already in the tree through Tauri's build tooling)
+  behind a trait: the tests use a fake, and one test uses a throw-away key under
+  `HKCU\Software\streamtap-test-<pid>` that it removes, never the browsers' keys.
+
+Pairing: the extension connects and says hello (a random instance id it keeps per
+browser profile, the browser it believes it is, its version). The app shows
+*"Chrome (profile abcd1234) wants to pair"* with Approve and Deny. Only after
+Approve it sends `credentials` (port and token) and the extension stores them. An
+approval is kept in `pairings.json` (origin + instance, at most 32), so the same
+profile pairs without a prompt next time and another profile asks again; the panel
+lists the approvals and *Revoke* removes one (the extension is told, drops the
+credentials it had been given and stops). A new token or port (Settings) is pushed
+to paired browsers. The browser name is what the extension reports (Edge and
+Chrome are told apart by the browser's brands; Brave usually looks like Chrome); the
+profile is the instance id, not the profile's name, which the protocol does not
+show. An unknown origin is refused by the host and again by the app. A pairing the
+user denies is asked again at the earliest after ten minutes (the extension's
+rule) unless the user presses *pair now* in the popup.
+
+Tabs: a paired and connected browser reports the tabs that hold a MediaSource
+(title, host, icon, DRM flag, whether it is captured). The panel lists them with
+*Capture* / *Stop*. Capture asks the extension to tap exactly that tab and reload it
+once (a running stream has already appended its init segment); it needs a running
+sink. A paired browser taps only chosen tabs; a browser set up by hand in the
+popup taps every tab as before. No page previews: a screenshot of a tab needs
+host access to all sites (or a click on the extension for that tab), which the
+extension does not ask for; the icon comes from the browser's favicon service.
+
+Schema and bounds (`proto.rs`, `framing.rs`): every message has `t` and `v: 1`,
+unknown fields and types are refused; 512 KiB at most from the extension (16 KiB
+to it), 32 tabs, titles cut to 200 characters with control and direction-override
+characters removed, hosts only host-name characters, icons only small
+`data:image/...;base64,` URLs whose bytes begin like the claimed type. A frame that
+declares more than the limit is refused before anything is read. The token is
+never printed (`Debug` is written by hand; the tests check it).
+
+Tests: schema and framing (unit), the host against a fake app on a real socket,
+the hub (pending gets no credentials, deny, remember, revoke, tap only for
+reported tabs, foreign origin, bounds), the registry logic against a fake, the
+approvals file, and an end-to-end test that starts the real `streamtap-host.exe`
+against the real bridge.
+
+Limits: a browser or profile is identified by the random id the extension
+generated, which the extension itself claims (any process of your user that can
+talk to the loopback bridge could claim another; you still approve every new
+one, and such a process could read `config.json` anyway). The hand run in a real
+Chrome is still to do (see the task); Firefox is out of scope.
 
 Limits: a hard kill of the app leaves a stale `out.part.mp4` in a capture
 whose mux was running (harmless, replaced by the next mux).

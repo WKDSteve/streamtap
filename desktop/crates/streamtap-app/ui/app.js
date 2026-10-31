@@ -14,6 +14,7 @@ const state = {
   settings: null,
   tokenShown: false,
   settingsOpen: false,
+  browserOpen: false,
   signature: "",
   busy: false,
 };
@@ -222,6 +223,106 @@ const renderLog = (snap) => {
   if (atEnd) pre.scrollTop = pre.scrollHeight;
 };
 
+// ---- browser link ---------------------------------------------------------
+
+const BROWSER_NAMES = { chrome: "Chrome", edge: "Edge", brave: "Brave", other: "Browser" };
+const browserName = (id) => BROWSER_NAMES[id] ?? "Browser";
+const REG_TEXT = { registered: "registered", "not-registered": "not registered", stale: "registered for another location" };
+
+// Page-controlled strings (titles, hosts) arrive cleaned and bounded from the app and
+// are set with textContent only. A favicon is shown only when it is an image data URL.
+const faviconImg = (url) =>
+  typeof url === "string" && /^data:image\/(png|jpeg|gif|webp|x-icon);base64,/.test(url)
+    ? el("img", { class: "fav", src: url, alt: "", width: "16", height: "16" })
+    : el("span", { class: "fav", "aria-hidden": "true" });
+
+const renderPairing = (snap) => {
+  const box = $("pairing");
+  box.replaceChildren();
+  for (const c of snap.browser.link.connections.filter((x) => !x.approved)) {
+    box.append(
+      el("div", { class: "notice warn", role: "alert" },
+        el("strong", { text: `${browserName(c.browser)} (profile ${c.profile}) wants to pair with streamtap.` }),
+        el("span", { text: "If you started this just now, approve it: the extension then receives the sink's port and token and can list your video tabs. Otherwise deny." }),
+        el("div", { class: "row" },
+          el("button", { type: "button", class: "primary", "data-fid": `pair:${c.id}:yes`, text: "Approve", onclick: () => run("Approve", () => invoke("browser_decide", { conn: c.id, approve: true })) }),
+          el("button", { type: "button", "data-fid": `pair:${c.id}:no`, text: "Deny", onclick: () => run("Deny", () => invoke("browser_decide", { conn: c.id, approve: false })) }),
+        )),
+    );
+  }
+};
+
+const renderBrowser = (snap) => {
+  const b = snap.browser;
+  const reg = $("browser-reg");
+  reg.replaceChildren(
+    ...b.registrations.map((r) => {
+      const registered = r.state === "registered";
+      const label = r.error ? `error: ${r.error}` : REG_TEXT[r.state] ?? "unknown";
+      return el("li", { class: "regrow" },
+        el("strong", { text: browserName(r.browser) }),
+        el("span", { class: registered ? "ok" : "muted", text: label }),
+        el("span", { class: "grow" }),
+        registered
+          ? el("button", { type: "button", "data-fid": `reg:${r.browser}:rm`, text: "Remove", onclick: () => run("Remove", () => invoke("browser_unregister", { browser: r.browser })) })
+          : el("button", { type: "button", class: "primary", "data-fid": `reg:${r.browser}:add`, text: r.state === "stale" ? "Register again" : "Register", disabled: !b.host_path, title: b.host_path ? "" : "streamtap-host was not found next to the app", onclick: () => run("Register", () => invoke("browser_register", { browser: r.browser })) }),
+      );
+    }),
+  );
+  const note = $("browser-note");
+  const notes = [];
+  if (!b.host_path) notes.push("streamtap-host was not found next to the app (build it with scripts/build.ps1).");
+  if (b.bridge_error) notes.push(b.bridge_error);
+  if (b.link.store_error) notes.push(b.link.store_error);
+  note.hidden = !notes.length;
+  note.textContent = notes.join(" ");
+
+  const list = $("approvals");
+  list.replaceChildren(
+    ...(b.link.approvals.length
+      ? b.link.approvals.map((a) => el("li", { class: "regrow" },
+          el("strong", { text: `${browserName(a.browser)} (profile ${a.profile})` }),
+          el("span", { class: a.connected ? "ok" : "muted", text: a.connected ? "connected" : "not connected" }),
+          el("span", { class: "grow" }),
+          el("button", { type: "button", class: "danger", "data-fid": `rev:${a.instance}`, text: "Revoke", onclick: () => run("Revoke", () => invoke("browser_revoke", { instance: a.instance })) })))
+      : [el("li", { class: "muted", text: "No browser is paired yet." })]),
+  );
+
+  const running = snap.sink.state === "running";
+  const approved = b.link.connections.filter((c) => c.approved);
+  $("tabs-hint").textContent = approved.length
+    ? running
+      ? "Capture reloads the tab once so that it sees the start of the stream. No previews of the page are taken (that would need access to all sites); icon and title come from the tab."
+      : "Start the sink (header) before you switch a tab to capture."
+    : "A paired and connected browser lists the tabs that hold a video here.";
+  const box = $("tabs");
+  box.replaceChildren(
+    ...approved.map((c) =>
+      el("div", { class: "browser-tabs" },
+        el("h4", { text: `${browserName(c.browser)} (profile ${c.profile})` }),
+        c.tabs.length
+          ? el("ul", { class: "plain" }, ...c.tabs.map((t) =>
+              el("li", { class: "tabrow" },
+                faviconImg(t.favicon),
+                el("span", { class: "tabtext" },
+                  el("span", { class: "tabtitle", text: t.title || t.host || "(untitled)" }),
+                  el("span", { class: "muted", text: `${t.host}${t.active ? " - visible tab" : ""}` })),
+                t.drm ? badge("DRM", "drm") : null,
+                t.tapping ? badge("capturing", "live") : null,
+                el("button", {
+                  type: "button",
+                  class: t.tapping ? "danger" : "primary",
+                  "data-fid": `tab:${c.id}:${t.id}`,
+                  text: t.tapping ? "Stop" : "Capture",
+                  disabled: (!t.tapping && !running) || (t.drm && !t.tapping),
+                  title: t.drm ? "DRM-protected: streamtap leaves it alone" : "",
+                  onclick: () => run("Capture", () => invoke("browser_tap", { conn: c.id, tab: t.id, on: !t.tapping })),
+                }))))
+          : el("p", { class: "muted", text: "No tab with a video yet. Open a page and start playing." })),
+    ),
+  );
+};
+
 const render = (snap) => {
   const sig = JSON.stringify([snap, state.settings, state.tokenShown, state.busy]);
   if (sig === state.signature) return;
@@ -233,6 +334,8 @@ const render = (snap) => {
   renderList(snap);
   renderSettings(snap);
   renderLog(snap);
+  renderPairing(snap);
+  renderBrowser(snap);
   if (focusId) document.querySelector(`[data-fid="${CSS.escape(focusId)}"]`)?.focus();
 };
 
@@ -275,6 +378,12 @@ $("settings-toggle").addEventListener("click", () => {
   $("settings").hidden = !state.settingsOpen;
   $("settings-toggle").setAttribute("aria-expanded", String(state.settingsOpen));
   if (state.settingsOpen) $("port").focus();
+});
+
+$("browser-toggle").addEventListener("click", () => {
+  state.browserOpen = !state.browserOpen;
+  $("browser").hidden = !state.browserOpen;
+  $("browser-toggle").setAttribute("aria-expanded", String(state.browserOpen));
 });
 
 $("settings-form").addEventListener("submit", (ev) => {

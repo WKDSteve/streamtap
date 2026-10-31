@@ -236,3 +236,16 @@ dialog p { overflow-wrap: anywhere; }
   .dot-running { animation: pulse 2s ease-in-out infinite; }
 }
 @keyframes pulse { 50% { opacity: 0.45; } }
+
+/* Connect browser */
+h3 { font-size: 14px; margin: 14px 0 6px; }
+h4 { font-size: 13px; margin: 8px 0 4px; }
+ul.plain { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.regrow, .tabrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.regrow .grow { flex: 1; }
+.ok { color: var(--ok); }
+.muted { color: var(--muted); }
+.tabrow { padding: 6px 0; border-top: 1px solid var(--border); }
+.tabrow .tabtext { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.tabrow .tabtitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fav { width: 16px; height: 16px; flex: none; }

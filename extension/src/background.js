@@ -2,17 +2,18 @@
 // for the popup, plus a badge with the number of SourceBuffers that have
 // received media segments. State lives in memory only; it is lost when the
 // worker is suspended, which is fine for a spike. The sink link (one WebSocket
-// per tapping frame) lives in sink-link.js.
+// per tapping frame) lives in sink-link.js, the pairing with the desktop app
+// (native messaging, tab list, per-tab capture) in native-pairing.js.
 "use strict";
 
-importScripts("sink-link.js");
+importScripts("sink-link.js", "native-pairing.js");
 
 const tabs = new Map(); // tabId -> { url, frames: Set, ms: Map<msId, {...}>, drm: [] }
 
 const tabState = (tabId, url) => {
   let t = tabs.get(tabId);
   if (!t) {
-    t = { url, frames: new Set(), ms: new Map(), drm: [], events: 0 };
+    t = { url, title: "", frames: new Set(), ms: new Map(), drm: [], events: 0 };
     tabs.set(tabId, t);
   }
   return t;
@@ -83,6 +84,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse(sinkLinkStatus(msg.tabId));
     return false;
   }
+  if (msg && msg.kind === "vc-pair-status") {
+    sendResponse(npStatus());
+    return false;
+  }
+  if (msg && msg.kind === "vc-pair-now") {
+    npRetryNow();
+    sendResponse(true);
+    return false;
+  }
+  // A content script asks whether its tab is tapped (mode "selected").
+  if (msg && msg.kind === "vc-tap-state") {
+    const id = sender.tab && sender.tab.id;
+    npTapState(id).then(sendResponse, () => sendResponse({ on: false }));
+    return true;
+  }
   if (msg && msg.kind === "vc-clear" && typeof msg.tabId === "number") {
     tabs.delete(msg.tabId);
     updateBadge(msg.tabId);
@@ -93,6 +109,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab && sender.tab.id;
   if (typeof tabId !== "number") return false;
   const t = tabState(tabId, sender.tab.url);
+  if (typeof sender.tab.title === "string") t.title = sender.tab.title.slice(0, 300);
 
   if (msg.kind !== "vc-event" || !msg.event || typeof msg.event !== "object") return false;
 
@@ -163,6 +180,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       break;
   }
   updateBadge(tabId);
+  npScheduleSend(false);
   return false;
 });
 
@@ -185,10 +203,23 @@ const serialize = (t) => {
 
 // Forget a tab's state when it navigates to a new document or closes.
 // tabs.onUpdated needs no extra permission (unlike webNavigation).
-chrome.tabs.onRemoved.addListener((tabId) => tabs.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabs.delete(tabId);
+  npTabClosed(tabId);
+});
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
     tabs.delete(tabId);
     updateBadge(tabId);
+    npScheduleSend(false);
   }
+});
+
+// Pairing with the desktop app: the tabs that hold a MediaSource are what the
+// app lists. Frame URLs are not reported, only the tab's own URL host.
+npInit({
+  mediaTabs: () =>
+    [...tabs]
+      .filter(([, t]) => t.ms.size > 0)
+      .map(([id, t]) => ({ id, url: t.url, title: t.title, drm: t.drm.length > 0 })),
 });

@@ -48,6 +48,7 @@ globalThis.chrome = {
   runtime: {
     id: "oggpddakdbffbjhkjmcakidgmhpgakia",
     lastError: null,
+    onMessage: { addListener: () => {} },
     sendMessage: (m, cb) => {
       forwarded.push(m);
       if (cb) cb();
@@ -219,6 +220,13 @@ const bg = { listener: null, badges: [] };
 const bgCtx = vm.createContext({
   console,
   importScripts: () => {},
+  // native-pairing.js is not loaded here (test-pairing.mjs covers it): inert stand-ins.
+  npInit: () => {},
+  npScheduleSend: () => {},
+  npTabClosed: () => {},
+  npStatus: () => ({}),
+  npRetryNow: () => {},
+  npTapState: async () => ({ on: false }),
   chrome: {
     runtime: { onMessage: { addListener: (f) => (bg.listener = f) } },
     action: {

@@ -351,7 +351,10 @@
   };
 
   // ---------------------------------------------------------------------------
-  // Tapping on/off: only with a configured sink (token set)
+  // Tapping on/off: only with a configured sink (token set). A browser paired
+  // with the desktop app is in mode "selected": it taps only the tabs the app
+  // switched on, which the service worker answers (vc-tap-state) and announces
+  // (vc-tap). A manual setup in the popup taps every tab ("all").
   // ---------------------------------------------------------------------------
 
   // null until chrome.storage answers: appends are held (bounded) meanwhile,
@@ -370,11 +373,37 @@
     heldBytes = 0;
     if (on) for (const [header, payload] of waiting) sendSegment(header, payload);
   };
+
+  // Reads the setting and, in mode "selected", asks the service worker; a
+  // later answer replaces an earlier one only if it is the latest question.
+  let question = 0;
+  const readTapping = () => {
+    const mine = ++question;
+    const answer = (on) => {
+      if (mine === question) setTapping(on);
+    };
+    chrome.storage.local.get({ sinkToken: "", tapMode: "all" }, (v) => {
+      if (!v.sinkToken) return answer(false);
+      if (v.tapMode !== "selected") return answer(true);
+      chrome.runtime.sendMessage({ kind: "vc-tap-state" }, (r) => {
+        void chrome.runtime.lastError;
+        answer(!!r && r.on === true);
+      });
+    });
+  };
   if (inExtension) {
     try {
-      chrome.storage.local.get({ sinkToken: "" }, (v) => setTapping(!!v.sinkToken));
+      readTapping();
       chrome.storage.onChanged.addListener((changes, area) => {
-        if (area === "local" && changes.sinkToken) setTapping(!!changes.sinkToken.newValue);
+        if (area === "local" && (changes.sinkToken || changes.tapMode)) readTapping();
+      });
+      // The app switched this tab on or off.
+      chrome.runtime.onMessage.addListener((msg, sender) => {
+        if (sender.id === chrome.runtime.id && msg && msg.kind === "vc-tap" && typeof msg.on === "boolean") {
+          question++;
+          setTapping(msg.on);
+        }
+        return false;
       });
     } catch (e) {
       setTapping(false);

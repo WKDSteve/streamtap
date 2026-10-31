@@ -24,8 +24,12 @@
     <h1>streamtap · Spike 1</h1>
     <div id="out" class="muted">loading…</div>
     <button id="clear">clear tab state</button>
+    <div class="muted">
+      <span id="pair">app pairing: …</span>
+      <button id="pair-now">pair now</button>
+    </div>
     <fieldset class="sink">
-      <legend>Sink (streamtap-sink serve)</legend>
+      <legend>Sink (manual fallback; a paired app fills this in)</legend>
       <label>port <input id="port" type="number" min="1" max="65535" size="6" /></label>
       <label>token <input id="token" type="password" size="16" /></label>
       <button id="save">save</button>

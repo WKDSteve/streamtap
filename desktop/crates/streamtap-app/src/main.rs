@@ -8,8 +8,11 @@
 
 mod captures;
 mod config;
+mod hub;
 mod jobs;
+mod pairings;
 mod paths;
+mod registration;
 mod sink;
 
 use std::collections::{HashMap, VecDeque};
@@ -24,6 +27,8 @@ use tauri::{Manager, RunEvent, State};
 
 use captures::{CaptureInfo, IndexAcc};
 use config::Settings;
+use hub::{Hub, HubView};
+use registration::Browser;
 use sink::MuxState;
 
 type CmdResult<T> = Result<T, String>;
@@ -57,6 +62,14 @@ struct Inner {
     /// Counts sink starts: output of an earlier sink process (its reader
     /// threads may still be draining) is not mixed into the new log.
     log_gen: u64,
+    /// The app's config directory (`config.json`, `pairings.json`, `bridge.json`, the host manifests).
+    config_dir: PathBuf,
+    /// Pairing and tab lists of the browsers (see `hub`); has its own lock.
+    hub: Arc<Hub>,
+    /// The bridge the native messaging host connects to.
+    bridge: Option<hub::Server>,
+    /// Why the bridge could not be opened.
+    bridge_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -75,6 +88,9 @@ impl AppState {
     fn shutdown(&self) {
         let handles: Vec<_> = {
             let mut g = self.lock();
+            // The hosts find no bridge any more; their browsers see the app close.
+            g.bridge = None;
+            g.hub.close_all();
             g.stop_sink();
             g.mux_handles.drain().map(|(_, h)| h).collect()
         };
@@ -88,9 +104,18 @@ impl AppState {
 
 impl Inner {
     fn new(settings: Settings, config_path: PathBuf, config_error: Option<String>) -> Self {
+        let config_dir = config_path
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        let store = pairings::Store::load(&config_dir.join("pairings.json"));
+        let hub = Arc::new(Hub::new(store, settings.port, &settings.token));
         Self {
             settings,
             config_path,
+            config_dir,
+            hub,
+            bridge: None,
+            bridge_error: None,
             config_error,
             sink: None,
             crashed: None,
@@ -151,6 +176,48 @@ struct Snapshot {
     captures_error: Option<String>,
     mux: HashMap<String, MuxState>,
     log: Vec<String>,
+    browser: BrowserSnapshot,
+}
+
+#[derive(Serialize)]
+struct Registration {
+    browser: &'static str,
+    /// `registered`, `not-registered` or `stale`; none when the registry could not be read.
+    state: Option<registration::State>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BrowserSnapshot {
+    host_path: Option<String>,
+    bridge_error: Option<String>,
+    registrations: Vec<Registration>,
+    link: HubView,
+}
+
+fn browser_snapshot(g: &Inner) -> BrowserSnapshot {
+    let reg = registration::WinRegistry::real();
+    let registrations = Browser::ALL
+        .into_iter()
+        .map(|b| match registration::state(&reg, &g.config_dir, b) {
+            Ok(state) => Registration {
+                browser: b.id(),
+                state: Some(state),
+                error: None,
+            },
+            Err(e) => Registration {
+                browser: b.id(),
+                state: None,
+                error: Some(e),
+            },
+        })
+        .collect();
+    BrowserSnapshot {
+        host_path: sink::find_host().map(|p| p.display().to_string()),
+        bridge_error: g.bridge_error.clone(),
+        registrations,
+        link: g.hub.view(),
+    }
 }
 
 #[tauri::command]
@@ -191,6 +258,7 @@ async fn snapshot(state: State<'_, AppState>) -> CmdResult<Snapshot> {
         captures_error,
         mux: g.mux.clone(),
         log: g.log.iter().cloned().collect(),
+        browser: browser_snapshot(&g),
     })
 }
 
@@ -222,6 +290,8 @@ fn apply_settings(g: &mut Inner, new: Settings) -> CmdResult<()> {
     }
     g.settings = new;
     g.config_error = None;
+    // Paired browsers get the new port and token.
+    g.hub.set_credentials(g.settings.port, &g.settings.token);
     Ok(())
 }
 
@@ -419,6 +489,49 @@ async fn delete_capture(state: State<'_, AppState>, id: String) -> CmdResult<()>
     Ok(())
 }
 
+#[tauri::command]
+async fn browser_register(state: State<'_, AppState>, browser: String) -> CmdResult<()> {
+    let browser = Browser::parse(&browser)?;
+    let host = sink::find_host()
+        .ok_or("streamtap-host was not found next to the app (build it: scripts/build.ps1)")?;
+    let dir = state.lock().config_dir.clone();
+    registration::register(&mut registration::WinRegistry::real(), &dir, browser, &host)
+}
+
+#[tauri::command]
+async fn browser_unregister(state: State<'_, AppState>, browser: String) -> CmdResult<()> {
+    let browser = Browser::parse(&browser)?;
+    let dir = state.lock().config_dir.clone();
+    registration::unregister(&mut registration::WinRegistry::real(), &dir, browser)
+}
+
+fn hub_of(state: &AppState) -> Arc<Hub> {
+    Arc::clone(&state.lock().hub)
+}
+
+#[tauri::command]
+async fn browser_decide(state: State<'_, AppState>, conn: u64, approve: bool) -> CmdResult<()> {
+    hub_of(state.inner()).decide(conn, approve)
+}
+
+#[tauri::command]
+async fn browser_revoke(state: State<'_, AppState>, instance: String) -> CmdResult<()> {
+    hub_of(state.inner()).revoke(&instance)
+}
+
+#[tauri::command]
+async fn browser_tap(state: State<'_, AppState>, conn: u64, tab: u32, on: bool) -> CmdResult<()> {
+    let hub = {
+        let mut g = state.lock();
+        g.refresh_sink();
+        if on && !g.sink_running() {
+            return Err("start the sink first".into());
+        }
+        Arc::clone(&g.hub)
+    };
+    hub.request_tap(conn, tab, on)
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .setup(|app| {
@@ -430,11 +543,12 @@ fn main() {
                 // The file stays as it is until the user saves new settings.
                 Err(e) => (Settings::defaults(&data_dir), Some(e)),
             };
-            app.manage(AppState(Arc::new(Mutex::new(Inner::new(
-                settings,
-                config_path,
-                config_error,
-            )))));
+            let mut inner = Inner::new(settings, config_path, config_error);
+            match hub::Server::start(&inner.hub, &inner.config_dir) {
+                Ok(server) => inner.bridge = Some(server),
+                Err(e) => inner.bridge_error = Some(e),
+            }
+            app.manage(AppState(Arc::new(Mutex::new(inner))));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -448,6 +562,11 @@ fn main() {
             open_result,
             open_folder,
             delete_capture,
+            browser_register,
+            browser_unregister,
+            browser_decide,
+            browser_revoke,
+            browser_tap,
         ])
         .build(tauri::generate_context!())
         .expect("cannot build the app");
@@ -528,22 +647,28 @@ mod tests {
 
     /// The sink exe next to the test exe's profile directory, built first.
     fn built_sink() -> PathBuf {
+        built_bin("streamtap-sink")
+    }
+
+    /// `package`'s exe in the test exe's profile directory, built first (the
+    /// package and the exe have the same name).
+    fn built_bin(package: &str) -> PathBuf {
         let exe = std::env::current_exe().unwrap();
         let profile_dir = exe.parent().and_then(Path::parent).unwrap().to_path_buf();
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let status = std::process::Command::new(cargo)
-            .args(["build", "-p", "streamtap-sink", "--locked"])
+            .args(["build", "-p", package, "--locked"])
             .args(build_profile_args(&profile_dir))
             .status()
             .expect("cargo build");
-        assert!(status.success(), "cargo build -p streamtap-sink failed");
-        let sink = profile_dir.join(if cfg!(windows) {
-            "streamtap-sink.exe"
+        assert!(status.success(), "cargo build -p {package} failed");
+        let bin = profile_dir.join(if cfg!(windows) {
+            format!("{package}.exe")
         } else {
-            "streamtap-sink"
+            package.to_string()
         });
-        assert!(sink.is_file(), "{} missing", sink.display());
-        sink
+        assert!(bin.is_file(), "{} missing", bin.display());
+        bin
     }
 
     /// The profile the test exe was built with, from its directory
@@ -732,5 +857,121 @@ mod tests {
         assert!(!again.drm, "a clear track is no DRM");
         f.st.shutdown();
         fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    // ---- end to end: the real host against the real bridge ----
+
+    /// Frames read from a child's stdout, delivered through a channel so a
+    /// test cannot hang on a silent host.
+    fn frames_of(
+        stdout: std::process::ChildStdout,
+    ) -> std::sync::mpsc::Receiver<serde_json::Value> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = stdout;
+            while let Ok(Some(body)) = streamtap_host::framing::read_frame(&mut out, 1 << 20) {
+                let value = serde_json::from_slice(&body).unwrap();
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
+    fn native_frame(json: &serde_json::Value) -> Vec<u8> {
+        let body = serde_json::to_vec(json).unwrap();
+        let mut out = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+        out.extend(body);
+        out
+    }
+
+    fn next_frame(rx: &std::sync::mpsc::Receiver<serde_json::Value>) -> serde_json::Value {
+        rx.recv_timeout(std::time::Duration::from_secs(15))
+            .expect("a frame from the host")
+    }
+
+    #[test]
+    fn end_to_end_the_real_host_pairs_through_the_bridge() {
+        use std::io::Write as _;
+        let host = built_bin("streamtap-host");
+        let (st, dir) = state("e2e-host");
+        let hub = Arc::clone(&st.lock().hub);
+        let server = hub::Server::start(&hub, &dir).unwrap();
+        st.lock().bridge = Some(server);
+        let token = st.lock().settings.token.clone();
+        let launch = |origin: &str| {
+            std::process::Command::new(&host)
+                .arg(origin)
+                .env("STREAMTAP_APP_DIR", &dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+
+        // Another origin: refused by the host itself, no bridge involved.
+        let mut bad = launch("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/");
+        let rx = frames_of(bad.stdout.take().unwrap());
+        assert_eq!(next_frame(&rx)["code"], "origin-not-allowed");
+        assert_eq!(bad.wait().unwrap().code(), Some(2));
+        assert!(hub.view().connections.is_empty());
+
+        let mut child = launch("chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia/");
+        let rx = frames_of(child.stdout.take().unwrap());
+        let mut stdin = child.stdin.take().unwrap();
+        let hello = serde_json::json!({
+            "t": "hello", "v": 1, "instance": "e2e-profile-1", "browser": "brave", "version": "0.3.0",
+        });
+        stdin.write_all(&native_frame(&hello)).unwrap();
+        stdin.flush().unwrap();
+        assert_eq!(
+            next_frame(&rx),
+            serde_json::json!({"t": "state", "v": 1, "pairing": "pending"})
+        );
+        // Until the user approves, nothing else comes, least of all the token.
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(400))
+            .is_err());
+        let conn = wait_for("the pending connection", || {
+            hub.view().connections.first().map(|c| (c.id, c.approved))
+        });
+        assert!(!conn.1);
+
+        hub.decide(conn.0, true).unwrap();
+        assert_eq!(next_frame(&rx)["pairing"], "approved");
+        let creds = next_frame(&rx);
+        assert_eq!(creds["t"], "credentials");
+        assert_eq!(creds["token"], token.as_str());
+        assert_eq!(creds["port"], st.lock().settings.port);
+
+        let tabs = serde_json::json!({"t": "tabs", "v": 1, "tabs": [
+            {"id": 11, "title": "A video", "host": "video.example", "favicon": null,
+             "drm": false, "tapping": false, "active": true}]});
+        stdin.write_all(&native_frame(&tabs)).unwrap();
+        stdin.flush().unwrap();
+        wait_for("the tab list", || {
+            hub.view()
+                .connections
+                .first()
+                .filter(|c| c.tabs.len() == 1)
+                .map(|_| ())
+        });
+        hub.request_tap(conn.0, 11, true).unwrap();
+        assert_eq!(
+            next_frame(&rx),
+            serde_json::json!({"t": "tap", "v": 1, "tab": 11, "on": true})
+        );
+
+        // Revoking ends the link: the extension is told, the host leaves.
+        hub.revoke("e2e-profile-1").unwrap();
+        assert_eq!(next_frame(&rx)["pairing"], "revoked");
+        assert!(wait_for("the host to exit", || child.try_wait().unwrap())
+            .code()
+            .is_some());
+        drop(stdin);
+        st.shutdown();
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

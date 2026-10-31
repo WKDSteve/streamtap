@@ -13,6 +13,11 @@
     "allow-mux-capture",
     "allow-open-result",
     "allow-open-folder",
-    "allow-delete-capture"
+    "allow-delete-capture",
+    "allow-browser-register",
+    "allow-browser-unregister",
+    "allow-browser-decide",
+    "allow-browser-revoke",
+    "allow-browser-tap"
   ]
 }

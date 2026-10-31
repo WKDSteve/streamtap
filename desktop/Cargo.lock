@@ -2912,10 +2912,20 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "streamtap-host",
  "tauri",
  "tauri-build",
  "tungstenite",
  "win32job",
+ "winreg",
+]
+
+[[package]]
+name = "streamtap-host"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-Builds desktop\target\release\streamtap-sink.exe and streamtap-app.exe (release, locked).
+Builds desktop\target\release\streamtap-sink.exe, streamtap-host.exe and streamtap-app.exe (release, locked).
 
 .DESCRIPTION
 Used by the nvim-config's :MyNative build and :MyPlugins machine. Two things a
 bare `cargo build` gets wrong for them:
-- A running sink (`streamtap-sink serve`, also the one the app started) or a running
-  app locks its exe; cargo then fails with "Access is denied (os error 5)". The
+- A running sink (`streamtap-sink serve`, also the one the app started), a running
+  host (the browser starts it) or a running app locks its exe; cargo then fails with "Access is denied (os error 5)". The
   script names the process instead.
 - A no-op build leaves the exes' timestamps alone, so a build that is current
   still looks older than the newest commit and stays "stale". After a
@@ -22,7 +22,7 @@ param()
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $root 'desktop\Cargo.toml'
-$exes = @('streamtap-sink', 'streamtap-app') | ForEach-Object {
+$exes = @('streamtap-sink', 'streamtap-host', 'streamtap-app') | ForEach-Object {
     [pscustomobject]@{ Name = $_; Path = (Join-Path $root "desktop\target\release\$_.exe") }
 }
 

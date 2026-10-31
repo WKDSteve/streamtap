@@ -60,9 +60,41 @@ const load = async () => {
     port.value = v.sinkPort;
     token.value = v.sinkToken;
   });
+  // A manual entry taps every tab (the old behaviour) and is not the app's to take back.
   document.getElementById("save").onclick = () =>
-    chrome.storage.local.set({ sinkPort: Number(port.value) || 17650, sinkToken: token.value }, () => {
-      document.getElementById("link").textContent = "saved; reload the page to reconnect";
+    chrome.storage.local.set(
+      { sinkPort: Number(port.value) || 17650, sinkToken: token.value, sinkPaired: false, tapMode: "all" },
+      () => {
+        document.getElementById("link").textContent = "saved; reload the page to reconnect";
+      }
+    );
+
+  const pairLine = document.getElementById("pair");
+  const showPair = (s) => {
+    void chrome.runtime.lastError;
+    if (!s) return (pairLine.textContent = "app pairing: unavailable");
+    const how = !s.connected
+      ? s.error === "host-unavailable"
+        ? "the connector is not registered, or the app is not running (Connect browser in the app)"
+        : "not connected"
+      : s.pairing === "approved"
+        ? `paired${s.tapped ? `, ${s.tapped} tab(s) captured` : ""}`
+        : s.pairing === "pending"
+          ? "waiting for your approval in the app"
+          : s.pairing === "denied"
+            ? "denied in the app"
+            : s.pairing === "revoked"
+              ? "revoked in the app"
+              : s.error === "app-not-running"
+                ? "the app is not running"
+                : "connecting";
+    pairLine.textContent = `app pairing: ${how}`;
+  };
+  chrome.runtime.sendMessage({ kind: "vc-pair-status" }, showPair);
+  document.getElementById("pair-now").onclick = () =>
+    chrome.runtime.sendMessage({ kind: "vc-pair-now" }, () => {
+      void chrome.runtime.lastError;
+      setTimeout(() => chrome.runtime.sendMessage({ kind: "vc-pair-status" }, showPair), 800);
     });
 
   // The service worker owns the sink sockets; ask it about this tab.

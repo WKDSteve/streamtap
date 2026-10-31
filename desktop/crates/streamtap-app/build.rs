@@ -10,6 +10,11 @@ const COMMANDS: &[&str] = &[
     "open_result",
     "open_folder",
     "delete_capture",
+    "browser_register",
+    "browser_unregister",
+    "browser_decide",
+    "browser_revoke",
+    "browser_tap",
 ];
 
 fn main() {
