@@ -74,19 +74,24 @@ Injected into a running ARD Mediathek page (hls.js → fMP4), 7 s after a seek:
   and the values are filled in. The "pre-hook" path registers such
   SourceBuffers lazily so late injection still works.
 
-## Spike 2 status (2026-10-30)
+## Spike 2 result (2026-10-31)
 
 - Sink and wire format verified end to end with `desktop/scripts/test-sink.mjs`
   (fragmented test MP4 → sink → `mux` → ffprobe OK).
-- Browser → sink **not yet verified**: the Claude desktop app's built-in
-  browser pane cannot reach loopback servers started from the shell (all
-  `ws://127.0.0.1:17650` attempts failed without a CSP message and without
-  reaching the listener). The hook + content script injected on the hls.js
-  demo page did produce segments (18 appends in 12 s, 1920×1080) and the
-  content script counted them as dropped, so the page-side path works; only
-  the socket needs a real Chrome. Open question from the concept remains:
-  does the page CSP (`connect-src`) apply to a content script's WebSocket in
-  Chromium? First real-Chrome run answers it.
+- **Real Chrome, ARD Mediathek:** one session, about 10.5 minutes of video
+  with several forward seeks and one 408 s backward seek. `mux` produced an
+  MP4 with H.264 1280×720 and AAC 48 kHz, 630 s; a full decode
+  (`ffmpeg -f null`) reports no errors.
+- The console showed one `WebSocket connection … failed` right after page
+  load; the reconnect succeeded and all segments arrived. No CSP message on
+  this site. Whether a strict page `connect-src` would block a content
+  script's socket is still not answered in general; the data path is an open
+  decision (content script, service worker or native messaging).
+- Two things the real run taught the mux (see `../desktop/README.md`):
+  hls.js starts at a low quality and switches after the first segment (new
+  init segment → new part), and after seeks segments arrive out of order.
+- The popup escapes every value it shows: any page script can forge the
+  hook's `postMessage` records.
 
 ## Known limitations of the spike
 
@@ -99,8 +104,6 @@ Injected into a running ARD Mediathek page (hls.js → fMP4), 7 s after a seek:
 - `sender.tab.url` in the registry is only available where the content script
   has host access; it is informational only.
 
-## Next: Spike 2
-
-Copy each segment once (`data.slice()`), transfer it to the content script,
-stream it binary over a local WebSocket to a small Rust server that writes one
-file per SourceBuffer, then `ffmpeg -c copy` the result into a playable MP4.
+- Any page script can post records that look like the hook's. They only
+  reach this page's own capture and the popup (escaped); they gain nothing,
+  but a capture of a hostile page can contain junk.

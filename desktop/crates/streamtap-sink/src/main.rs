@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -408,8 +408,75 @@ impl Session {
 struct IndexRow {
     sb: u32,
     part: u32,
+    offset: u64,
+    len: u64,
     is_init: bool,
+    tfdt: Option<u64>,
+    timescale: Option<u32>,
     mime: String,
+}
+
+/// Returns a file for `sbN.pM` whose media segments are in ascending `tfdt`
+/// order. Players fetch out of order after a backward seek and the sink
+/// writes in arrival order, so the raw part may be non-monotonic. If it
+/// already is in order the raw file is returned unchanged; otherwise
+/// `sbN.pM.sorted.bin` is written (init segment first, then media by `tfdt`).
+fn ordered_part(dir: &Path, sb: u32, part: u32, rows: &[&IndexRow]) -> io::Result<PathBuf> {
+    let raw = dir.join(format!("sb{sb}.p{part}.bin"));
+    let (init, mut media): (Vec<&IndexRow>, Vec<&IndexRow>) =
+        rows.iter().copied().partition(|r| r.is_init);
+    let in_order = media
+        .windows(2)
+        .all(|w| w[0].tfdt.unwrap_or(0) < w[1].tfdt.unwrap_or(0));
+
+    // Report gaps (missed ranges after a forward seek) on the sorted timeline.
+    media.sort_by_key(|r| r.tfdt.unwrap_or(0));
+    if let Some(ts) = media.iter().find_map(|r| r.timescale).filter(|t| *t > 0) {
+        let steps: Vec<u64> = media
+            .windows(2)
+            .filter_map(|w| Some(w[1].tfdt? - w[0].tfdt?))
+            .collect();
+        let mut typical = steps.clone();
+        typical.sort_unstable();
+        if let Some(&median) = typical.get(typical.len() / 2) {
+            let gaps = steps.iter().filter(|s| **s > median * 3 / 2).count();
+            if gaps > 0 {
+                let missing: u64 = steps
+                    .iter()
+                    .filter(|s| **s > median * 3 / 2)
+                    .map(|s| s - median)
+                    .sum();
+                eprintln!(
+                    "mux: sb{sb}.p{part}: {gaps} gap(s), about {} s not captured (seeked past them)",
+                    missing / u64::from(ts)
+                );
+            }
+        }
+    }
+    if in_order {
+        return Ok(raw);
+    }
+
+    let sorted = dir.join(format!("sb{sb}.p{part}.sorted.bin"));
+    let mut src = File::open(&raw)?;
+    let mut dst = io::BufWriter::new(File::create(&sorted)?);
+    let mut buf = Vec::new();
+    for r in init.iter().take(1).chain(media.iter()) {
+        let len = usize::try_from(r.len)
+            .ok()
+            .filter(|l| *l <= MAX_MESSAGE)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "segment too large"))?;
+        buf.resize(len, 0);
+        src.seek(io::SeekFrom::Start(r.offset))?;
+        src.read_exact(&mut buf)?;
+        dst.write_all(&buf)?;
+    }
+    dst.flush()?;
+    eprintln!(
+        "mux: sb{sb}.p{part}: segments arrived out of order, wrote {}",
+        sorted.display()
+    );
+    Ok(sorted)
 }
 
 fn run_mux(args: &[String]) -> i32 {
@@ -428,39 +495,74 @@ fn run_mux(args: &[String]) -> i32 {
         }
     };
 
-    // Per SourceBuffer: which parts exist, and whether part 0 has an init segment.
-    let mut parts: HashMap<u32, (u32, bool, String)> = HashMap::new();
+    // Per (SourceBuffer, part): bytes written, whether it starts with an init
+    // segment, and the MIME type.
+    let mut rows: Vec<IndexRow> = Vec::new();
     for line in index.lines().filter(|l| !l.trim().is_empty()) {
-        let row: IndexRow = match serde_json::from_str(line) {
-            Ok(r) => r,
+        match serde_json::from_str(line) {
+            Ok(r) => rows.push(r),
             Err(e) => {
                 eprintln!("mux: bad index line: {e}");
                 return 1;
             }
-        };
-        let e = parts.entry(row.sb).or_insert((0, false, row.mime.clone()));
-        e.0 = e.0.max(row.part);
-        if row.part == 0 && row.is_init {
-            e.1 = true;
         }
+    }
+    let mut parts: HashMap<(u32, u32), (u64, bool, String)> = HashMap::new();
+    for row in &rows {
+        let e = parts
+            .entry((row.sb, row.part))
+            .or_insert((0, false, row.mime.clone()));
+        e.0 += row.len;
+        e.1 |= row.is_init;
     }
     if parts.is_empty() {
         eprintln!("mux: index is empty");
         return 1;
     }
 
-    let mut ids: Vec<_> = parts.keys().copied().collect();
+    // Adaptive players often start at a low quality and switch after the
+    // first segment, which starts a new part. Pick, per SourceBuffer, the
+    // decodable part (has an init segment) with the most bytes.
+    let mut ids: Vec<u32> = parts.keys().map(|(sb, _)| *sb).collect();
     ids.sort_unstable();
+    ids.dedup();
     let mut inputs = Vec::new();
     for id in &ids {
-        let (max_part, has_init, mime) = &parts[id];
-        if !has_init {
-            eprintln!("mux: sb{id} ({mime}) has no init segment in part 0; the file will not decode. Capture with the hook active from page load.");
+        let mut candidates: Vec<_> = parts
+            .iter()
+            .filter(|((sb, _), _)| sb == id)
+            .map(|((_, part), v)| (*part, v))
+            .collect();
+        candidates.sort_unstable_by_key(|(part, _)| *part);
+        let total = candidates.len();
+        let best = candidates
+            .iter()
+            .filter(|(_, (_, has_init, _))| *has_init)
+            .max_by_key(|(_, (bytes, _, _))| *bytes);
+        let Some((part, (bytes, _, mime))) = best else {
+            eprintln!("mux: sb{id} has no part with an init segment; skipped. Capture with the hook active from page load.");
+            continue;
+        };
+        if total > 1 {
+            eprintln!(
+                "mux: sb{id} has {total} parts (codec/quality changes); using part {part} ({bytes} bytes, {mime})"
+            );
         }
-        if *max_part > 0 {
-            eprintln!("mux: sb{id} has {} parts (codec/quality changes); only part 0 is muxed in this spike", max_part + 1);
+        let part_rows: Vec<&IndexRow> = rows
+            .iter()
+            .filter(|r| r.sb == *id && r.part == *part)
+            .collect();
+        match ordered_part(&dir, *id, *part, &part_rows) {
+            Ok(p) => inputs.push(p),
+            Err(e) => {
+                eprintln!("mux: sb{id}.p{part}: cannot reorder segments: {e}");
+                return 1;
+            }
         }
-        inputs.push(dir.join(format!("sb{id}.p0.bin")));
+    }
+    if inputs.is_empty() {
+        eprintln!("mux: nothing decodable to mux");
+        return 1;
     }
 
     let mut cmd = Command::new("ffmpeg");

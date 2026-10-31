@@ -45,11 +45,20 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
 target/release/streamtap-sink mux captures/<dir> [--out file.mp4]
 ```
 
-Runs `ffmpeg -i sb1.p0.bin [-i sb2.p0.bin …] -c copy -movflags +faststart`.
-Only part 0 of each SourceBuffer is muxed in this spike; the command warns
-when more parts exist or when part 0 has no init segment (capture started
-after the player had already appended it, which the extension avoids by
-running at `document_start`).
+Runs `ffmpeg -i <video part> -i <audio part> -c copy -movflags +faststart`.
+
+- **Which part:** per SourceBuffer the part with an init segment and the
+  most bytes. Adaptive players often start at a low quality and switch after
+  the first segment, so part 0 can be a single segment. The other parts are
+  named in a warning and left out (spike limit).
+- **Order:** the sink writes in arrival order. After a backward seek that is
+  not the timeline order, so `mux` writes `sbN.pM.sorted.bin` (init segment
+  first, then media segments by ascending `tfdt`) and muxes that instead.
+- **Gaps:** ranges skipped by a forward seek are reported with their
+  approximate length.
+- A SourceBuffer without any init segment is skipped (capture started after
+  the player had appended it; the extension avoids this by running at
+  `document_start`).
 
 ## Wire format
 
@@ -85,11 +94,17 @@ ffprobe captures/<dir>/out.mp4
 Result on 2026-10-30: 8 segments written, 2 duplicates dropped, `mux: ok`,
 ffprobe reports h264 640×360 + aac 48 kHz, 6.08 s.
 
+First real-browser run (Chrome, ARD Mediathek, 2026-10-31): one session,
+H.264 1280×720 + AAC, 630 s after reordering, full decode without errors.
+
 ## Deferred from the NEW_PROJECT gate (rules-vault, native)
 
 Done: loopback bind, token before any write, hard size limits, workspace
 lints, no shell for the ffmpeg child, no heredocs for docs, LICENSE.
 Not yet (spike): `deny.toml` / `cargo audit` in CI, Windows CI runner (repo is
 private), security tests as raw TCP bytes before the first route (`TST-01`),
-child-process timeout for ffmpeg (`RS-04`), error enum (`RS-05`), the
-Tauri shell and UI. These come with the MVP, not with the spike.
+read and handshake timeouts, child-process timeout for ffmpeg (`RS-04`),
+error enum (`RS-05`), the token on the command line (visible to other
+processes; pairing replaces it), the core/sink/testkit split, the Tauri
+shell and UI. The security tests, CI and the split come first, before new
+features.

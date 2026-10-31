@@ -14,9 +14,10 @@ alone, by design.
 
 - Spike 1 (done): the extension logs what players feed into MSE. See
   [extension/README.md](extension/README.md).
-- Spike 2 (sink done, browser run pending): `desktop/streamtap-sink` receives
-  segments over a loopback WebSocket, writes them per SourceBuffer and remuxes
-  with `ffmpeg -c copy`. See [desktop/README.md](desktop/README.md).
+- Spike 2 (done, verified in Chrome on 2026-10-31): `desktop/streamtap-sink`
+  receives segments over a loopback WebSocket, writes them per SourceBuffer
+  and remuxes with `ffmpeg -c copy`, reordering after seeks. See
+  [desktop/README.md](desktop/README.md).
 
 Layout:
 
@@ -33,8 +34,7 @@ streamtap/
 
 1. Spike 1: hook sees segments, timeline parses (done, see extension README).
 2. Spike 2: segments streamed binary to a local Rust server, written per
-   SourceBuffer, `ffmpeg -c copy` yields a playable MP4 (sink verified with a
-   test client; first real-browser run pending).
+   SourceBuffer, `ffmpeg -c copy` yields a playable MP4 (done).
 3. MVP: desktop app with a tab/video list, background capture mode, DRM flag.
 4. Later: download modes (yt-dlp, manifest replay), tab capture, live ring
    buffer, Firefox.
