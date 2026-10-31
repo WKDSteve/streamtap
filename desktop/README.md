@@ -78,7 +78,8 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   (also without a `tfdt`).
 - An init is decided once it is complete: its chunks (an init split across
   appends: chunks the extension flags `initCont`, or untimed chunks while the
-  init has no complete `moov` / `Tracks` yet) are held, up to 4 MiB, until
+  init has no complete `moov` / `Tracks` yet) are held, up to 4 MiB with
+  512 bytes counted per chunk for its header, until
   the next media, then compared as a whole. After a complete init an untimed
   chunk (a segment cut inside its `moof`) is media.
 - A repeated, identical init is skipped. A **different** init (codec or
@@ -163,22 +164,28 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   (MSE coded frame processing), per SourceBuffer over all its parts in
   arrival order, so an ABR switch and back keeps one timeline. After the
   player set `timestampOffset` (`tsoSet`, a seek or a resync as Shaka does
-  it) the append starts at that offset; otherwise at its `tfdt` plus the
+  it) the append's first presentation time goes to that offset (its `tfdt`
+  plus the first sample's composition offset, minus the edit list's
+  `media_time`); otherwise it starts at its `tfdt` plus the
   offset in effect, unless that does not continue within 100 ms of where the
   previous append ended (a discontinuity, a new period restarting `tfdt`):
   then right there, as the browser does, and these are counted. A seek
   without a set offset therefore plays after what came before it, as in the
   browser; a seek with one keeps its place and its gap is reported. Moved
-  segments get their `tfdt` rewritten. Without `tfdt`, durations and
-  timescale on every segment this cannot be done: the arrival order is kept,
-  which is warned. The first append keeps its own time (the browser may start
+  segments get their `tfdt` rewritten. A segment without `tfdt`, duration or
+  timescale ends the group (the next one is not checked against it); a part
+  with such a segment keeps its arrival order, which is warned. When a frame
+  would decode before 0 (B-frames at a set offset, a negative
+  `timestampOffset`), every SourceBuffer is moved later by the same amount,
+  which is said, so they stay aligned. The first append keeps its own time (the browser may start
   it at 0; the alignment between SourceBuffers is relative anyway).
 - **Gaps:** ranges skipped by a forward seek are reported with their
   approximate length.
 - **Lost inits:** when the extension had to drop an init (its queue was
   full), it takes nothing more of that SourceBuffer until the next init and
   sends `initlost`; the sink notes it in `events.jsonl` and `mux` says that
-  the capture of that SourceBuffer ends there.
+  the media of that SourceBuffer between the lost init and its next init is
+  not captured.
 - A bad `index.jsonl` line (an interrupted sink) is skipped, not fatal.
 - A SourceBuffer without any init segment is skipped (capture started after
   the player had appended it; the extension avoids this by running at

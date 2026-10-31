@@ -615,10 +615,12 @@
     } catch (e) {
       tso = null;
     }
-    // The player set timestampOffset since the last append: in sequence mode
-    // the browser starts this append at that offset.
-    const tsoSet = !!info.tsoSet;
-    info.tsoSet = false;
+    // The player set timestampOffset since the last media append: in
+    // sequence mode the browser starts this media at that offset. Init bytes
+    // in between do not use it up.
+    const media = !isInit && !initCont;
+    const tsoSet = media && !!info.tsoSet;
+    if (media) info.tsoSet = false;
 
     // WebM Cluster timecodes count in the init's TimecodeScale (1 ms when the
     // init did not say otherwise).
@@ -723,12 +725,15 @@
     patch(SourceBuffer.prototype, "timestampOffset", (d) => ({
       set: function (v) {
         const info = sbInfo.get(this);
+        // A set the browser rejects (while updating, a non-finite value)
+        // changes nothing: only a set that took counts.
+        const result = d.set.call(this, v);
         if (info) {
           info.tsoSet = true;
           log(`SourceBuffer #${info.id} timestampOffset = ${v}`);
           post("timestampoffset", { sbId: info.id, value: v });
         }
-        return d.set.call(this, v);
+        return result;
       },
     }));
   }

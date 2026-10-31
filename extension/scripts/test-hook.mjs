@@ -323,6 +323,11 @@ sb13.appendBuffer(ab(media(0)));
 check(last().tsoSet === true && last().tso === 4, "a set timestampOffset is flagged");
 sb13.appendBuffer(ab(media(90000)));
 check(last().tsoSet === false, "only on the append right after it");
+sb13.timestampOffset = 8;
+sb13.appendBuffer(ab(init("avc1")));
+check(last().isInit === true && last().tsoSet === false, "an init append does not use it up");
+sb13.appendBuffer(ab(media(0)));
+check(last().tsoSet === true, "the media after the init carries it");
 
 // A short tail of media, then an init: both posted on their own, the init intact.
 const sb14 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');

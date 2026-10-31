@@ -68,19 +68,31 @@ let sinkKeptTotal = 0;
 
 const blobsSize = (chunks) => (chunks ? chunks.reduce((n, b) => n + b.size, 0) : 0);
 
-// The kept init with the most bytes on any link but `except`, as [link, sb].
+// What to drop when the kept-init budget is full: the largest init of the
+// tab that keeps the most bytes, other than `except`'s tab, as [link, sb].
+// Shares are per tab, so a page cannot push another tab's init out with
+// many small forged ones.
 const largestKept = (except) => {
+  let tab = null;
+  let tabSize = 0;
+  for (const [tabId, m] of sinkLinks) {
+    if (tabId === except.tabId) continue;
+    let n = 0;
+    for (const l of m.values()) for (const chunks of l.inits.values()) n += blobsSize(chunks);
+    if (n > tabSize) {
+      tab = m;
+      tabSize = n;
+    }
+  }
+  if (!tab) return null;
   let best = null;
   let bestSize = 0;
-  for (const m of sinkLinks.values()) {
-    for (const l of m.values()) {
-      if (l === except) continue;
-      for (const [sb, chunks] of l.inits) {
-        const n = blobsSize(chunks);
-        if (n > bestSize) {
-          best = [l, sb];
-          bestSize = n;
-        }
+  for (const l of tab.values()) {
+    for (const [sb, chunks] of l.inits) {
+      const n = blobsSize(chunks);
+      if (n > bestSize) {
+        best = [l, sb];
+        bestSize = n;
       }
     }
   }
@@ -108,6 +120,8 @@ const linkKeep = (link, sb, chunks) => {
       break;
     }
     linkKeep(victim[0], victim[1], null);
+    // A new socket of that link cannot replay it: said then (initlost).
+    victim[0].evicted.add(victim[1]);
   }
   link.inits.delete(sb);
   if (chunks) link.inits.set(sb, chunks);
@@ -143,6 +157,7 @@ const linkConsumed = (link, item) => {
     return;
   }
   if (!item.isInit) return;
+  link.evicted.delete(item.sb);
   linkKeep(link, item.sb, [keep]);
   while (link.inits.size > SINK_MAX_KEPT_INITS) linkKeep(link, link.inits.keys().next().value, null);
 };
@@ -194,6 +209,14 @@ const linkConnect = async (link) => {
   ws.onopen = () => {
     openedAt = Date.now();
     ws.send(sinkFrame({ type: "hello", token: settings.token, ...link.hello }));
+    // An init that had to make room for another tab's cannot be replayed:
+    // that SourceBuffer waits for its next init, and the sink is told.
+    for (const sb of link.evicted) {
+      if (link.inits.has(sb)) continue;
+      link.lostInit.add(sb);
+      if (Number.isSafeInteger(sb) && sb >= 0) ws.send(sinkFrame({ type: "event", name: "initlost", sb }));
+    }
+    link.evicted.clear();
     // Every socket is a new capture directory on the sink, and the player
     // appended its init segments only once: send the ones in effect first
     // (an identical init in the queue is deduped by the sink).
@@ -303,6 +326,7 @@ chrome.runtime.onConnect.addListener((port) => {
     inits: new Map(), // sb -> [framed init, continuation...] in effect, replayed on every new socket
     lostInit: new Set(), // sb whose init was dropped: nothing until the next init
     gone: false, // the port's cleanup ran: nothing is kept any more
+    evicted: new Set(), // sb whose kept init made room for another tab's
     pending: [], // { blob, sb, isInit, initCont } while connecting
     pendingBytes: 0,
     sent: 0,

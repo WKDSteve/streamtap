@@ -253,8 +253,10 @@ struct IndexLine<'a> {
 /// Media segments remembered for dedupe, per session (all parts and tracks
 /// together): beyond this the session takes no more media.
 const MAX_SEEN_PER_SESSION: usize = 400_000;
-/// Init bytes held until the init is complete (an init split across appends).
+/// Init bytes held until the init is complete (an init split across appends),
+/// counting `PENDING_CHUNK_COST` for each chunk's header.
 const MAX_PENDING_INIT: usize = 4 * 1024 * 1024;
+const PENDING_CHUNK_COST: usize = 512;
 /// Part files per `SourceBuffer` (one per distinct init).
 const MAX_PARTS_PER_TRACK: u32 = 64;
 /// Budget charged for each part file (its directory entry and cluster).
@@ -440,21 +442,26 @@ fn init_prefix_len(kind: &str, payload: &[u8]) -> Option<usize> {
     // A box starts where the previous one ended (headers may be 8 or 16 bytes).
     // Only with a moof/mdat after it: an init+index range of a single-file
     // stream (ftyp moov sidx) is all init.
-    let boxes = boxes_in(payload, 0, payload.len());
-    let first_media = boxes
+    // A last box cut off (a chunked fetch) counts by its type, as in the
+    // hook: (type, start) of every box, complete or not.
+    let complete = boxes_in(payload, 0, payload.len());
+    let mut starts: Vec<([u8; 4], usize)> = Vec::with_capacity(complete.len() + 1);
+    let mut at = 0;
+    for (k, _, end) in &complete {
+        starts.push((*k, at));
+        at = *end;
+    }
+    if let Some(t) = payload.get(at + 4..at + 8) {
+        starts.push(([t[0], t[1], t[2], t[3]], at));
+    }
+    let first_media = starts.iter().position(|(k, _)| MEDIA_BOXES.contains(&k))?;
+    if !starts[first_media..]
         .iter()
-        .position(|(k, _, _)| MEDIA_BOXES.contains(&k))?;
-    if !boxes[first_media..]
-        .iter()
-        .any(|(k, _, _)| k == b"moof" || k == b"mdat")
+        .any(|(k, _)| k == b"moof" || k == b"mdat")
     {
         return None;
     }
-    let start = if first_media == 0 {
-        0
-    } else {
-        boxes[first_media - 1].2
-    };
+    let start = starts[first_media].1;
     (start > 0).then_some(start)
 }
 
@@ -741,7 +748,10 @@ fn handle_connection(
             (Header::Event { name, sb }, Some(s)) => {
                 println!("{}: event {name} sb={sb:?}", s.dir.display());
                 if let ("initlost", Some(sb)) = (name.as_str(), sb) {
-                    s.note_lost_init(sb)?;
+                    if let Err(e) = s.note_lost_init(sb) {
+                        eprintln!("{}: write failed, closing: {e}", s.dir.display());
+                        break;
+                    }
                 }
                 if name == "endofstream" {
                     s.finish();
@@ -836,6 +846,12 @@ impl TrackState {
             self.pending_done = done;
             self.pending_scan = next;
         }
+    }
+
+    /// Memory the pending init holds: its bytes plus each chunk's header
+    /// (a page can send it in 1-byte chunks).
+    fn pending_cost(&self) -> usize {
+        self.pending_whole.len() + self.pending.len() * PENDING_CHUNK_COST
     }
 
     /// Takes the pending chunks and their bytes, leaving nothing pending.
@@ -1203,13 +1219,13 @@ impl Session {
             track.pending_after_refusal = std::mem::take(&mut track.refused);
             track.init_kind.clone_from(&h.kind);
             track.push_pending(h, payload);
-            if track.pending_whole.len() > MAX_PENDING_INIT {
+            if track.pending_cost() > MAX_PENDING_INIT {
                 self.flush_init(h.sb)?;
             }
             return Ok(());
         }
         if continuation && !track.pending.is_empty() {
-            if track.pending_whole.len() + payload.len() <= MAX_PENDING_INIT {
+            if track.pending_cost() + payload.len() + PENDING_CHUNK_COST <= MAX_PENDING_INIT {
                 track.push_pending(h, payload);
                 return Ok(());
             }
@@ -1495,9 +1511,13 @@ type SeqMoves = HashMap<(u32, u64), i64>;
 /// offset, the group start. Otherwise it starts at its `tfdt` plus the offset
 /// in effect, unless that does not continue within 100 ms of where the
 /// previous append ended (a discontinuity, a new period restarting `tfdt`):
-/// then the browser starts it right there. Returns the moves and the number
-/// of discontinuities; `None` when a row lacks `tfdt`, duration or timescale.
-fn seq_layout(rows: &[&IndexRow]) -> Option<(SeqMoves, usize)> {
+/// then the browser starts it right there. The browser puts the first
+/// frame's presentation time at the group start: `leads` holds, per row, how
+/// far that lies after its `tfdt` (composition offset of the first sample
+/// minus the edit list's `media_time`). A row without `tfdt`, duration or
+/// timescale gets no move and ends the group (the next one is not checked
+/// against it). Returns the moves and the number of discontinuities.
+fn seq_layout(rows: &[&IndexRow], leads: &SeqMoves) -> (SeqMoves, usize) {
     const NS: i128 = 1_000_000_000;
     let mut moves = HashMap::new();
     let mut group_end: Option<i128> = None;
@@ -1508,13 +1528,15 @@ fn seq_layout(rows: &[&IndexRow]) -> Option<(SeqMoves, usize)> {
             r.dur.filter(|d| *d > 0),
             r.timescale.filter(|t| *t > 0),
         ) else {
-            return None;
+            group_end = None;
+            continue;
         };
         let ts = i128::from(ts);
         let t_ns = i128::from(t) * NS / ts;
         let tso_ns = i128::from(shift_ticks(r.tso, Some(1_000_000_000)));
         let start = if r.tso_set {
-            tso_ns
+            let lead = leads.get(&(r.part, r.offset)).copied().unwrap_or(0);
+            tso_ns - i128::from(lead) * NS / ts
         } else {
             let s = t_ns + tso_ns;
             match group_end {
@@ -1531,7 +1553,187 @@ fn seq_layout(rows: &[&IndexRow]) -> Option<(SeqMoves, usize)> {
         let clamped = ticks.clamp(i128::from(i64::MIN), i128::from(i64::MAX));
         moves.insert((r.part, r.offset), i64::try_from(clamped).expect("clamped"));
     }
-    Some((moves, jumps))
+    (moves, jumps)
+}
+
+/// Big-endian integer of `n` bytes (at most 8) at `at`.
+fn be_uint(b: &[u8], at: usize, n: usize) -> Option<u64> {
+    b.get(at..at + n)
+        .map(|x| x.iter().fold(0u64, |v, byte| (v << 8) | u64::from(*byte)))
+}
+
+/// Composition offset of the first sample of a media segment (first `trun`
+/// of the first `traf`), in its track's ticks; 0 when it has none.
+fn first_cto(seg: &[u8]) -> i64 {
+    let Some((_, ms, me)) = boxes_in(seg, 0, seg.len())
+        .into_iter()
+        .find(|(k, _, _)| k == b"moof")
+    else {
+        return 0;
+    };
+    let Some((_, ts, te)) = boxes_in(seg, ms, me)
+        .into_iter()
+        .find(|(k, _, _)| k == b"traf")
+    else {
+        return 0;
+    };
+    let Some((_, s, e)) = boxes_in(seg, ts, te)
+        .into_iter()
+        .find(|(k, _, _)| k == b"trun")
+    else {
+        return 0;
+    };
+    let trun = &seg[s..e];
+    let (Some(version), Some(flags)) = (be_uint(trun, 0, 1), be_uint(trun, 1, 3)) else {
+        return 0;
+    };
+    if flags & 0x800 == 0 {
+        return 0;
+    }
+    // sample_count, then optional data_offset and first_sample_flags, then
+    // the first sample's duration, size and flags before its offset.
+    let mut at = 8;
+    for (bit, len) in [(0x1, 4), (0x4, 4), (0x100, 4), (0x200, 4), (0x400, 4)] {
+        if flags & bit != 0 {
+            at += len;
+        }
+    }
+    let Some(raw) = be_uint(trun, at, 4) else {
+        return 0;
+    };
+    let raw = u32::try_from(raw).expect("4 bytes");
+    if version == 1 {
+        i64::from(i32::from_be_bytes(raw.to_be_bytes()))
+    } else {
+        i64::from(raw)
+    }
+}
+
+/// `media_time` of the first non-empty edit of the first track's edit list
+/// (`moov/trak/edts/elst`), in its media ticks; 0 without one.
+fn elst_media_time(init: &[u8]) -> i64 {
+    let find = |s: usize, e: usize, kind: &[u8; 4]| {
+        boxes_in(init, s, e)
+            .into_iter()
+            .find(|(k, _, _)| k == kind)
+            .map(|(_, s, e)| (s, e))
+    };
+    let Some((s, e)) = find(0, init.len(), b"moov")
+        .and_then(|(s, e)| find(s, e, b"trak"))
+        .and_then(|(s, e)| find(s, e, b"edts"))
+        .and_then(|(s, e)| find(s, e, b"elst"))
+    else {
+        return 0;
+    };
+    let elst = &init[s..e];
+    let v1 = elst.first() == Some(&1);
+    let count = be_uint(elst, 4, 4).unwrap_or(0);
+    let entry = if v1 { 16 } else { 8 };
+    for i in 0..count.min(16) {
+        let at = 8 + usize::try_from(i).expect("small") * entry;
+        let media_time = if v1 {
+            be_uint(elst, at + 8, 8).map(|v| i64::from_be_bytes(v.to_be_bytes()))
+        } else {
+            be_uint(elst, at + 4, 4).map(|v| {
+                i64::from(i32::from_be_bytes(
+                    u32::try_from(v).expect("4 bytes").to_be_bytes(),
+                ))
+            })
+        };
+        match media_time {
+            Some(-1) => {} // an empty edit
+            Some(t) => return t,
+            None => return 0,
+        }
+    }
+    0
+}
+
+/// The presentation lead (`seq_layout`) of every sequence-mode row appended
+/// right after a set `timestampOffset`: read from its segment and its part's
+/// init. Unreadable rows get none.
+fn seq_leads(dir: &Path, sb: u32, rows: &[&IndexRow]) -> SeqMoves {
+    let mut leads = HashMap::new();
+    let mut parts: Vec<u32> = rows
+        .iter()
+        .filter(|r| r.seq_mode && r.tso_set && !r.is_init)
+        .map(|r| r.part)
+        .collect();
+    parts.sort_unstable();
+    parts.dedup();
+    let mut buf = Vec::new();
+    for part in parts {
+        let Ok(mut src) = File::open(dir.join(format!("sb{sb}.p{part}.bin"))) else {
+            continue;
+        };
+        let mut init = Vec::new();
+        for r in rows.iter().filter(|r| r.part == part && r.is_init) {
+            if read_segment(&mut src, r, &mut buf).is_ok() {
+                init.extend_from_slice(&buf);
+            }
+        }
+        let media_time = elst_media_time(&init);
+        for r in rows
+            .iter()
+            .filter(|r| r.part == part && r.seq_mode && r.tso_set && !r.is_init)
+        {
+            if read_segment(&mut src, r, &mut buf).is_ok() {
+                leads.insert((part, r.offset), first_cto(&buf) - media_time);
+            }
+        }
+    }
+    leads
+}
+
+/// The sequence-mode layout of every `SourceBuffer` (`seq_layout`), and the
+/// lift (nanoseconds) for all of them. A frame placed by its offset may need
+/// a decode time before 0 (B-frames: at a set offset the browser puts the
+/// presentation time there; a negative `timestampOffset`), which an MP4
+/// cannot hold: then every `SourceBuffer` moves later by the same amount, so
+/// their alignment stays.
+fn seq_layouts(dir: &Path, rows: &[IndexRow], ids: &[u32]) -> (HashMap<u32, SeqMoves>, i64) {
+    const NS: i128 = 1_000_000_000;
+    let mut layouts = HashMap::new();
+    let mut earliest: i128 = 0;
+    for id in ids {
+        let sb_rows: Vec<&IndexRow> = rows.iter().filter(|r| r.sb == *id).collect();
+        let leads = seq_leads(dir, *id, &sb_rows);
+        let (moves, jumps) = seq_layout(&sb_rows, &leads);
+        if jumps > 0 {
+            eprintln!(
+                "mux: sb{id}: sequence mode: {jumps} discontinuity(ies) without a timestampOffset set; placed right after the previous append, as the browser does"
+            );
+        }
+        for r in sb_rows.iter().filter(|r| !r.is_init) {
+            let (Some(t), Some(ts)) = (r.tfdt, r.timescale.filter(|t| *t > 0)) else {
+                continue;
+            };
+            let m = if r.seq_mode {
+                moves.get(&(r.part, r.offset)).copied().unwrap_or(0)
+            } else {
+                shift_ticks(r.tso, Some(ts))
+            };
+            earliest = earliest.min((i128::from(t) + i128::from(m)) * NS / i128::from(ts));
+        }
+        layouts.insert(*id, moves);
+    }
+    let lift = i64::try_from((-earliest).clamp(0, i128::from(i64::MAX))).expect("clamped");
+    if lift > 0 {
+        eprintln!(
+            "mux: the earliest frame would decode {:.3} s before 0; every SourceBuffer is moved later by that",
+            Duration::from_nanos(lift.unsigned_abs()).as_secs_f64()
+        );
+    }
+    (layouts, lift)
+}
+
+/// `ns` nanoseconds as ticks of `ts`, rounded up (0 without a timescale).
+fn ns_ticks(ns: i64, ts: Option<u32>) -> i64 {
+    let Some(ts) = ts.filter(|t| *t > 0) else {
+        return 0;
+    };
+    let ticks = (i128::from(ns) * i128::from(ts) + 999_999_999) / 1_000_000_000;
+    i64::try_from(ticks.clamp(i128::from(i64::MIN), i128::from(i64::MAX))).expect("clamped")
 }
 
 fn read_segment(src: &mut File, r: &IndexRow, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -1632,6 +1834,7 @@ fn ordered_part(
     part: u32,
     rows: &[&IndexRow],
     seq_moves: Option<&SeqMoves>,
+    lift_ns: i64,
 ) -> io::Result<(PathBuf, Option<f64>, usize)> {
     let raw = dir.join(format!("sb{sb}.p{part}.bin"));
     let init: Vec<&IndexRow> = rows.iter().copied().filter(|r| r.is_init).collect();
@@ -1658,9 +1861,14 @@ fn ordered_part(
     let track_ts = trak_timescales(&init_bytes);
     // Sequence mode: placed where the browser placed it (`seq_layout`, over
     // all parts of the SourceBuffer); without that layout the arrival order.
-    let seq_ok = seq_moves.is_some() || !media.iter().any(|r| r.seq_mode);
+    let seq_ok = media
+        .iter()
+        .filter(|r| r.seq_mode)
+        .all(|r| seq_moves.is_some_and(|m| m.contains_key(&(part, r.offset))));
+    // Every SourceBuffer moves by the same lift, so none decodes before 0.
+    let lift = ns_ticks(lift_ns, ts);
     let offset = |r: &IndexRow| {
-        if r.seq_mode {
+        lift + if r.seq_mode {
             seq_moves
                 .and_then(|m| m.get(&(part, r.offset)))
                 .copied()
@@ -1738,7 +1946,9 @@ fn ordered_part(
             return 0;
         }
         match (r.seq_mode, tid.and_then(|t| track_ts.get(&t))) {
-            (false, Some(&t)) if tracks > 1 => shift_ticks(r.tso, Some(t)),
+            (false, Some(&t)) if tracks > 1 => {
+                shift_ticks(r.tso, Some(t)) + ns_ticks(lift_ns, Some(t))
+            }
             (true, Some(&t)) if tracks > 1 => rescale(offset(r), ts, t),
             _ => delta(r),
         }
@@ -1871,7 +2081,7 @@ fn report_lost_inits(dir: &Path) {
     lost.dedup();
     for sb in lost {
         eprintln!(
-            "mux: sb{sb}: the extension dropped an init (its queue was full); what came after it is not captured"
+            "mux: sb{sb}: the extension dropped an init (its queue was full); the media between it and the next init of sb{sb} is not captured"
         );
     }
 }
@@ -1978,6 +2188,7 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
     let mut ids: Vec<u32> = parts.keys().map(|(sb, _)| *sb).collect();
     ids.sort_unstable();
     ids.dedup();
+    let (layouts, lift) = seq_layouts(dir, rows, &ids);
     let mut inputs = Vec::new();
     for id in &ids {
         let mut candidates: Vec<_> = parts
@@ -2002,12 +2213,8 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
             );
         }
         let sb_rows: Vec<&IndexRow> = rows.iter().filter(|r| r.sb == *id).collect();
-        let seq = seq_layout(&sb_rows);
-        if let Some((_, jumps)) = seq.as_ref().filter(|(_, j)| *j > 0) {
-            eprintln!(
-                "mux: sb{id}: sequence mode: {jumps} discontinuity(ies) without a timestampOffset set; placed right after the previous append, as the browser does"
-            );
-        }
+        let no_moves = SeqMoves::new();
+        let seq_moves = layouts.get(id).unwrap_or(&no_moves);
         let part_rows: Vec<&IndexRow> = sb_rows
             .iter()
             .copied()
@@ -2017,9 +2224,8 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
             .iter()
             .find(|r| r.is_init)
             .map_or("", |r| r.kind.as_str());
-        let moves = seq.as_ref().map(|(m, _)| m);
-        let (path, start, traks) =
-            ordered_part(dir, *id, *part, &part_rows, moves).map_err(|e| {
+        let (path, start, traks) = ordered_part(dir, *id, *part, &part_rows, Some(seq_moves), lift)
+            .map_err(|e| {
                 SinkError::io(format!("sb{id}.p{part}: cannot reorder segments"), None, e)
             })?;
         // An MP4 init without a complete moov (cut short) cannot be decoded,
@@ -2426,9 +2632,9 @@ mod tests {
     fn order(dir: &Path, rows: &[IndexRow]) -> (Vec<u8>, PathBuf, Option<f64>) {
         let refs: Vec<&IndexRow> = rows.iter().collect();
         // As mux_inputs does: the sequence-mode layout over the SourceBuffer.
-        let seq = seq_layout(&refs);
-        let moves = seq.as_ref().map(|(m, _)| m);
-        let (path, start, _) = ordered_part(dir, 1, 0, &refs, moves).expect("ordered");
+        let leads = seq_leads(dir, 1, &refs);
+        let (moves, _) = seq_layout(&refs, &leads);
+        let (path, start, _) = ordered_part(dir, 1, 0, &refs, Some(&moves), 0).expect("ordered");
         (fs::read(&path).expect("read"), path, start)
     }
 
@@ -3563,7 +3769,7 @@ built with gcc"),
         let tfdts: Vec<u32> = got[init.len()..].chunks(32).map(tfdt_of).collect();
         assert_eq!(tfdts, [0, 1000, 2000, 3000, 4000, 5000], "in time order");
         let refs: Vec<&IndexRow> = rows.iter().collect();
-        let (moves, jumps) = seq_layout(&refs).expect("layout");
+        let (moves, jumps) = seq_layout(&refs, &HashMap::new());
         assert_eq!(jumps, 0, "no discontinuity");
         assert!(
             moves.values().all(|m| *m == 0),
@@ -3598,7 +3804,7 @@ built with gcc"),
         first.seq_mode = true;
         rows.insert(0, first);
         let refs: Vec<&IndexRow> = rows.iter().collect();
-        let (moves, jumps) = seq_layout(&refs).expect("layout");
+        let (moves, jumps) = seq_layout(&refs, &HashMap::new());
         assert_eq!(jumps, 0);
         assert!(moves.values().all(|m| *m == 0), "{moves:?}");
     }
@@ -3618,6 +3824,52 @@ built with gcc"),
         assert!(!done);
         assert_eq!(at, 12, "after the complete ftyp");
         assert!(init_scan("mp4", &init, at).0);
+    }
+
+    #[test]
+    fn a_set_offset_places_the_first_presentation_time() {
+        // trun with duration and composition offset: the first frame shows
+        // 80 ticks after its decode time.
+        let mut trun = vec![0, 0, 0x09, 0x00]; // v0, duration + cto
+        trun.extend(1u32.to_be_bytes());
+        trun.extend(40u32.to_be_bytes());
+        trun.extend(80u32.to_be_bytes());
+        let seg = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"trun", &trun)));
+        assert_eq!(first_cto(&seg), 80);
+        assert_eq!(first_cto(&moof(0)), 0, "no trun");
+
+        let mut r = row(0, 32, false, Some(1000), Some(4.0));
+        r.seq_mode = true;
+        r.tso_set = true;
+        r.dur = Some(1000);
+        let leads: SeqMoves = HashMap::from([((0, 0), 80)]);
+        let (moves, _) = seq_layout(&[&r], &leads);
+        // PTS (1000 + 80) at 4 s: tfdt goes to 3920.
+        assert_eq!(moves[&(0, 0)], 2920);
+    }
+
+    #[test]
+    fn a_cut_moof_still_splits_a_combined_append() {
+        let init = init_with_traks(1);
+        let mut v = init.clone();
+        v.extend(mp4_box(*b"styp", b"msdh"));
+        v.extend(&moof(0)[..12]); // header says 40 bytes, 12 arrived
+        assert_eq!(init_prefix_len("mp4", &v), Some(init.len()));
+    }
+
+    #[test]
+    fn pending_chunks_count_their_header() {
+        // An ftyp-only init, then 1-byte chunks: each costs its header too.
+        let mut s = session("pendcost");
+        write(
+            &mut s,
+            &seg(1, true, None, None),
+            &mp4_box(*b"ftyp", b"iso6"),
+        );
+        for _ in 0..(MAX_PENDING_INIT / PENDING_CHUNK_COST + 10) {
+            write(&mut s, &seg(1, false, None, None), b"x");
+        }
+        assert!(s.tracks[&1].pending_cost() <= MAX_PENDING_INIT);
     }
 
     #[test]
