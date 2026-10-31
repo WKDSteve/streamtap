@@ -19,3 +19,7 @@ Thumbs.db
 *.webm
 *.ts
 captures/
+
+# Extension signing keys and packed builds: never in the repository.
+*.pem
+*.crx
