@@ -94,40 +94,43 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (typeof tabId !== "number") return false;
   const t = tabState(tabId, sender.tab.url);
 
-  if (msg.kind === "vc-frame") {
-    if (t.frames.size < MAX_FRAMES_PER_TAB) t.frames.add(String(msg.frameUrl));
-    return false;
-  }
-  if (msg.kind !== "vc-event") return false;
+  if (msg.kind !== "vc-event" || !msg.event || typeof msg.event !== "object") return false;
 
   const e = msg.event;
+  // Strings are bounded here as well as in content.js; the frame URL comes
+  // from the browser, not from the record.
+  const cut = (v, n) => String(v ?? "").slice(0, n);
+  const frameUrl = cut(sender.url || e.frameUrl, 2048);
   t.events++;
 
   switch (e.type) {
+    case "frame":
+      if (t.frames.size < MAX_FRAMES_PER_TAB) t.frames.add(frameUrl);
+      break;
     case "mediasource":
-      msState(t, e.frameUrl, e.msId);
+      msState(t, frameUrl, e.msId);
       break;
     case "objecturl":
-      msState(t, e.frameUrl, e.msId).blobUrl = e.url;
+      msState(t, frameUrl, e.msId).blobUrl = cut(e.url, 512);
       break;
     case "sourcebuffer":
-      sbState(msState(t, e.frameUrl, e.msId), e.sbId, e.mime);
+      sbState(msState(t, frameUrl, e.msId), e.sbId, cut(e.mime, 256));
       break;
     case "changetype": {
       for (const m of t.ms.values()) {
         const s = m.sb.get(e.sbId);
         if (s) {
           if (s.mimes.length < MAX_MIMES) s.mimes.push(s.mime);
-          s.mime = e.mime;
+          s.mime = cut(e.mime, 256);
         }
       }
       break;
     }
     case "append": {
-      const s = sbState(msState(t, e.frameUrl, e.msId), e.sbId, e.mime);
+      const s = sbState(msState(t, frameUrl, e.msId), e.sbId, cut(e.mime, 256));
       s.appends++;
       s.bytes += Number(e.bytes) || 0;
-      s.kind = e.kind;
+      s.kind = cut(e.kind, 16);
       if (e.isInit) s.inits++;
       else s.media++;
       if (Number.isFinite(e.startSec)) {
@@ -140,17 +143,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       break;
     }
     case "endofstream":
-      for (const m of t.ms.values()) if (m.msId === e.msId && m.frameUrl === e.frameUrl) m.ended = true;
+      for (const m of t.ms.values()) if (m.msId === e.msId && m.frameUrl === frameUrl) m.ended = true;
       break;
     case "drm":
       if (t.drm.length < 50) {
-        t.drm.push({ keySystem: String(e.keySystem), robustness: Array.isArray(e.robustness) ? e.robustness : [], frameUrl: e.frameUrl });
+        const robustness = Array.isArray(e.robustness) ? e.robustness.slice(0, 10).map((r) => cut(r, 64)) : [];
+        t.drm.push({ keySystem: cut(e.keySystem, 128), robustness, frameUrl });
       }
       break;
     case "encrypted":
       // Encrypted media seen in a SourceBuffer: not tapped (hook.js).
       if (t.drm.length < 50) {
-        t.drm.push({ keySystem: `encrypted media in SourceBuffer #${e.sbId}`, robustness: [], frameUrl: e.frameUrl });
+        t.drm.push({ keySystem: `encrypted media in SourceBuffer #${cut(e.sbId, 12)}`, robustness: [], frameUrl });
       }
       break;
     default:

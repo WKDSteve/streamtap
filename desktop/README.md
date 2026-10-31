@@ -23,7 +23,7 @@ as `warn` (clean, tests included), rustfmt with Unix newlines.
 
 ```
 target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captures]
-    [--allow-origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia]
+    [--allow-origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia] [--max-session-gib 16]
 ```
 
 - Binds **127.0.0.1 only**; there is no flag to bind anything else.
@@ -40,25 +40,37 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   URL from the browser, title; written atomically), `sbN.pM.bin` (one file
   per SourceBuffer `N` and init-segment part `M`) and `index.jsonl` (one line
   per written segment, written in one call: offset, length, MediaSource,
-  `tfdt`, timescale, `timestampOffset`, MIME).
-- Limits: 64 KiB JSON header, 64 MiB per message (larger messages close the
-  connection), 32 SourceBuffers per session. A malformed message after
-  `hello` is skipped and logged (a page can forge the hook's records); more
-  than 100 close the connection. Before `hello` any bad message closes it.
-- **DRM:** an init segment that declares protection (`encv`, `enca`, `tenc`,
-  `pssh`) is not written, nor anything after it on that SourceBuffer until a
-  clear init segment arrives. The extension does not send such segments in
-  the first place; this is the second line.
+  `tfdt`, timescale, duration, `timestampOffset`, sequence mode, MIME). The
+  extension opens one connection per MediaSource, so one directory is one
+  video.
+- Limits: 64 KiB JSON header, 64 MiB per message and per WebSocket frame
+  (larger close the connection), 32 SourceBuffers per session, 16 GiB written
+  per session (`--max-session-gib`; then nothing more is written and it is
+  logged once). A malformed message after `hello` is skipped and logged (a
+  page can forge the hook's records); more than 100 close the connection.
+  Before `hello` any bad message closes it. Every way a connection ends
+  prints the per-SourceBuffer summary.
+- **DRM:** a segment that carries protection is not written, nor anything
+  after it on that SourceBuffer until a clear init segment arrives: an init
+  (or any top-level `moov`) declaring `encv`/`enca`/`tenc`/`pssh`, a `pssh`
+  box, sample encryption (`senc`) in a `moof`, or a WebM init with
+  `ContentEncryption`. The extension does not send such segments in the first
+  place; this is the second line.
 
 ### Dedupe and parts
 
-- A media segment whose (`tfdt`, `timestampOffset`) was already written for
-  that SourceBuffer part is skipped (players re-fetch ranges after seeks).
-  The offset matters: multi-period DASH and HLS discontinuities restart
-  `tfdt` and move the timeline with `timestampOffset` instead.
+- A media segment whose (`tfdt`, `timestampOffset`, duration) was already
+  written for that SourceBuffer part is skipped (players re-fetch ranges
+  after seeks). The offset matters: multi-period DASH and HLS discontinuities
+  restart `tfdt` and move the timeline with `timestampOffset` instead. In
+  sequence mode (`seqMode`) there is no `tfdt` dedupe: the browser ignores
+  `tfdt` there.
+- The untimed continuation chunks (no `moof`) of a skipped duplicate are
+  skipped too, or they would land as orphan bytes.
 - A repeated, byte-identical init segment is skipped.
 - A **different** init segment (codec or quality change, `changeType`) starts
-  a new part file `sbN.p(M+1).bin`.
+  a new part file `sbN.p(M+1).bin`. So does the first init when media came
+  before it (the hook attached late): that media stays alone in part 0.
 
 ## Mux
 
@@ -66,9 +78,17 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
 target/release/streamtap-sink mux captures/<dir> [--out file.mp4]
 ```
 
-Runs `ffmpeg -i <video part> -i <audio part> -map 0 -map 1 -c copy -movflags +faststart`
-(explicit `-map`: every stream of every input).
+Runs `ffmpeg -f mp4 -protocol_whitelist file [-itsoffset <s>] -i <part> … -map 0 -map 1 … -c copy -movflags +faststart`.
 
+- **Inputs are checked and forced:** a part must start like its kind (`ftyp`,
+  `moov` or `styp` for MP4, the EBML magic for WebM) and ffmpeg gets the
+  demuxer explicitly (`-f mp4` / `-f matroska`) with files only. The bytes come
+  from the page; probing would follow whatever they claim to be (an MPD or a
+  playlist pulls in other files). A part that fails the check is skipped.
+- **Alignment:** ffmpeg moves every input to start at 0. Each input gets
+  `-itsoffset` = its first presentation time minus the earliest one, so a
+  video part that starts later (after a quality switch) stays in sync with
+  the audio.
 - **Which MediaSource:** one MediaSource is one video. A preroll ad, the next
   video of a single-page app or a hover preview add more to the same
   session; `mux` takes the one with the most bytes and names the others.
@@ -79,15 +99,20 @@ Runs `ffmpeg -i <video part> -i <audio part> -map 0 -map 1 -c copy -movflags +fa
 - **Order:** the sink writes in arrival order. Unless the part already is
   init-first and in timeline order, `mux` writes `sbN.pM.sorted.bin`: init
   segment first, then media segments by presentation time (`tfdt` plus
-  `timestampOffset`). Segments moved by a `timestampOffset` get their `tfdt`
-  rewritten so the timeline stays monotonic. Without a `tfdt` on every media
-  segment (WebM blocks, continuation chunks) the arrival order is kept.
+  `timestampOffset` in ticks, computed exactly). Segments moved by a
+  `timestampOffset` get their `tfdt` rewritten so the timeline stays
+  monotonic; not in a SourceBuffer with several tracks (each `traf` counts in
+  its own timescale), which is warned. With durations on all segments, one
+  that earlier ones fully cover (an LL-HLS full segment after its parts) is
+  left out; partial overlaps are counted. Without a `tfdt` on every media
+  segment (WebM blocks, continuation chunks) or in sequence mode the arrival
+  order is kept.
 - **Gaps:** ranges skipped by a forward seek are reported with their
   approximate length.
 - A bad `index.jsonl` line (an interrupted sink) is skipped, not fatal.
 - A SourceBuffer without any init segment is skipped (capture started after
   the player had appended it; the extension avoids this by running at
-  `document_start`, and resends kept init segments after a reconnect).
+  `document_start`, and resends the init in effect on every new connection).
 
 ## Wire format
 
@@ -102,10 +127,13 @@ Headers:
 | `type` | fields | payload |
 |---|---|---|
 | `hello` | `token`, `session`, `url`, `title` | none; must be the first message |
-| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `kind`, `tfdt`, `timescale` (u32), `tso` (seconds) | the segment bytes exactly as passed to `appendBuffer` |
+| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode` | the segment bytes exactly as passed to `appendBuffer` |
 | `event` | `name` (`endofstream`, `changetype`), `sb` | none |
 
 ## Test without a browser
+
+`cargo test --release` runs the unit tests (dedupe, parts, DRM refusal,
+limits, ordering, shifting, overlap, input checks, alignment arguments).
 
 `scripts/test-sink.mjs` splits a fragmented MP4 into init + `moof`/`mdat`
 segments and streams them like the extension would, including one duplicate
@@ -122,13 +150,15 @@ ffprobe captures/<dir>/out.mp4
 
 `scripts/test-sink-link.mjs <file> --token <t> --captures <sink --out dir>`
 runs the extension's service-worker link (`extension/src/sink-link.js`) in
-Node with a mocked `chrome`, posting segments as `data:` URLs right after
-`hello` like the content script. Halfway it closes the socket as if the sink
-had restarted. It checks what the sink wrote: two capture directories, the
-second starting with the replayed init segment, nothing dropped.
+Node with a mocked `chrome` against a running sink and checks what the sink
+wrote, in three scenarios: a reconnect (the second directory starts with
+the replayed init), a first socket that fails (the dropped init still
+arrives), and a quality switch during a reconnect (old init before old
+media, new init before new media).
 Both clients send the extension origin (`--origin` to change it).
 `../extension/scripts/test-hook.mjs` checks the page hook in Node (DRM
-marking, tap switch, `timestampOffset`, corrupt WebM).
+marking and EME stop, split inits, tap switch, `timestampOffset`, first
+`tfdt`, 64-bit `tfdt`, sequence mode, rejected appends, corrupt WebM).
 
 Result on 2026-10-30: 8 segments written, 2 duplicates dropped, `mux: ok`,
 ffprobe reports h264 640×360 + aac 48 kHz, 6.08 s.

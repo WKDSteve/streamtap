@@ -53,9 +53,16 @@
 
   const u32 = (dv, off) => dv.getUint32(off);
   const u64 = (dv, off) => Number(dv.getBigUint64(off));
+  // A 64-bit decode time: a Number while exact, a decimal string above 2^53.
+  const u64Exact = (dv, off) => {
+    const v = dv.getBigUint64(off);
+    return v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString();
+  };
 
   // Iterate boxes in [start, end), calling fn(type, headerSize, bodyStart, bodyEnd).
-  const eachBox = (u8, dv, start, end, fn) => {
+  // A box that runs past `end` stops the walk; onOpen(type, missingBytes) is
+  // told about it (an init segment split across appends).
+  const eachBox = (u8, dv, start, end, fn, onOpen) => {
     let off = start;
     while (off + 8 <= end) {
       let size = u32(dv, off);
@@ -68,6 +75,7 @@
       } else if (size === 0) {
         size = end - off;
       }
+      if (size >= header && off + size > end && onOpen) onOpen(type, off + size - end);
       if (size < header || off + size > end) break;
       fn(type, header, off + header, off + size);
       off += size;
@@ -106,14 +114,22 @@
           // fullbox(4) + creation + modification (4+4 or 8+8) -> timescale
           out.timescale = u32(dv, bodyStart + (version === 1 ? 20 : 12));
         } else if (type === "tfdt") {
-          const version = u8[bodyStart];
-          out.tfdt = version === 1 ? u64(dv, bodyStart + 4) : u32(dv, bodyStart + 4);
+          // The first fragment's decode time is the append's start; later
+          // fragments (several moofs, or a second track) must not replace it.
+          if (out.tfdt === null) {
+            const version = u8[bodyStart];
+            out.tfdt = version === 1 ? u64Exact(dv, bodyStart + 4) : u32(dv, bodyStart + 4);
+          }
         } else if (type === "tfhd") {
           const flags = u32(dv, bodyStart) & 0xffffff;
+          out._track = u32(dv, bodyStart + 4);
+          if (out._firstTrack === undefined) out._firstTrack = out._track;
           let p = bodyStart + 8; // fullbox + track_ID
           if (flags & 0x000001) p += 8; // base_data_offset
           if (flags & 0x000002) p += 4; // sample_description_index
           out._defaultDuration = flags & 0x000008 ? u32(dv, p) : null;
+        } else if (type === "trun" && out._track !== out._firstTrack) {
+          // Duration counts the first track only (one timescale).
         } else if (type === "trun") {
           const flags = u32(dv, bodyStart) & 0xffffff;
           const count = u32(dv, bodyStart + 4);
@@ -136,7 +152,9 @@
         }
 
         if (CONTAINERS.has(type)) walk(bodyStart, bodyEnd, depth + 1);
-      });
+      }, depth === 0 ? (type, missing) => {
+        if (type === "moov") out.openMoov = missing;
+      } : null);
     };
 
     try {
@@ -150,6 +168,8 @@
       out.encrypted = hasAnyFourcc(u8, out.moov[0], out.moov[1], ENCRYPTION_FOURCCS);
     }
     delete out._defaultDuration;
+    delete out._track;
+    delete out._firstTrack;
     delete out.moov;
     return out;
   };
@@ -244,7 +264,9 @@
     }
     if (u8.byteLength >= 4) {
       const id = ((u8[0] << 24) | (u8[1] << 16) | (u8[2] << 8) | u8[3]) >>> 0;
-      if (id === 0x1a45dfa3 || id === 0x1f43b675 || id === 0x18538067) return "webm";
+      // EBML, Cluster, Segment, Tracks, Info (an init split across appends
+      // can start with Tracks or Info).
+      if ([0x1a45dfa3, 0x1f43b675, 0x18538067, 0x1654ae6b, 0x1549a966].includes(id)) return "webm";
     }
     if (u8[0] === 0x47 && u8[188] === 0x47) return "ts";
     return "unknown";
@@ -278,9 +300,42 @@
       msInfo.set(ms, info);
       post("mediasource", { msId: info.id });
       log(`MediaSource #${info.id} created`);
+      // A closed MediaSource is done: content.js ends its sink session.
+      try {
+        ms.addEventListener("sourceclose", () => post("msclose", { msId: info.id }));
+      } catch (e) {
+        // not an EventTarget in some test stand-ins
+      }
     }
     return info;
   };
+
+  // ---------------------------------------------------------------------------
+  // EME in this frame: stop tapping altogether
+  // ---------------------------------------------------------------------------
+
+  // Real DRM playback needs MediaKeys on the media element, and the browser
+  // fires "encrypted" when it meets protection data in appended media. Either
+  // one switches this frame to metadata only for good, whatever the per-
+  // segment markers say (an init split across appends, clear lead, cbcs).
+  let emeActive = false;
+  const markEme = (why) => {
+    if (emeActive) return;
+    emeActive = true;
+    post("drm", { keySystem: why, robustness: [] });
+    log(`EME active (${why}); not tapping this frame any more`);
+  };
+  if (typeof HTMLMediaElement !== "undefined" && HTMLMediaElement.prototype.setMediaKeys) {
+    patch(HTMLMediaElement.prototype, "setMediaKeys", (d) => ({
+      value: function (mediaKeys) {
+        if (mediaKeys) markEme("setMediaKeys");
+        return d.value.call(this, mediaKeys);
+      },
+    }));
+  }
+  if (typeof document !== "undefined" && document.addEventListener) {
+    document.addEventListener("encrypted", () => markEme("encrypted event"), true);
+  }
 
   if (typeof MediaSource !== "undefined") {
     patch(MediaSource.prototype, "addSourceBuffer", (d) => ({
@@ -323,11 +378,23 @@
     const parsed = kind === "mp4" ? parseIsoBmff(u8) : kind === "webm" ? parseWebm(u8) : null;
     if (parsed && parsed.timescale) info.timescale = parsed.timescale;
 
-    // DRM: an encrypted init segment marks the SourceBuffer as protected until
-    // a clear init segment arrives; encrypted media (senc) marks it too. Its
-    // bytes are never copied: streamtap detects DRM and leaves it alone.
-    if (parsed && parsed.isInit) info.encrypted = !!parsed.encrypted;
-    else if (parsed && parsed.encrypted) info.encrypted = true;
+    // DRM: protection markers in an init segment (also one whose moov did not
+    // fit this append: then the whole small buffer is scanned) or in media
+    // (senc) mark the SourceBuffer as protected for good. Its bytes are never
+    // copied: streamtap detects DRM and leaves it alone.
+    let encryptedHere = !!(parsed && parsed.encrypted);
+    if (!encryptedHere && kind === "mp4" && parsed && parsed.isInit && u8.byteLength <= 4 * 1024 * 1024) {
+      encryptedHere = hasAnyFourcc(u8, 0, u8.byteLength, ENCRYPTION_FOURCCS);
+    }
+    // The rest of a moov that did not fit the previous append: this append
+    // starts with it, without box headers the parser could recognise.
+    if (info.openMoov > 0) {
+      const rest = Math.min(info.openMoov, u8.byteLength);
+      if (!encryptedHere) encryptedHere = hasAnyFourcc(u8, 0, rest, ENCRYPTION_FOURCCS);
+      info.openMoov -= rest;
+    }
+    if (parsed && parsed.openMoov > 0 && parsed.openMoov <= 4 * 1024 * 1024) info.openMoov = parsed.openMoov;
+    if (encryptedHere) info.encrypted = true;
     if (info.encrypted && !info.encryptedReported) {
       info.encryptedReported = true;
       post("encrypted", { sbId: info.id, msId: info.msId, mime: info.mime });
@@ -335,14 +402,17 @@
     }
 
     let tso = null;
+    let seqMode = false;
     try {
       tso = Number(sb.timestampOffset);
       if (!Number.isFinite(tso)) tso = null;
+      seqMode = sb.mode === "sequence";
     } catch (e) {
       tso = null;
     }
 
     const ts = info.timescale;
+    const tfdtNum = parsed && parsed.tfdt !== null ? Number(parsed.tfdt) : null;
     const rec = {
       sbId: info.id,
       msId: info.msId,
@@ -355,9 +425,11 @@
       boxes: parsed ? parsed.boxes : [],
       tfdt: parsed ? parsed.tfdt : null,
       timescale: ts,
+      dur: parsed && parsed.duration ? parsed.duration : null,
       tso,
-      encrypted: !!info.encrypted,
-      startSec: parsed && parsed.tfdt !== null && ts ? +(parsed.tfdt / ts).toFixed(3) : null,
+      seqMode,
+      encrypted: !!info.encrypted || emeActive,
+      startSec: tfdtNum !== null && ts ? +(tfdtNum / ts).toFixed(3) : null,
       durationSec: parsed && parsed.duration && ts ? +(parsed.duration / ts).toFixed(3) : null,
       samples: parsed ? parsed.samples : 0,
       head: hex(u8, 12),
@@ -366,7 +438,7 @@
     // by transfer so no second copy is made on the way to the content script.
     // Protected media and frames whose content script does not tap get
     // metadata only.
-    if (info.encrypted || !tapping) {
+    if (info.encrypted || emeActive || !tapping) {
       post("append", rec);
     } else {
       const copy = u8.slice().buffer;
@@ -382,26 +454,34 @@
   };
 
   if (typeof SourceBuffer !== "undefined") {
+    // The native append runs first: one the browser rejects synchronously
+    // (QuotaExceededError, InvalidStateError) throws before anything is
+    // recorded, so a player's retry is not stored twice. appendBuffer copies
+    // the bytes synchronously and segment parsing starts asynchronously, so
+    // the data and timestampOffset read right after the call are still the
+    // ones of this append.
     patch(SourceBuffer.prototype, "appendBuffer", (d) => ({
       value: function (data) {
+        const result = d.value.call(this, data);
         try {
           onAppend(this, data, "appendBuffer");
         } catch (e) {
           log("hook error", e);
         }
-        return d.value.call(this, data);
+        return result;
       },
     }));
 
     // Firefox-only async variant.
     patch(SourceBuffer.prototype, "appendBufferAsync", (d) => ({
       value: function (data) {
+        const result = d.value.call(this, data);
         try {
           onAppend(this, data, "appendBufferAsync");
         } catch (e) {
           log("hook error", e);
         }
-        return d.value.call(this, data);
+        return result;
       },
     }));
 
@@ -412,7 +492,7 @@
           log(`SourceBuffer #${info.id} changeType ${info.mime} -> ${mime}`);
           info.mime = String(mime);
           info.timescale = null;
-          post("changetype", { sbId: info.id, mime: info.mime });
+          post("changetype", { sbId: info.id, msId: info.msId, mime: info.mime });
         }
         return d.value.call(this, mime);
       },

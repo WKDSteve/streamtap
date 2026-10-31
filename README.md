@@ -5,10 +5,10 @@ already in the clear: a browser extension hooks `SourceBuffer.appendBuffer()`
 (Media Source Extensions) and hands the segments to a desktop app that writes
 them to disk and muxes them into a playable file. Bit-exact, no re-encoding.
 
-Works for anything that does not use DRM (public broadcasters' media
-libraries, YouTube, Vimeo, Twitch, news sites, lecture platforms). Content
-protected by EME/DRM (Widevine, PlayReady, FairPlay) is detected and left
-alone, by design.
+Aimed at players that do not use DRM (public broadcasters' media libraries,
+YouTube, Vimeo, Twitch, news sites, lecture platforms); verified so far in
+Chrome on the ARD Mediathek (hls.js). Content protected by EME/DRM
+(Widevine, PlayReady, FairPlay) is detected and left alone, by design.
 
 ## Status
 

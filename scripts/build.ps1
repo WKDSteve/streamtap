@@ -31,7 +31,11 @@ if ($running) {
     exit 1
 }
 
-& cargo build --release --locked --manifest-path $manifest
+# The target dir is named explicitly: a CARGO_TARGET_DIR or a build.target-dir
+# setting would otherwise send the artifact elsewhere, and the old exe below
+# would be touched and reported as current.
+$targetDir = Join-Path $root 'desktop\target'
+& cargo build --release --locked --manifest-path $manifest --target-dir $targetDir
 if ($LASTEXITCODE -ne 0) {
     Write-Error "cargo build failed (exit code $LASTEXITCODE)"
     exit 1
