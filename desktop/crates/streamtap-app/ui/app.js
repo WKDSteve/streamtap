@@ -260,7 +260,16 @@ const renderList = (snap) => {
 };
 
 // Broad groups that may read config.json, by the stable id the app sends (SRV-14).
-const GROUP_KEYS = { everyone: "groupEveryone", users: "groupUsers", "authenticated-users": "groupAuthenticatedUsers" };
+const GROUP_KEYS = {
+  everyone: "groupEveryone",
+  users: "groupUsers",
+  "authenticated-users": "groupAuthenticatedUsers",
+  interactive: "groupInteractive",
+  local: "groupLocal",
+  guests: "groupGuests",
+  "domain-users": "groupDomainUsers",
+  "all-app-packages": "groupAllAppPackages",
+};
 
 const renderConfigAccess = (snap) => {
   const box = $("config-access");

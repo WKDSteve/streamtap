@@ -75,7 +75,10 @@ const groupKeys = app.match(/const GROUP_KEYS = \{([^}]*)\}/);
 check(groupKeys, "GROUP_KEYS found");
 if (groupKeys) {
   const ids = [...groupKeys[1].matchAll(/"?([\w-]+)"?:\s*"(\w+)"/g)];
-  check(ids.map((m) => m[1]).sort().join(",") === "authenticated-users,everyone,users", "GROUP_KEYS covers the three broad groups the app reports");
+  check(
+    ids.map((m) => m[1]).sort().join(",") === "all-app-packages,authenticated-users,domain-users,everyone,guests,interactive,local,users",
+    "GROUP_KEYS covers the eight broad groups the app reports"
+  );
   for (const m of ids) check(m[2] in en, `GROUP_KEYS uses unknown key ${m[2]}`);
 }
 for (const reason of ["exit-1", "exit-2", "exit-3", "exit-4", "exit-5", "exit-6", "exit-unexpected", "signal", "spawn", "aborted", "wait"]) {

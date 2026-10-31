@@ -449,7 +449,11 @@ Security:
 - `config.json` gets no ACL of its own: the rights of the user profile on
   `%APPDATA%` (you, SYSTEM, Administrators) are enough. At every start the app
   reads the file's DACL and checks that none of the broad groups *Everyone*
-  (`S-1-1-0`), *Users* (`S-1-5-32-545`) or *Authenticated Users* (`S-1-5-11`)
+  (`S-1-1-0`), *Users* (`S-1-5-32-545`), *Authenticated Users* (`S-1-5-11`),
+  *Interactive* (`S-1-5-4`), *Local* (`S-1-2-0`), *Guests* (`S-1-5-32-546`),
+  *Domain Users* of any domain (`S-1-5-21-…-513`; without a domain the
+  machine's *None* group, which holds every local account) or *All Application
+  Packages* (`S-1-15-2-1`)
   may read it: an allow entry that grants reading the data, changing the DACL
   or taking ownership (the last two let the group grant itself reading;
   generic rights count by what they stand for), unless a deny of exactly that

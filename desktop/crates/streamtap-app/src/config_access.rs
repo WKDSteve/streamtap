@@ -15,13 +15,38 @@ use std::path::Path;
 
 use serde::Serialize;
 
-/// The broad groups by SID, with the stable id the UI translates.
-const BROAD_GROUPS: [(&str, &str); 3] = [
+/// The broad groups by SID, with the stable id the UI translates, in the
+/// order of the warning. `S-1-5-21-*-513` stands for the *Domain Users*
+/// group of any domain (on a machine without a domain, its *None* group,
+/// which holds every local account), see [`is_group`].
+const BROAD_GROUPS: [(&str, &str); 8] = [
     ("S-1-1-0", "everyone"),
     ("S-1-5-32-545", "users"),
     ("S-1-5-11", "authenticated-users"),
+    ("S-1-5-4", "interactive"),
+    ("S-1-2-0", "local"),
+    ("S-1-5-32-546", "guests"),
+    ("S-1-5-21-*-513", "domain-users"),
+    ("S-1-15-2-1", "all-app-packages"),
 ];
 const EVERYONE: &str = "S-1-1-0";
+
+/// Whether `sid` is the group `pattern` names: an exact SID, or with one `*`
+/// standing for a domain's sub-authorities (one or more decimal parts).
+fn is_group(sid: &str, pattern: &str) -> bool {
+    let Some((prefix, rid)) = pattern.split_once("-*-") else {
+        return sid == pattern;
+    };
+    sid.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|rest| rest.strip_suffix(rid))
+        .and_then(|rest| rest.strip_suffix('-'))
+        .is_some_and(|domain| {
+            domain
+                .split('-')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
 
 const FILE_READ_DATA: u32 = 0x0000_0001;
 const WRITE_DAC: u32 = 0x0004_0000;
@@ -123,10 +148,10 @@ fn can_read(aces: &[AceView], group: &str) -> bool {
             // Only the specific bits of a deny take something away (generic
             // ones are mapped when an entry is written to a file); this errs
             // on the side of a warning as well.
-            AceKind::Deny if ace.sid == group || ace.sid == EVERYONE => {
+            AceKind::Deny if is_group(&ace.sid, group) || ace.sid == EVERYONE => {
                 denied |= ace.mask & SPECIFIC;
             }
-            AceKind::Allow if ace.sid == group => {
+            AceKind::Allow if is_group(&ace.sid, group) => {
                 let mask = granted(ace.mask);
                 if REVEALING.iter().any(|r| mask & r != 0 && denied & r == 0) {
                     return true;
@@ -248,6 +273,49 @@ mod tests {
         vec![allow(SYSTEM, FULL), allow(ADMINS, FULL), allow(ME, FULL)]
     }
 
+    /// A concrete SID for a `BROAD_GROUPS` entry (the pattern's `*` filled).
+    fn example(pattern: &str) -> String {
+        pattern.replace('*', "1111111111-2222222222-3333333333")
+    }
+
+    /// Every group id, in warning order.
+    fn all_ids() -> Vec<&'static str> {
+        BROAD_GROUPS.iter().map(|(_, id)| *id).collect()
+    }
+
+    #[test]
+    fn the_wider_groups_and_any_domains_users_are_broad() {
+        for (sid, id) in [
+            ("S-1-5-4", "interactive"),
+            ("S-1-2-0", "local"),
+            ("S-1-5-32-546", "guests"),
+            (
+                "S-1-5-21-1111111111-2222222222-3333333333-513",
+                "domain-users",
+            ),
+            ("S-1-5-21-7-513", "domain-users"),
+            ("S-1-15-2-1", "all-app-packages"),
+        ] {
+            let mut dacl = profile();
+            dacl.push(allow(sid, READ));
+            assert_eq!(broad_readers(Some(&dacl)), [id], "{sid}");
+        }
+        // Not Domain Users: another RID of the domain, a cut or forged form.
+        for sid in [
+            ME,
+            "S-1-5-21-513",
+            "S-1-5-21--513",
+            "S-1-5-21-1-x-513",
+            "S-1-5-21-1-5130",
+            "S-1-5-21-1-513-1",
+            "S-1-5-32-513",
+        ] {
+            let mut dacl = profile();
+            dacl.push(allow(sid, READ));
+            assert_eq!(broad_readers(Some(&dacl)), NONE, "{sid}");
+        }
+    }
+
     #[test]
     fn the_profile_default_reaches_no_broad_group() {
         assert_eq!(broad_readers(Some(&profile())), NONE);
@@ -256,27 +324,27 @@ mod tests {
 
     #[test]
     fn each_broad_group_with_read_rights_is_found() {
-        for (sid, id) in BROAD_GROUPS {
+        for (pattern, id) in BROAD_GROUPS {
+            let sid = example(pattern);
             for mask in [READ, FULL, 0x0000_0001, 0x8000_0000, 0x1000_0000] {
                 let mut dacl = profile();
-                dacl.push(allow(sid, mask));
+                dacl.push(allow(&sid, mask));
                 assert_eq!(broad_readers(Some(&dacl)), [id], "{sid} {mask:#x}");
             }
         }
         let mut all = profile();
-        all.extend(BROAD_GROUPS.iter().rev().map(|(sid, _)| allow(sid, READ)));
-        assert_eq!(
-            broad_readers(Some(&all)),
-            ["everyone", "users", "authenticated-users"]
+        all.extend(
+            BROAD_GROUPS
+                .iter()
+                .rev()
+                .map(|(pattern, _)| allow(&example(pattern), READ)),
         );
+        assert_eq!(broad_readers(Some(&all)), all_ids());
     }
 
     #[test]
     fn no_dacl_means_everyone() {
-        assert_eq!(
-            broad_readers(None),
-            ["everyone", "users", "authenticated-users"]
-        );
+        assert_eq!(broad_readers(None), all_ids());
     }
 
     #[test]
@@ -393,9 +461,7 @@ mod tests {
         assert!(read_dacl(&file).unwrap().is_none(), "a NULL DACL");
         assert_eq!(
             check(&file),
-            Some(ConfigAccess::Exposed {
-                groups: vec!["everyone", "users", "authenticated-users"]
-            })
+            Some(ConfigAccess::Exposed { groups: all_ids() })
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
