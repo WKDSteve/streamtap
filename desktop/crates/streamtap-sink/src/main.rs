@@ -138,11 +138,13 @@ struct ServeConfig {
 }
 
 /// Reads the token for `--token-stdin`: the first line of `r`, at most
-/// `MAX_TOKEN_LINE` bytes, LF or CRLF removed. A last line without a line
+/// `MAX_TOKEN_LINE` bytes, LF or CRLF and a leading UTF-8 BOM removed; a
+/// longer line is refused, never cut. A last line without a line
 /// break counts when it is not empty. Anything after the first line is ignored.
 fn read_token_line(r: impl Read) -> Result<String, SinkError> {
-    // Room for the CRLF after the longest token.
-    let limit = u64::try_from(MAX_TOKEN_LINE).map_or(u64::MAX, |n| n + 2);
+    // Room for a BOM before and a CRLF after the longest token, so a line cut
+    // at the limit is always longer than a token once both are removed.
+    let limit = u64::try_from(MAX_TOKEN_LINE).map_or(u64::MAX, |n| n + 5);
     let mut line = Vec::new();
     io::BufReader::new(r.take(limit))
         .read_until(b'\n', &mut line)
@@ -152,6 +154,11 @@ fn read_token_line(r: impl Read) -> Result<String, SinkError> {
         if line.last() == Some(&b'\r') {
             line.pop();
         }
+    }
+    // Windows PowerShell 5.1 with `$OutputEncoding` set to UTF-8 puts a BOM
+    // in front of what it pipes to a program; it is never part of a token.
+    if line.starts_with(b"\xef\xbb\xbf") {
+        line.drain(..3);
     }
     if line.len() > MAX_TOKEN_LINE {
         return Err(SinkError::Usage(format!(
@@ -5311,6 +5318,8 @@ mod tests {
             (b"secret", b"secret"),
             (b"secret\nsecond line\n", b"secret"),
             (b" sp ace \n", b" sp ace "),
+            (b"\xef\xbb\xbfsecret\r\n", b"secret"),
+            (b"\xef\xbb\xbfsecret", b"secret"),
         ] {
             let token = token_from_stdin(input).expect("valid");
             assert_eq!(token.expose(), want, "{input:?}");
@@ -5326,6 +5335,8 @@ mod tests {
             b" \t\r\n",
             b"\nsecret\n",
             b"\xff\xfe\n",
+            b"\xef\xbb\xbf\r\n",
+            b"\xef\xbb\xbf",
         ] {
             let err = token_from_stdin(input).unwrap_err();
             assert_eq!(err.exit_code(), 2, "{input:?}: {err}");
@@ -5336,13 +5347,20 @@ mod tests {
     fn token_stdin_reads_at_most_4_kib() {
         let longest = "t".repeat(MAX_TOKEN_LINE);
         for tail in ["\n", "\r\n", ""] {
-            let token = token_from_stdin(format!("{longest}{tail}").as_bytes()).expect("fits");
-            assert_eq!(token.expose().len(), MAX_TOKEN_LINE, "{tail:?}");
+            for bom in ["", "\u{feff}"] {
+                let token =
+                    token_from_stdin(format!("{bom}{longest}{tail}").as_bytes()).expect("fits");
+                assert_eq!(token.expose().len(), MAX_TOKEN_LINE, "{bom:?} {tail:?}");
+            }
         }
+        // A cut line is refused, never shortened into a token (also after
+        // its BOM is removed).
         for input in [
             format!("{longest}t\n"),
             format!("{longest}t"),
             "t".repeat(100_000),
+            format!("\u{feff}{longest}t\r\n"),
+            format!("\u{feff}{}", "t".repeat(100_000)),
         ] {
             let err = token_from_stdin(input.as_bytes()).unwrap_err();
             assert_eq!(err.exit_code(), 2, "{} bytes: {err}", input.len());

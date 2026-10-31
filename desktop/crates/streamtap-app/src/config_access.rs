@@ -23,9 +23,33 @@ const BROAD_GROUPS: [(&str, &str); 3] = [
 ];
 const EVERYONE: &str = "S-1-1-0";
 
-/// `FILE_READ_DATA`, `GENERIC_ALL` and `GENERIC_READ`: rights that include
-/// reading the file's content.
-const READ_RIGHTS: u32 = 0x0000_0001 | 0x1000_0000 | 0x8000_0000;
+const FILE_READ_DATA: u32 = 0x0000_0001;
+const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
+/// Rights that read the file's content or let the holder grant itself that
+/// (changing the DACL or taking ownership is as good as reading).
+const REVEALING: [u32; 3] = [FILE_READ_DATA, WRITE_DAC, WRITE_OWNER];
+
+/// Generic rights and the file rights they stand for (`FILE_GENERIC_*`,
+/// `FILE_ALL_ACCESS`).
+const GENERIC_MAP: [(u32, u32); 4] = [
+    (0x8000_0000, 0x0012_0089),
+    (0x4000_0000, 0x0012_0116),
+    (0x2000_0000, 0x0012_00A0),
+    (0x1000_0000, 0x001F_01FF),
+];
+/// The bits of a mask that are not generic rights.
+const SPECIFIC: u32 = 0x0FFF_FFFF;
+
+/// The file rights an allow entry's mask grants, generic rights mapped. A
+/// generic right in an entry on the file itself is normally mapped when it is
+/// written; counting it here errs on the side of a warning.
+fn granted(mask: u32) -> u32 {
+    GENERIC_MAP
+        .iter()
+        .filter(|(generic, _)| mask & generic != 0)
+        .fold(mask & SPECIFIC, |m, (_, file)| m | file)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AceKind {
@@ -76,38 +100,42 @@ impl ConfigAccess {
 /// The broad groups that can read a file with this DACL, in `BROAD_GROUPS`
 /// order. `None` is no DACL at all: everyone has full access.
 ///
-/// Entries are evaluated in order like Windows does: an allow for a group
-/// counts unless a deny of reading for that group, or for *Everyone*, came
-/// before it. Membership beyond that is not resolved, so the answer errs on
-/// the side of a warning.
+/// Entries are evaluated in order and bit by bit like Windows does: a group
+/// can read when an allow for it grants one of the [`REVEALING`] rights
+/// (reading the data, changing the DACL, taking ownership) that no earlier
+/// deny for that group, or for *Everyone*, took away. Membership beyond that
+/// is not resolved, so the answer errs on the side of a warning.
 pub(crate) fn broad_readers(dacl: Option<&[AceView]>) -> Vec<&'static str> {
     let Some(aces) = dacl else {
         return BROAD_GROUPS.iter().map(|(_, id)| *id).collect();
     };
-    let mut denied: Vec<&str> = Vec::new();
-    let mut readable: Vec<&'static str> = Vec::new();
-    for ace in aces
-        .iter()
-        .filter(|a| !a.inherit_only && a.mask & READ_RIGHTS != 0)
-    {
-        match ace.kind {
-            AceKind::Deny => denied.push(&ace.sid),
-            AceKind::Allow => {
-                let blocked = denied.iter().any(|d| *d == ace.sid || *d == EVERYONE);
-                if let Some((_, id)) = BROAD_GROUPS.iter().find(|(sid, _)| *sid == ace.sid) {
-                    if !blocked && !readable.contains(id) {
-                        readable.push(id);
-                    }
-                }
-            }
-            AceKind::Other => {}
-        }
-    }
     BROAD_GROUPS
         .iter()
+        .filter(|(sid, _)| can_read(aces, sid))
         .map(|(_, id)| *id)
-        .filter(|id| readable.contains(id))
         .collect()
+}
+
+fn can_read(aces: &[AceView], group: &str) -> bool {
+    let mut denied = 0u32;
+    for ace in aces.iter().filter(|a| !a.inherit_only) {
+        match ace.kind {
+            // Only the specific bits of a deny take something away (generic
+            // ones are mapped when an entry is written to a file); this errs
+            // on the side of a warning as well.
+            AceKind::Deny if ace.sid == group || ace.sid == EVERYONE => {
+                denied |= ace.mask & SPECIFIC;
+            }
+            AceKind::Allow if ace.sid == group => {
+                let mask = granted(ace.mask);
+                if REVEALING.iter().any(|r| mask & r != 0 && denied & r == 0) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Checks `path`: `None` when no broad group can read it.
@@ -129,7 +157,9 @@ pub(crate) fn check(path: &Path) -> Option<ConfigAccess> {
 #[cfg(windows)]
 pub(crate) fn read_dacl(path: &Path) -> Result<Option<Vec<AceView>>, String> {
     use windows_permissions::constants::{AceFlags, AceType, SeObjectType, SecurityInformation};
-    use windows_permissions::wrappers::GetNamedSecurityInfo;
+    use windows_permissions::wrappers::{
+        ConvertSecurityDescriptorToStringSecurityDescriptor, GetNamedSecurityInfo,
+    };
 
     let sd = GetNamedSecurityInfo(
         path.as_os_str(),
@@ -137,6 +167,13 @@ pub(crate) fn read_dacl(path: &Path) -> Result<Option<Vec<AceView>>, String> {
         SecurityInformation::Dacl,
     )
     .map_err(|e| e.to_string())?;
+    // A NULL DACL (everyone has full access) makes the crate's `dacl()`
+    // panic; SDDL names it before the first entry as `NO_ACCESS_CONTROL`.
+    let sddl = ConvertSecurityDescriptorToStringSecurityDescriptor(&sd, SecurityInformation::Dacl)
+        .map_err(|e| e.to_string())?;
+    if is_null_dacl(&sddl.to_string_lossy()) {
+        return Ok(None);
+    }
     let Some(acl) = sd.dacl() else {
         return Ok(None);
     };
@@ -164,6 +201,16 @@ pub(crate) fn read_dacl(path: &Path) -> Result<Option<Vec<AceView>>, String> {
         });
     }
     Ok(Some(aces))
+}
+
+/// Whether the DACL part of an SDDL string (`D:` flags, then the entries in
+/// parentheses) is a NULL DACL. Only the flags are looked at, so the text of
+/// a conditional entry cannot fake it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_null_dacl(sddl: &str) -> bool {
+    sddl.split('(')
+        .next()
+        .is_some_and(|flags| flags.contains("NO_ACCESS_CONTROL"))
 }
 
 /// Other platforms have no DACL; the app is built for Windows only.
@@ -269,9 +316,88 @@ mod tests {
         assert_eq!(broad_readers(Some(&everyone)), NONE);
         let other = vec![ace(AceKind::Deny, ME, READ), allow(users, READ)];
         assert_eq!(broad_readers(Some(&other)), ["users"]);
-        // A deny of writing only blocks no reading.
+        // A deny of writing only blocks no reading, nor does a generic one.
         let write_only = vec![ace(AceKind::Deny, users, 0x0000_0002), allow(users, READ)];
         assert_eq!(broad_readers(Some(&write_only)), ["users"]);
+        let generic = vec![ace(AceKind::Deny, users, 0x8000_0000), allow(users, READ)];
+        assert_eq!(broad_readers(Some(&generic)), ["users"]);
+    }
+
+    /// Changing the DACL or taking ownership lets a group grant itself
+    /// reading, so it counts like reading; a deny takes away only its bits.
+    #[test]
+    fn rights_to_change_the_dacl_or_owner_count_and_denies_work_bit_by_bit() {
+        let users = "S-1-5-32-545";
+        for mask in [WRITE_DAC, WRITE_OWNER] {
+            let mut dacl = profile();
+            dacl.push(allow(users, mask));
+            assert_eq!(broad_readers(Some(&dacl)), ["users"], "{mask:#x}");
+        }
+        // A deny of changing the DACL does not block reading.
+        let dac = vec![ace(AceKind::Deny, users, WRITE_DAC), allow(users, READ)];
+        assert_eq!(broad_readers(Some(&dac)), ["users"]);
+        // Reading denied, but full control still includes changing the DACL.
+        let read_only = vec![ace(AceKind::Deny, users, READ), allow(users, FULL)];
+        assert_eq!(broad_readers(Some(&read_only)), ["users"]);
+        // All three denied (by Everyone): nothing left.
+        let all = vec![
+            ace(
+                AceKind::Deny,
+                "S-1-1-0",
+                FILE_READ_DATA | WRITE_DAC | WRITE_OWNER,
+            ),
+            allow(users, FULL),
+            allow(users, 0x1000_0000),
+        ];
+        assert_eq!(broad_readers(Some(&all)), NONE);
+    }
+
+    #[test]
+    fn a_null_dacl_is_recognised_by_its_flags_only() {
+        for sddl in ["D:NO_ACCESS_CONTROL", "D:PNO_ACCESS_CONTROL"] {
+            assert!(is_null_dacl(sddl), "{sddl}");
+        }
+        for sddl in [
+            "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)",
+            "D:",
+            "",
+            "D:(XA;;FR;;;WD;(@User.NO_ACCESS_CONTROL == 1))",
+        ] {
+            assert!(!is_null_dacl(sddl), "{sddl}");
+        }
+    }
+
+    /// A real file with a NULL DACL (full access for everyone) is reported
+    /// as readable by every broad group, not as unchecked.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_file_with_a_null_dacl_is_readable_by_everyone() {
+        use windows_permissions::constants::{SeObjectType, SecurityInformation};
+        use windows_permissions::wrappers::SetNamedSecurityInfo;
+
+        let dir = std::env::temp_dir().join(format!("streamtap-nulldacl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.json");
+        std::fs::write(&file, b"{}").unwrap();
+        SetNamedSecurityInfo(
+            file.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(read_dacl(&file).unwrap().is_none(), "a NULL DACL");
+        assert_eq!(
+            check(&file),
+            Some(ConfigAccess::Exposed {
+                groups: vec!["everyone", "users", "authenticated-users"]
+            })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

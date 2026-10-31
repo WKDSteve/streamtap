@@ -41,8 +41,10 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
 - A token is required, from exactly one of two places (both: usage error,
   exit 2):
   - `--token-stdin` (what the app uses): the sink reads the first line of
-    its stdin before it binds, at most 4 KiB, with the LF or CRLF removed; a
-    last line without a line break counts when it is not empty. Anything after
+    its stdin before it binds, at most 4 KiB, with the LF or CRLF and a
+    leading UTF-8 BOM removed (Windows PowerShell 5.1 adds one when
+    `$OutputEncoding` is UTF-8); a last line without a line break counts when it
+    is not empty, a longer line is refused, never cut. Anything after
     the first line is ignored, and stdin is not used again. Every other flag
     is checked first, so a bad flag ends the sink without waiting for stdin.
   - `--token <secret>`, for a quick manual run. **Warning:** a command line is
@@ -448,9 +450,12 @@ Security:
   `%APPDATA%` (you, SYSTEM, Administrators) are enough. At every start the app
   reads the file's DACL and checks that none of the broad groups *Everyone*
   (`S-1-1-0`), *Users* (`S-1-5-32-545`) or *Authenticated Users* (`S-1-5-11`)
-  may read it (an allow entry with read data, generic read or generic all; a
-  deny of that group or of Everyone before it counts; no DACL at all means
-  everyone). If one may, the Settings panel shows a warning naming the groups
+  may read it: an allow entry that grants reading the data, changing the DACL
+  or taking ownership (the last two let the group grant itself reading;
+  generic rights count by what they stand for), unless a deny of exactly that
+  right for the group or for Everyone came before it. No DACL and a NULL DACL
+  (`D:NO_ACCESS_CONTROL`) both mean everyone; group membership beyond that is
+  not resolved, so the check errs on the side of a warning. If one may, the Settings panel shows a warning naming the groups
   (translated) and the app logs it (the sink output panel until the next sink
   start, and stderr); the fix is to remove those entries under *Properties >
   Security* of the file or its folder and restart the app. A DACL that cannot
@@ -618,9 +623,12 @@ after the token changed) the token field and *Copy* give the new token, and
 that the Settings panel shows the translated `config.json` access warning (or
 none). The access decision is unit-tested on made-up DACLs (profile default,
 each broad group with each read right, rights without reading, inherit-only and
-audit entries, deny order, no DACL); one test reads the real DACL of a temp
-file and finds Everyone after `icacls /grant *S-1-1-0:(R)`. The token handover
-is covered by the sink's stdin tests (first line, CRLF, EOF, 4 KiB bound,
+audit entries, deny order, denies bit by bit, change-DACL and take-ownership
+rights, no DACL); one test reads the real DACL of a temp file and finds
+Everyone after `icacls /grant *S-1-1-0:(R)`, another gives a temp file a real
+NULL DACL and gets all three groups. The token handover
+is covered by the sink's stdin tests (first line, CRLF, BOM, EOF, 4 KiB bound
+(also with a BOM, a cut line is refused),
 blank, non-UTF-8, read error, `--token` and `--token-stdin` together, no read
 of stdin before the other flags are checked) and by the end-to-end tests,
 which start the real sink with `--token-stdin` and send it a `hello` with the
