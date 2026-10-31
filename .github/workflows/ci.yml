@@ -1,0 +1,81 @@
+# CI of streamtap.
+#
+# Runs on a self-hosted runner (the author's Windows machine): the repository is private and has no paid plan, so
+# hosted runners (ubuntu-latest) do not start. Start the runner with `scripts/runners.ps1 ensure streamtap` of the
+# nvim config; without it a push stays "Queued". Only for a PRIVATE repo with trusted authors: no `pull_request`
+# trigger on purpose (a PR would run its own workflow with the author's rights on this machine). A Linux and a Windows
+# job on hosted runners come when the repository goes public (NREL-13).
+#
+# Tools (rustup, cargo-audit, cargo-deny, node, python) are expected on the PATH and print their versions; the Rust
+# toolchain itself is the one desktop/rust-toolchain.toml names, so local builds and CI use the same.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `shell: bash` resolves to the WSL launcher on this machine; Git Bash is named explicitly, in 8.3 form because the
+# shell string is split at spaces.
+defaults:
+  run:
+    shell: C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+
+jobs:
+  rust:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      # Actions are pinned by commit (NREL-03); the comment names the tag.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          persist-credentials: false
+      # Installs the toolchain of rust-toolchain.toml when it is missing, then names it.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustc --version && cargo --version && cargo audit --version && cargo deny --version
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      # The supply chain (NREL-01): known advisories, licenses, sources.
+      - run: cargo audit --deny warnings
+      - run: cargo deny check
+
+  extension:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          persist-credentials: false
+      - run: node --version
+      # Syntax of every script of the extension and of the test drivers (TST-17).
+      - name: node --check
+        run: git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' | xargs -0 -n1 node --check
+      # The MSE hook in Node with stand-ins; needs neither a browser nor a sink.
+      - run: node extension/scripts/test-hook.mjs
+
+  # A control or invisible character in a tracked text file (a backspace in a path, a bidirectional override in
+  # source) is refused (NREL-14); the tool tests itself.
+  hygiene:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          persist-credentials: false
+      - run: python -m unittest discover tools
+      - run: python tools/check-control-chars.py

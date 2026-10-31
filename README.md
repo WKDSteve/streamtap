@@ -26,9 +26,30 @@ streamtap/
   extension/   MV3 extension (hook, content script, service worker, popup)
   desktop/     Rust workspace: streamtap-sink (WebSocket receiver, segment store, mux);
                later the Tauri 2 app
+  tools/       repository checks (control-character guard)
   LICENSE
   README.md
 ```
+
+## Checks
+
+CI (`.github/workflows/ci.yml`, self-hosted Windows runner while the
+repository is private) runs, and locally the same commands do:
+
+```
+cd desktop
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo audit --deny warnings     # cargo install cargo-audit
+cargo deny check                # cargo install cargo-deny; policy in desktop/deny.toml
+cd ..
+node extension/scripts/test-hook.mjs
+python tools/check-control-chars.py
+```
+
+The Rust toolchain is pinned in `desktop/rust-toolchain.toml` (rustup
+installs it on first use).
 
 ## Roadmap (short)
 

@@ -1,0 +1,6 @@
+# The toolchain of local builds and of CI (.github/workflows/ci.yml); rustup
+# installs it on first use. Bump it here only, CI follows.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
