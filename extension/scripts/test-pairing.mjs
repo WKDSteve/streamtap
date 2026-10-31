@@ -271,9 +271,10 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   check(w.reloads.length === 1 && w.sentToTabs.at(-1)[1].on === false && (await w.run("npTapState(5)")).on === false, "switching off tells the tab and does not reload it");
 
   // A restart: the selection comes back from the session storage.
-  const w2 = makeWorld({ session: { tapTabs: [5, "x", -2, 7.5] } });
+  const w2 = makeWorld({ session: { tapTabs: [5, "x", -2, 7.5, 8], tapOrigins: { 5: "https://video.example", 8: "javascript:alert(1)" } } });
   w2.start();
   check((await w2.run("npTapState(5)")).on === true && (await w2.run("npTapState(7)")).on === false, "after a restart only valid stored tab ids are tapped");
+  check((await w2.run("npTapState(8)")).on === false, "a stored tab whose origin is not a web origin (or is missing) is not tapped");
 
   w.run("npTabClosed(5)");
   w.port().emit({ v: 1, t: "tap", tab: 5, on: true });
@@ -281,6 +282,68 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   w.run("npTabClosed(5)");
   await flush();
   check(JSON.stringify(w.session.data.tapTabs) === "[]", "a closed tab is no longer tapped");
+}
+
+// --- a choice belongs to the site it was made on ---------------------------------------------
+{
+  const w = makeWorld({
+    media: [
+      { id: 5, url: "https://video.example/watch?v=1", title: "v", drm: false },
+      { id: 6, url: "chrome://extensions/", title: "internal", drm: false },
+    ],
+  });
+  w.start();
+  await flush();
+  await approve(w);
+  w.port().emit({ v: 1, t: "tap", tab: 6, on: true });
+  await flush();
+  check(w.reloads.length === 0 && !w.session.data.tapTabs, "a tab that is not a web page cannot be switched on");
+  w.port().emit({ v: 1, t: "tap", tab: 5, on: true });
+  await flush();
+  const ask = (frame) => w.run(`npTapState(5, ${JSON.stringify(frame)})`);
+  check((await ask({ frameId: 0, url: "https://video.example/another/page?x=1" })).on === true, "the same origin keeps the choice (another page of the site)");
+  check((await ask({ frameId: 3, url: "https://ads.example/frame" })).on === true, "a frame below the top is not what the choice is judged by");
+  check((await ask({ frameId: 0, url: "https://video.example/reloaded" })).on === true && w.session.data.tapTabs.join() === "5", "a reload of the chosen page keeps the choice");
+  w.sentToTabs.length = 0;
+  check((await ask({ frameId: 0, url: "https://bank.example/login" })).on === false, "a top frame on another origin is not tapped");
+  check(
+    (await w.run("npTapState(5)")).on === false && w.session.data.tapTabs.length === 0 && Object.keys(w.session.data.tapOrigins).length === 0,
+    "and the choice is over, also in the stored selection"
+  );
+  check(w.sentToTabs.some(([id, m]) => id === 5 && m.kind === "vc-tap" && m.on === false), "the tab's content scripts are told");
+  await w.fire();
+  check(tabsSent(w).at(-1).tabs[0].tapping === false, "the app's list shows the tab as no longer captured");
+  // The scheme and the port are part of the origin.
+  for (const other of ["http://video.example/", "https://video.example:8443/"]) {
+    const x = makeWorld({ media: [{ id: 5, url: "https://video.example/", title: "v", drm: false }] });
+    x.start();
+    await flush();
+    await approve(x);
+    x.port().emit({ v: 1, t: "tap", tab: 5, on: true });
+    await flush();
+    check((await x.run(`npTapState(5, ${JSON.stringify({ frameId: 0, url: other })})`)).on === false, `${other} is another origin`);
+  }
+}
+
+// --- nothing handed out stays when the approval is gone ----------------------------------------
+{
+  for (const pairing of ["pending", "denied", "revoked"]) {
+    const w = makeWorld({
+      local: { sinkToken: SECRET, sinkPaired: true, tapMode: "selected", sinkPort: 17650 },
+      session: { tapTabs: [3], tapOrigins: { 3: "https://video.example" } },
+    });
+    w.start();
+    await flush();
+    w.port().emit({ v: 1, t: "state", pairing });
+    await flush();
+    check(!("sinkToken" in w.local.data) && !("tapMode" in w.local.data) && w.session.data.tapTabs.length === 0, `a paired token and selection do not outlive the approval (${pairing}, also when it ended while the browser was away)`);
+  }
+  const manual = makeWorld({ local: { sinkToken: SECRET, sinkPaired: false, sinkPort: 17650 } });
+  manual.start();
+  await flush();
+  manual.port().emit({ v: 1, t: "state", pairing: "pending" });
+  await flush();
+  check(manual.local.data.sinkToken === SECRET, "a token entered by hand is not touched by a pending state");
 }
 
 // --- denial, revocation, retries ---------------------------------------------------------
@@ -298,7 +361,7 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   check(w.ports.length === 2, "the popup's pair-now asks again at once");
 
   // Revocation takes paired credentials back, a manual setup stays.
-  const paired = makeWorld({ local: { sinkToken: SECRET, sinkPaired: true, tapMode: "selected", sinkPort: 17650 }, session: { tapTabs: [3] } });
+  const paired = makeWorld({ local: { sinkToken: SECRET, sinkPaired: true, tapMode: "selected", sinkPort: 17650 }, session: { tapTabs: [3], tapOrigins: { 3: "https://video.example" } } });
   paired.start();
   await flush();
   await approve(paired);

@@ -36,6 +36,7 @@ const np = {
   port: null,
   status: { connected: false, pairing: null, error: null },
   selected: new Set(), // tab ids that are tapped (mode "selected")
+  origins: new Map(), // tab id -> the origin the tab was chosen on; a tab that leaves it is no longer chosen
   ready: Promise.resolve(),
   backoff: NP_BACKOFF_MIN_MS,
   retryTimer: null,
@@ -54,6 +55,16 @@ const npClean = (v, max) =>
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, max);
+
+// The origin (scheme, host, port) of a web page, or "" for anything else.
+const npOriginOf = (url) => {
+  try {
+    const u = new URL(url);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.origin : "";
+  } catch (e) {
+    return "";
+  }
+};
 
 const npHostOf = (url) => {
   try {
@@ -112,7 +123,7 @@ const npClearPaired = async () => {
 
 const npPersistSelected = () => {
   try {
-    return chrome.storage.session.set({ tapTabs: [...np.selected] });
+    return chrome.storage.session.set({ tapTabs: [...np.selected], tapOrigins: Object.fromEntries(np.origins) });
   } catch (e) {
     return Promise.resolve();
   }
@@ -122,6 +133,7 @@ const npPersistSelected = () => {
 const npSetSelected = async (next, notify) => {
   const before = np.selected;
   np.selected = next;
+  for (const id of [...np.origins.keys()]) if (!next.has(id)) np.origins.delete(id);
   await npPersistSelected();
   for (const id of new Set([...before, ...next, ...notify])) {
     npNotifyTab(id, next.has(id));
@@ -136,20 +148,21 @@ const npNotifyTab = (tabId, on) => {
   }
 };
 
-const npKnownTab = (tabId) => np.deps.mediaTabs().some((t) => t.id === tabId);
-
-// The app asked to switch capture of one tab. Only a tab that holds a
-// MediaSource is accepted. Switching on reloads the tab once: a stream that
-// is already playing has appended its init segment, and a capture without it
-// is useless.
+// The app asked to switch capture of one tab. Only a web tab that holds a
+// MediaSource is accepted, and the choice is bound to that tab's origin (see
+// npTapState). Switching on reloads the tab once: a stream that is already
+// playing has appended its init segment, and a capture without it is useless.
 const npSetTap = async (tabId, on) => {
   if (!Number.isInteger(tabId) || tabId <= 0 || typeof on !== "boolean") return false;
-  if (on && !npKnownTab(tabId)) return false;
+  const media = on ? np.deps.mediaTabs().find((t) => t.id === tabId) : null;
+  const origin = media ? npOriginOf(media.url) : "";
+  if (on && !origin) return false;
   if (on === np.selected.has(tabId)) return true;
   const next = new Set(np.selected);
   if (on) {
     if (next.size >= NP_MAX_TABS) return false;
     next.add(tabId);
+    np.origins.set(tabId, origin);
   } else {
     next.delete(tabId);
   }
@@ -165,10 +178,22 @@ const npSetTap = async (tabId, on) => {
   return true;
 };
 
-// What a content script asks when it starts: is this tab tapped?
-const npTapState = async (tabId) => {
+// What a content script asks when it starts: is this tab tapped? The user
+// chose a tab showing one site: when the top frame of that tab is on another
+// origin now (the user or a redirect navigated away), the choice ends here,
+// instead of silently copying whatever the next site plays. `frame` is the
+// asking frame (frameId, url) as the browser reports it.
+const npTapState = async (tabId, frame) => {
   await np.ready;
-  return { on: Number.isInteger(tabId) && np.selected.has(tabId) };
+  if (!Number.isInteger(tabId) || !np.selected.has(tabId)) return { on: false };
+  if (frame && frame.frameId === 0 && npOriginOf(frame.url) !== np.origins.get(tabId)) {
+    const next = new Set(np.selected);
+    next.delete(tabId);
+    await npSetSelected(next, []);
+    npScheduleSend(true);
+    return { on: false };
+  }
+  return { on: true };
 };
 
 // ---- the tab list -------------------------------------------------------------
@@ -285,9 +310,11 @@ const npOnMessage = async (m) => {
       if (m.pairing === "approved") {
         np.lastSig = "";
         npScheduleSend(true);
-      } else if (m.pairing === "denied" || m.pairing === "revoked") {
-        npPause();
-        if (m.pairing === "revoked") await npClearPaired();
+      } else {
+        if (m.pairing === "denied" || m.pairing === "revoked") npPause();
+        // Whatever the pairing handed out is gone with the approval, also when
+        // the revocation happened while this browser was not connected.
+        await npClearPaired();
       }
       break;
     }
@@ -380,6 +407,7 @@ const npTabClosed = (tabId) => {
     const next = new Set(np.selected);
     next.delete(tabId);
     np.selected = next;
+    np.origins.delete(tabId);
     npPersistSelected();
   }
   npScheduleSend(false);
@@ -389,12 +417,22 @@ const npInit = (deps) => {
   np.deps = deps;
   np.ready = (async () => {
     try {
-      const v = await chrome.storage.session.get({ tapTabs: [] });
+      const v = await chrome.storage.session.get({ tapTabs: [], tapOrigins: {} });
+      const origins = v.tapOrigins && typeof v.tapOrigins === "object" ? v.tapOrigins : {};
       if (Array.isArray(v.tapTabs)) {
-        np.selected = new Set(v.tapTabs.filter((n) => Number.isInteger(n) && n > 0).slice(0, NP_MAX_TABS));
+        // A tab without a stored web origin cannot be checked later: it is not chosen.
+        for (const n of v.tapTabs) {
+          const o = origins[n];
+          if (np.selected.size >= NP_MAX_TABS) break;
+          if (Number.isInteger(n) && n > 0 && typeof o === "string" && o.length <= 300 && npOriginOf(o) === o) {
+            np.selected.add(n);
+            np.origins.set(n, o);
+          }
+        }
       }
     } catch (e) {
       np.selected = new Set();
+      np.origins = new Map();
     }
   })();
   npConnect();
