@@ -1,8 +1,11 @@
 // Service worker: per-tab registry of MediaSources / SourceBuffers / appends
 // for the popup, plus a badge with the number of SourceBuffers that have
 // received media segments. State lives in memory only; it is lost when the
-// worker is suspended, which is fine for a spike.
+// worker is suspended, which is fine for a spike. The sink link (one WebSocket
+// per tapping frame) lives in sink-link.js.
 "use strict";
+
+importScripts("sink-link.js");
 
 const tabs = new Map(); // tabId -> { url, frames: Set, ms: Map<msId, {...}>, drm: [] }
 
@@ -64,6 +67,10 @@ const updateBadge = (tabId) => {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.kind === "vc-get" && typeof msg.tabId === "number") {
     sendResponse(serialize(tabs.get(msg.tabId)));
+    return false;
+  }
+  if (msg && msg.kind === "vc-link-status" && typeof msg.tabId === "number") {
+    sendResponse(sinkLinkStatus(msg.tabId));
     return false;
   }
   if (msg && msg.kind === "vc-clear" && typeof msg.tabId === "number") {

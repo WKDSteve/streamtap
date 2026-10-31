@@ -17,9 +17,14 @@ as `warn` (clean as of spike 2), rustfmt with Unix newlines.
 
 ```
 target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captures]
+    [--allow-origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia]
 ```
 
 - Binds **127.0.0.1 only**; there is no flag to bind anything else.
+- The handshake's `Origin` must equal the allowed origin exactly (default:
+  the streamtap extension, whose id the manifest `key` fixes). A web page,
+  another extension or a client without `Origin` gets `403` before anything
+  is written.
 - `--token` is required. The extension sends the same value in its first
   message (`hello`); a wrong token closes the socket before anything is
   written. Set it in the extension popup (port + token).
@@ -91,6 +96,12 @@ target/release/streamtap-sink mux captures/<dir>
 ffprobe captures/<dir>/out.mp4
 ```
 
+`scripts/test-sink-link.mjs` (same arguments) runs the extension's
+service-worker link (`extension/src/sink-link.js`) in Node with a mocked
+`chrome`, posting segments as `data:` URLs right after `hello` like the
+content script; it exits 0 when every message was sent and none dropped.
+Both clients send the extension origin (`--origin` to change it).
+
 Result on 2026-10-30: 8 segments written, 2 duplicates dropped, `mux: ok`,
 ffprobe reports h264 640×360 + aac 48 kHz, 6.08 s.
 
@@ -99,8 +110,9 @@ H.264 1280×720 + AAC, 630 s after reordering, full decode without errors.
 
 ## Deferred from the NEW_PROJECT gate (rules-vault, native)
 
-Done: loopback bind, token before any write, hard size limits, workspace
-lints, no shell for the ffmpeg child, no heredocs for docs, LICENSE.
+Done: loopback bind, exact origin check in the handshake, token before any
+write, hard size limits, workspace lints, no shell for the ffmpeg child, no
+heredocs for docs, LICENSE.
 Not yet (spike): `deny.toml` / `cargo audit` in CI, Windows CI runner (repo is
 private), security tests as raw TCP bytes before the first route (`TST-01`),
 read and handshake timeouts, child-process timeout for ffmpeg (`RS-04`),

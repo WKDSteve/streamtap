@@ -1,10 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "streamtap (spike 1: MSE hook logger)",
-  "version": "0.1.0",
-  "description": "Logs every SourceBuffer.appendBuffer() call so we can see what media players feed into MSE. No data is stored or sent anywhere.",
-  "minimum_chrome_version": "111",
-  "permissions": ["storage"],
+  "name": "streamtap",
+  "version": "0.2.0",
+  "description": "Taps the segments a video player appends to Media Source Extensions and sends them to the local streamtap sink. Detects DRM and leaves it alone.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz5iYI+AW0WFlCIPUBm0EYBjUi7qZsbIy2VKeupWvfJejXoqUKO1xhVTo8BR9NRJHBRQ0yj1TZeIUXGLZoV5VPih0RFFri1cA6r46J+HFY5MWHcoBrEoZ6xvrjjlfW8ja8CbtP1bWxfQC9AYPJgn9SRO/4SaxL1vqTLvq4spsIu4gSUDbulWqLWxMAJe5Ml8+94aBZwuwvTEOS6WV1lNvC7cXwDnUoNKd6wqP1oa8cYPnhr0Mw96X6Ay3LE+kiXiX6moenv3hUl5/DxPD5u6DJd5j9Yt+MkotrysfK3+1EMZZHEKwzQLQBWtKFxPIfvqz0IIyt2lJghSbtwyRUOTXbQIDAQAB",
+  "permissions": [
+    "storage"
+  ],
   "action": {
     "default_title": "streamtap",
     "default_popup": "popup/popup.html"
@@ -14,16 +17,24 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["src/hook.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/hook.js"
+      ],
       "run_at": "document_start",
       "all_frames": true,
       "match_about_blank": true,
       "world": "MAIN"
     },
     {
-      "matches": ["<all_urls>"],
-      "js": ["src/content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/content.js"
+      ],
       "run_at": "document_start",
       "all_frames": true,
       "match_about_blank": true

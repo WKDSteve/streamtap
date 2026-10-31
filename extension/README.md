@@ -8,6 +8,12 @@ segment bytes to the local sink over a loopback WebSocket (spike 2, see
 [../desktop/README.md](../desktop/README.md)). Without a configured sink the
 extension stays in metadata-only mode.
 
+The **service worker owns the socket**, not the content script: the sink
+then sees the extension's own origin and compares it exactly, and no page
+CSP (`connect-src`) can block it. The manifest's `key` pins the extension id
+to `oggpddakdbffbjhkjmcakidgmhpgakia` on every machine, so the origin is
+`chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia`.
+
 The concept and the DRM primer live in the nvim-config vault under
 `docs/ROADMAP/IDEAS/video-capture/`.
 
@@ -16,8 +22,9 @@ The concept and the DRM primer live in the nvim-config vault under
 | File | Runs where | Purpose |
 |---|---|---|
 | `src/hook.js` | page main world, `document_start`, all frames | Patches `MediaSource`, `SourceBuffer`, `URL.createObjectURL`, `Navigator.requestMediaKeySystemAccess`; parses fMP4 / WebM headers; posts records via `window.postMessage`. |
-| `src/content.js` | isolated world | Forwards the records to the service worker; opens `ws://127.0.0.1:<port>/` to the sink, sends `hello` with the token, then one binary message per segment. Never buffers more than 64 MiB and only while connecting; when the sink is down segments are counted as dropped, not queued. |
-| `src/background.js` | service worker | Per-tab registry (in memory), badge with the number of SourceBuffers that received media. Red badge when a DRM key system was requested. |
+| `src/content.js` | isolated world | Forwards the records to the service worker. On the first segment it opens a runtime port `vc-sink` and posts `hello`, then every segment as a `data:` URL (extension messaging is JSON, it cannot carry an `ArrayBuffer`) in append order. At most 64 MiB wait for encoding; beyond that segments are counted as dropped. |
+| `src/background.js` | service worker | Per-tab registry (in memory), badge with the number of SourceBuffers that received media. Red badge when a DRM key system was requested. Loads `sink-link.js`. |
+| `src/sink-link.js` | service worker | One WebSocket to `ws://127.0.0.1:<port>/` per port: `hello` with the token and the frame URL from the browser (not from the page), then one binary message per segment. Queues at most 64 MiB, only while connecting; when the sink is down segments are dropped and counted, never queued. Answers the popup's link status. |
 | `popup/` | action popup | Shows the registry for the current tab. |
 
 ## Load it (Chrome / Edge / Brave)
@@ -42,8 +49,16 @@ The concept and the DRM primer live in the nvim-config vault under
 After editing a file, hit the reload icon on `chrome://extensions` and reload
 the page.
 
+Updating from 0.1 (before the `key`): the id changes, so Chrome treats it as
+a new extension. Remove the old entry, load the folder again and enter port
+and token again (the settings belong to the old id).
+
+Chrome ≥ 116 (an open WebSocket keeps the service worker alive).
+
 Firefox: `world: "MAIN"` needs Firefox ≥ 128; load via
 `about:debugging#/runtime/this-firefox` → Load Temporary Add-on → `manifest.json`.
+Firefox ignores `key` and gives the extension a random `moz-extension://`
+origin; start the sink with `--allow-origin <that origin>` to capture there.
 
 ## What a successful run looks like
 
@@ -84,9 +99,8 @@ Injected into a running ARD Mediathek page (hls.js → fMP4), 7 s after a seek:
   (`ffmpeg -f null`) reports no errors.
 - The console showed one `WebSocket connection … failed` right after page
   load; the reconnect succeeded and all segments arrived. No CSP message on
-  this site. Whether a strict page `connect-src` would block a content
-  script's socket is still not answered in general; the data path is an open
-  decision (content script, service worker or native messaging).
+  this site. Since then the socket lives in the service worker (decided
+  2026-10-31), so a page `connect-src` no longer matters.
 - Two things the real run taught the mux (see `../desktop/README.md`):
   hls.js starts at a low quality and switches after the first segment (new
   init segment → new part), and after seeks segments arrive out of order.

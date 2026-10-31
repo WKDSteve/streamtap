@@ -44,8 +44,8 @@ const render = (state) => {
 
 const fmtLink = (s) =>
   !s
-    ? "no content script in this tab"
-    : `${s.connected ? "connected" : "not connected"} · ${s.sent} msgs / ${fmtBytes(s.sentBytes)} sent · ${s.dropped} dropped`;
+    ? "sink: no segments tapped in this tab yet"
+    : `sink: ${s.connected ? "connected" : "not connected"} · ${s.sent} msgs / ${fmtBytes(s.sentBytes)} sent · ${s.dropped} dropped`;
 
 const load = async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -65,15 +65,11 @@ const load = async () => {
       document.getElementById("link").textContent = "saved; reload the page to reconnect";
     });
 
-  // Ask the top frame's content script how the sink link is doing.
-  try {
-    chrome.tabs.sendMessage(tab.id, { kind: "vc-link-status" }, { frameId: 0 }, (s) => {
-      void chrome.runtime.lastError;
-      document.getElementById("link").textContent = fmtLink(s);
-    });
-  } catch (e) {
-    document.getElementById("link").textContent = fmtLink(null);
-  }
+  // The service worker owns the sink sockets; ask it about this tab.
+  chrome.runtime.sendMessage({ kind: "vc-link-status", tabId: tab.id }, (s) => {
+    void chrome.runtime.lastError;
+    document.getElementById("link").textContent = fmtLink(s);
+  });
 };
 
 load();

@@ -23,6 +23,10 @@ use serde::{Deserialize, Serialize};
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 const DEFAULT_PORT: u16 = 17_650;
+/// Origin of the streamtap extension. Its id is fixed by the `key` in
+/// `extension/manifest.json`; the service worker owns the socket, so the
+/// handshake carries exactly this origin (SRV-03/04: compared exactly).
+const DEFAULT_ORIGIN: &str = "chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia";
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -35,7 +39,7 @@ fn main() {
         Some("mux") => run_mux(&args[1..]),
         _ => {
             eprintln!(
-                "usage:\n  streamtap-sink serve --token <token> [--port {DEFAULT_PORT}] [--out captures]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>]"
+                "usage:\n  streamtap-sink serve --token <token> [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>]"
             );
             2
         }
@@ -68,6 +72,9 @@ fn run_serve(args: &[String]) -> i32 {
         }
     };
     let out = PathBuf::from(flag(args, "--out").unwrap_or("captures"));
+    let origin = flag(args, "--allow-origin")
+        .unwrap_or(DEFAULT_ORIGIN)
+        .to_owned();
     if let Err(e) = fs::create_dir_all(&out) {
         eprintln!("serve: cannot create {}: {e}", out.display());
         return 1;
@@ -82,7 +89,7 @@ fn run_serve(args: &[String]) -> i32 {
         }
     };
     println!(
-        "streamtap-sink listening on ws://127.0.0.1:{port}  out={}",
+        "streamtap-sink listening on ws://127.0.0.1:{port}  out={}  origin={origin}",
         out.display()
     );
 
@@ -92,8 +99,9 @@ fn run_serve(args: &[String]) -> i32 {
             Ok(s) => {
                 let token = token.clone();
                 let out = out.clone();
+                let origin = origin.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(s, &token, &out) {
+                    if let Err(e) = handle_connection(s, &token, &origin, &out) {
                         eprintln!("connection ended with error: {e}");
                     }
                 });
@@ -171,10 +179,37 @@ struct Session {
     tracks: HashMap<u32, TrackState>,
 }
 
-fn handle_connection(stream: TcpStream, token: &[u8], out: &Path) -> io::Result<()> {
+/// Handshake guard: the `Origin` header must equal `origin` exactly; anything
+/// else (missing, a web page, another extension) gets 403 before any file is
+/// touched.
+// The error type is fixed by tungstenite's handshake `Callback` trait; it
+// cannot be boxed.
+#[allow(clippy::result_large_err)]
+fn check_origin(
+    origin: &str,
+    req: &tungstenite::handshake::server::Request,
+    resp: tungstenite::handshake::server::Response,
+) -> Result<tungstenite::handshake::server::Response, tungstenite::handshake::server::ErrorResponse>
+{
+    let got = req
+        .headers()
+        .get("origin")
+        .map(tungstenite::http::HeaderValue::as_bytes);
+    if got == Some(origin.as_bytes()) {
+        return Ok(resp);
+    }
+    let mut err =
+        tungstenite::handshake::server::ErrorResponse::new(Some("origin not allowed".to_owned()));
+    *err.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
+    Err(err)
+}
+
+// The handshake closure returns tungstenite's fixed (large) error type.
+#[allow(clippy::result_large_err)]
+fn handle_connection(stream: TcpStream, token: &[u8], origin: &str, out: &Path) -> io::Result<()> {
     let peer = stream.peer_addr()?;
-    let mut ws = tungstenite::accept(stream)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut ws = tungstenite::accept_hdr(stream, |req: &_, resp| check_origin(origin, req, resp))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{peer}: {e}")))?;
     let mut session: Option<Session> = None;
 
     loop {
@@ -190,7 +225,12 @@ fn handle_connection(stream: TcpStream, token: &[u8], out: &Path) -> io::Result<
         };
         let data = match msg {
             tungstenite::Message::Binary(b) => b,
-            tungstenite::Message::Close(_) => break,
+            tungstenite::Message::Close(_) => {
+                // tungstenite queued the close reply; send it so the client
+                // sees a clean close instead of a dropped connection.
+                let _ = ws.flush();
+                break;
+            }
             tungstenite::Message::Ping(p) => {
                 let _ = ws.send(tungstenite::Message::Pong(p));
                 continue;

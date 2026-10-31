@@ -1,15 +1,16 @@
 // Isolated-world content script.
 //
-// Spike 1: forwards the hook's metadata records to the service worker (badge,
-// popup). Spike 2: additionally streams every segment payload as a binary
-// WebSocket message to the local sink (streamtap-sink serve).
+// Forwards the hook's metadata records to the service worker (badge, popup)
+// and hands every segment payload to the service worker over a runtime port
+// ("vc-sink"). The service worker owns the WebSocket to the local sink
+// (src/sink-link.js), so the page's CSP does not apply to it and the sink can
+// check the extension's origin exactly.
 //
-// Wire format per message: u32 LE header length | JSON header | payload.
-// The first message is {"type":"hello","token":...}; wrong token = the sink
-// closes the socket.
+// Port messages are JSON, so payloads travel as data: URLs (FileReader encodes
+// natively). A promise chain keeps them in append order.
 //
-// The script also runs outside an extension (injected for tests): then there
-// is no chrome.* and the sink settings come from window.__vcSinkConfig.
+// Injected outside an extension (tests) there is no chrome.*: the script then
+// only counts what it would have sent.
 (() => {
   "use strict";
 
@@ -17,7 +18,7 @@
   const inExtension = typeof chrome !== "undefined" && !!(chrome.runtime && chrome.runtime.id);
 
   // ---------------------------------------------------------------------------
-  // Service-worker relay (metadata only)
+  // Metadata relay
   // ---------------------------------------------------------------------------
 
   const forward = (msg) => {
@@ -32,101 +33,83 @@
   };
 
   // ---------------------------------------------------------------------------
-  // Sink link (binary)
+  // Segment relay to the service worker
   // ---------------------------------------------------------------------------
 
-  const MAX_PENDING_BYTES = 64 * 1024 * 1024; // while CONNECTING only
+  const MAX_QUEUED_BYTES = 64 * 1024 * 1024; // payloads waiting to be encoded
   const session = (crypto.randomUUID && crypto.randomUUID()) || String(Math.random()).slice(2);
-  const enc = new TextEncoder();
 
   const link = {
-    ws: null,
-    settings: null, // { port, token }
-    pending: [], // Blobs queued while the socket is connecting
-    pendingBytes: 0,
+    port: null,
+    dead: false, // the extension was reloaded: stop trying
+    queuedBytes: 0,
+    chain: Promise.resolve(),
+    posted: 0,
     dropped: 0,
-    sent: 0,
-    sentBytes: 0,
-    nextRetryAt: 0,
-    retryDelay: 1000,
   };
 
-  const loadSettings = () =>
-    new Promise((resolve) => {
-      if (!inExtension) return resolve(window.__vcSinkConfig || null);
-      try {
-        chrome.storage.local.get({ sinkPort: 17650, sinkToken: "" }, (v) =>
-          resolve(v.sinkToken ? { port: v.sinkPort, token: v.sinkToken } : null)
-        );
-      } catch (e) {
-        resolve(null);
-      }
+  const openPort = () => {
+    if (link.port || link.dead || !inExtension) return link.port;
+    try {
+      link.port = chrome.runtime.connect({ name: "vc-sink" });
+    } catch (e) {
+      link.dead = true;
+      return null;
+    }
+    link.port.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError;
+      link.port = null;
+      // A restarted service worker: reconnect on the next segment (the sink
+      // starts a new capture directory). A reloaded extension: give up.
+      link.dead = !(chrome.runtime && chrome.runtime.id);
+    });
+    link.port.postMessage({ t: "hello", session, title: document.title });
+    return link.port;
+  };
+
+  const toDataUrl = (buffer) =>
+    new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(new Blob([buffer]));
     });
 
-  const frame = (header, payload) => {
-    const h = enc.encode(JSON.stringify(header));
-    const len = new Uint8Array(4);
-    new DataView(len.buffer).setUint32(0, h.byteLength, true);
-    return payload ? new Blob([len, h, payload]) : new Blob([len, h]);
-  };
-
-  const flushPending = () => {
-    for (const b of link.pending) link.ws.send(b);
-    link.sent += link.pending.length;
-    link.pending = [];
-    link.pendingBytes = 0;
-  };
-
-  const connect = async () => {
-    if (link.ws || Date.now() < link.nextRetryAt) return;
-    link.settings = link.settings || (await loadSettings());
-    if (!link.settings) return; // not configured: metadata-only mode
-    const { port, token } = link.settings;
-    let ws;
+  const post = (msg) => {
+    const port = openPort();
+    if (!port) {
+      link.dropped++;
+      return;
+    }
     try {
-      ws = new WebSocket(`ws://127.0.0.1:${port}/`);
+      port.postMessage(msg);
+      link.posted++;
     } catch (e) {
-      console.warn(TAG, "sink connect refused by browser:", e && e.message);
-      link.nextRetryAt = Date.now() + link.retryDelay;
-      return;
+      link.dropped++;
     }
-    ws.binaryType = "arraybuffer";
-    link.ws = ws;
-    ws.onopen = () => {
-      link.retryDelay = 1000;
-      ws.send(frame({ type: "hello", token, session, url: location.href, title: document.title }));
-      flushPending();
-      console.debug(TAG, "sink connected, session", session);
-    };
-    ws.onclose = () => {
-      link.ws = null;
-      link.pending = [];
-      link.pendingBytes = 0;
-      link.nextRetryAt = Date.now() + link.retryDelay;
-      link.retryDelay = Math.min(link.retryDelay * 2, 10000);
-      console.debug(TAG, "sink closed");
-    };
-    ws.onerror = () => {
-      // onclose follows; nothing to do here.
-    };
   };
 
-  const send = (header, payload) => {
-    const b = frame(header, payload);
-    if (link.ws && link.ws.readyState === WebSocket.OPEN) {
-      link.ws.send(b);
-      link.sent++;
-      link.sentBytes += b.size;
+  const sendSegment = (header, payload) => {
+    const size = payload.byteLength;
+    if (!inExtension || link.dead || link.queuedBytes + size > MAX_QUEUED_BYTES) {
+      link.dropped++;
       return;
     }
-    if (link.ws && link.ws.readyState === WebSocket.CONNECTING && link.pendingBytes + b.size <= MAX_PENDING_BYTES) {
-      link.pending.push(b);
-      link.pendingBytes += b.size;
-      return;
-    }
-    // Not connected: never buffer unboundedly in the page. Count and drop.
-    link.dropped++;
-    connect();
+    link.queuedBytes += size;
+    link.chain = link.chain
+      .then(() => toDataUrl(payload))
+      .then((dataUrl) => post({ t: "segment", header, payload: dataUrl }))
+      .catch(() => {
+        link.dropped++;
+      })
+      .finally(() => {
+        link.queuedBytes -= size;
+      });
+  };
+
+  const sendEvent = (header) => {
+    if (!inExtension || link.dead) return;
+    link.chain = link.chain.then(() => post({ t: "event", header }));
   };
 
   // ---------------------------------------------------------------------------
@@ -143,10 +126,9 @@
       if (data.type === "append") {
         const { payload, ...meta } = data;
         forward({ kind: "vc-event", event: meta });
-        if (payload) {
-          send(
+        if (payload instanceof ArrayBuffer) {
+          sendSegment(
             {
-              type: "segment",
               sb: meta.sbId,
               seq: meta.seq,
               mime: meta.mime,
@@ -163,24 +145,15 @@
 
       forward({ kind: "vc-event", event: data });
       if (data.type === "endofstream" || data.type === "changetype") {
-        send({ type: "event", name: data.type, sb: data.sbId ?? null });
+        sendEvent({ name: data.type, sb: data.sbId ?? null });
       }
     },
     false
   );
 
-  // Expose counters for the popup / for test injection.
+  // Counters for test injection.
   window.__vcLink = link;
-  if (inExtension) {
-    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-      if (msg && msg.kind === "vc-link-status") {
-        sendResponse({ connected: !!(link.ws && link.ws.readyState === WebSocket.OPEN), sent: link.sent, sentBytes: link.sentBytes, dropped: link.dropped, session });
-      }
-      return false;
-    });
-  }
 
   forward({ kind: "vc-frame", frameUrl: location.href, top: window === window.top });
-  connect();
   console.debug(TAG, "ready in", location.href, inExtension ? "(extension)" : "(injected)");
 })();
