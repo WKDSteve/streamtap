@@ -19,6 +19,7 @@ const SINK_MAX_BUFFERED_BYTES = 64 * 1024 * 1024; // per socket, unsent while op
 const SINK_MAX_INIT_BYTES = 1024 * 1024; // init segments kept for a new socket
 const SINK_MAX_KEPT_INITS = 16;
 const SINK_MAX_LINKS = 16; // tapping ports of the whole worker
+const SINK_MAX_BACKLOG = 128 * 1024 * 1024; // data: URL chars received, not yet decoded
 const SINK_STABLE_MS = 5000; // a socket open this long resets the backoff
 const sinkEnc = new TextEncoder();
 
@@ -30,6 +31,7 @@ const sinkSegmentHeader = (h) => ({
   ms: h.ms ?? null,
   mime: typeof h.mime === "string" ? h.mime.slice(0, 256) : "",
   isInit: h.isInit === true,
+  initCont: h.initCont === true && h.isInit !== true,
   kind: typeof h.kind === "string" ? h.kind.slice(0, 16) : "",
   tfdt: typeof h.tfdt === "number" || typeof h.tfdt === "string" ? h.tfdt : null,
   timescale: h.timescale ?? null,
@@ -41,8 +43,9 @@ const sinkSegmentHeader = (h) => ({
 // tabId -> Map<portId, link>; read by the popup through "vc-link-status".
 const sinkLinks = new Map();
 let nextPortId = 1;
-let sinkLinkCount = 0;
+let sinkLinkCount = 0; // links that may connect (not overflow)
 let sinkPendingTotal = 0;
+let sinkBacklog = 0;
 
 const sinkFrame = (header, payload) => {
   const h = sinkEnc.encode(JSON.stringify(header));
@@ -61,10 +64,22 @@ const sinkSettings = () =>
 // An item leaves the stream (sent or dropped). Init segments are remembered
 // at this point, in stream order: everything still pending after it belongs
 // to it, so a new socket replays exactly the inits in effect.
+// Continuation chunks of a split init join it. An init too large to keep
+// also drops the old one, so the old quality's init is never replayed in
+// front of the new quality's media.
 const linkConsumed = (link, item) => {
-  if (!item.isInit || item.blob.size > SINK_MAX_INIT_BYTES) return;
+  if (item.initCont) {
+    const chunks = link.inits.get(item.sb);
+    if (!chunks) return;
+    const kept = chunks.reduce((n, b) => n + b.size, 0);
+    if (kept + item.blob.size > SINK_MAX_INIT_BYTES) link.inits.delete(item.sb);
+    else chunks.push(item.blob);
+    return;
+  }
+  if (!item.isInit) return;
   link.inits.delete(item.sb);
-  link.inits.set(item.sb, item.blob);
+  if (item.blob.size > SINK_MAX_INIT_BYTES) return;
+  link.inits.set(item.sb, [item.blob]);
   while (link.inits.size > SINK_MAX_KEPT_INITS) link.inits.delete(link.inits.keys().next().value);
 };
 
@@ -88,7 +103,7 @@ const linkWrite = (link, ws, item) => {
 const linkConnect = async (link) => {
   // A closed port still gets its queue delivered; it just opens no new socket
   // once that is done.
-  if (link.ws || link.connecting || Date.now() < link.nextRetryAt || !link.hello) return;
+  if (link.overflow || link.ws || link.connecting || Date.now() < link.nextRetryAt || !link.hello) return;
   if (link.closed && !link.pending.length) return;
   // Segments arriving while the settings are read are queued, not dropped.
   link.connecting = true;
@@ -118,10 +133,12 @@ const linkConnect = async (link) => {
     // Every socket is a new capture directory on the sink, and the player
     // appended its init segments only once: send the ones in effect first
     // (an identical init in the queue is deduped by the sink).
-    for (const blob of link.inits.values()) {
-      ws.send(blob);
-      link.sent++;
-      link.sentBytes += blob.size;
+    for (const chunks of link.inits.values()) {
+      for (const blob of chunks) {
+        ws.send(blob);
+        link.sent++;
+        link.sentBytes += blob.size;
+      }
     }
     const queued = link.pending;
     sinkPendingTotal -= link.pendingBytes;
@@ -153,9 +170,11 @@ const linkSend = (link, item) => {
   const ws = link.ws;
   if (ws && ws.readyState === WebSocket.OPEN) {
     // Backpressure: a stalled sink must not make the worker buffer without
-    // bound. Init segments always go (small, and the media after them is
-    // useless without them).
-    if (!item.isInit && ws.bufferedAmount + item.blob.size > SINK_MAX_BUFFERED_BYTES) {
+    // bound. Small init bytes go up to twice the limit (the media after them
+    // is useless without them); everything else stops at the limit.
+    const initBytes = (item.isInit || item.initCont) && item.blob.size <= SINK_MAX_INIT_BYTES;
+    const limit = initBytes ? 2 * SINK_MAX_BUFFERED_BYTES : SINK_MAX_BUFFERED_BYTES;
+    if (ws.bufferedAmount + item.blob.size > limit) {
       linkConsumed(link, item);
       link.dropped++;
       return;
@@ -189,6 +208,18 @@ const decodePayload = async (dataUrl) => {
   return (await fetch(dataUrl)).arrayBuffer();
 };
 
+// A link beyond the worker-wide limit is accepted but parked: it opens no
+// socket and drops its segments until a slot frees up (checked again on each
+// segment), so the content script does not have to reconnect.
+const linkAdmit = (link) => {
+  if (!link.overflow) return true;
+  if (sinkLinkCount >= SINK_MAX_LINKS) return false;
+  link.overflow = false;
+  sinkLinkCount++;
+  linkConnect(link);
+  return true;
+};
+
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "vc-sink") return;
   const tabId = port.sender && port.sender.tab && port.sender.tab.id;
@@ -204,11 +235,9 @@ chrome.runtime.onConnect.addListener((port) => {
     ws: null,
     connecting: false,
     closed: false,
-    // Beyond the worker-wide limit a port is accepted but drops everything
-    // (disconnecting would only make the content script reconnect).
-    overflow: sinkLinkCount >= SINK_MAX_LINKS,
-    inits: new Map(), // sb -> framed init in effect, replayed on every new socket
-    pending: [], // { blob, sb, isInit } while connecting
+    overflow: true, // until linkAdmit gives it a slot
+    inits: new Map(), // sb -> [framed init, continuation...] in effect, replayed on every new socket
+    pending: [], // { blob, sb, isInit, initCont } while connecting
     pendingBytes: 0,
     sent: 0,
     sentBytes: 0,
@@ -216,17 +245,27 @@ chrome.runtime.onConnect.addListener((port) => {
     nextRetryAt: 0,
     retryDelay: 1000,
   };
-  sinkLinkCount++;
   if (!sinkLinks.has(tabId)) sinkLinks.set(tabId, new Map());
   sinkLinks.get(tabId).set(portId, link);
 
   // Messages are decoded one after the other so the sink receives them in
-  // append order even though decoding is asynchronous.
+  // append order even though decoding is asynchronous. What waits for
+  // decoding is bounded worker-wide (content.js counts a payload as handed
+  // on as soon as postMessage returns).
   let chain = Promise.resolve();
   port.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== "object") return;
+    let held = 0;
+    if (msg.t === "segment") {
+      held = typeof msg.payload === "string" ? msg.payload.length : 0;
+      if (sinkBacklog + held > SINK_MAX_BACKLOG) {
+        link.dropped++;
+        return;
+      }
+      sinkBacklog += held;
+    }
     chain = chain
       .then(async () => {
-        if (!msg || typeof msg !== "object") return;
         if (msg.t === "hello") {
           // The frame URL comes from the browser, not from the page.
           link.hello = {
@@ -234,12 +273,12 @@ chrome.runtime.onConnect.addListener((port) => {
             url: String(port.sender.url || "").slice(0, 2048),
             title: String(msg.title || "").slice(0, 300),
           };
-          linkConnect(link);
+          if (linkAdmit(link)) linkConnect(link);
           return;
         }
         if (!link.hello) return;
         if (msg.t === "segment" && msg.header && typeof msg.header === "object") {
-          if (link.overflow) {
+          if (!linkAdmit(link)) {
             link.dropped++;
             return;
           }
@@ -254,20 +293,28 @@ chrome.runtime.onConnect.addListener((port) => {
             return;
           }
           const header = sinkSegmentHeader(msg.header);
-          linkSend(link, { blob: sinkFrame(header, payload), sb: header.sb, isInit: header.isInit });
+          linkSend(link, {
+            blob: sinkFrame(header, payload),
+            sb: header.sb,
+            isInit: header.isInit,
+            initCont: header.initCont,
+          });
           return;
         }
         if (msg.t === "event" && msg.header && typeof msg.header === "object") {
           const name = msg.header.name === "endofstream" || msg.header.name === "changetype" ? msg.header.name : null;
-          if (name) {
+          if (name && linkAdmit(link)) {
             const blob = sinkFrame({ type: "event", name, sb: msg.header.sb ?? null });
-            linkSend(link, { blob, sb: null, isInit: false });
+            linkSend(link, { blob, sb: null, isInit: false, initCont: false });
           }
         }
       })
       .catch(() => {
         // One failed message must not stop the ones behind it.
         link.dropped++;
+      })
+      .finally(() => {
+        sinkBacklog -= held;
       });
   });
 
@@ -277,7 +324,8 @@ chrome.runtime.onConnect.addListener((port) => {
     // connecting closes itself after flushing its queue (onopen).
     chain.then(() => {
       if (link.ws && link.ws.readyState === WebSocket.OPEN) link.ws.close();
-      sinkLinkCount--;
+      if (!link.overflow) sinkLinkCount--;
+      link.overflow = true; // never admitted again
       const m = sinkLinks.get(tabId);
       if (m) {
         m.delete(portId);

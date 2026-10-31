@@ -106,6 +106,7 @@
         if (depth === 0) out.boxes.push(type);
         if (type === "moov" || type === "ftyp") out.isInit = true;
         if (type === "moov") out.moov = [bodyStart, bodyEnd];
+        if (depth === 0 && (type === "moof" || type === "mdat")) out.media = true;
         // Protection markers: a pssh box anywhere, sample encryption in traf.
         if (type === "pssh" || type === "senc") out.encrypted = true;
 
@@ -152,9 +153,7 @@
         }
 
         if (CONTAINERS.has(type)) walk(bodyStart, bodyEnd, depth + 1);
-      }, depth === 0 ? (type, missing) => {
-        if (type === "moov") out.openMoov = missing;
-      } : null);
+      });
     };
 
     try {
@@ -167,6 +166,7 @@
     if (out.moov && !out.encrypted) {
       out.encrypted = hasAnyFourcc(u8, out.moov[0], out.moov[1], ENCRYPTION_FOURCCS);
     }
+    out.moovComplete = !!out.moov;
     delete out._defaultDuration;
     delete out._track;
     delete out._firstTrack;
@@ -191,6 +191,21 @@
     let value = keepMarker ? first : first & (mask - 1);
     for (let i = 1; i < len; i++) value = value * 256 + u8[off + i];
     return { value, len };
+  };
+
+  // Calls fn(id, bodyStart, bodyEnd) for each EBML child in [start, end).
+  const ebmlChildren = (u8, start, end, fn) => {
+    for (let p = start; p < end; ) {
+      const id = readVint(u8, p, true);
+      const size = id && readVint(u8, p + id.len, false);
+      if (!id || !size) return;
+      const s = p + id.len + size.len;
+      const unknown = size.value === Math.pow(2, 7 * size.len) - 1;
+      const e = unknown ? end : Math.min(end, s + size.value);
+      fn(id.value, s, e);
+      if (unknown || s + size.value <= p) return;
+      p = s + size.value;
+    }
   };
 
   // True when the two-byte sequence (a, b) occurs in u8[start, end).
@@ -224,6 +239,7 @@
         continue;
       } else if (id.value === 0x1f43b675) {
         out.boxes.push("Cluster");
+        out.media = true;
         // First child is normally Timecode (0xE7).
         const tc = readVint(u8, bodyStart, true);
         if (tc && tc.value === 0xe7) {
@@ -240,14 +256,38 @@
       } else if (id.value === 0x1654ae6b) {
         out.boxes.push("Tracks");
         out.isInit = true;
-        // ContentEncryption (0x5035) with ContentEncKeyID (0x47E2): WebM
-        // encryption (Widevine/ClearKey on WebM).
-        if (hasPair(u8, bodyStart, bodyEnd, 0x50, 0x35) && hasPair(u8, bodyStart, bodyEnd, 0x47, 0xe2)) {
-          out.encrypted = true;
-        }
+        // TrackEntry > ContentEncodings > ContentEncoding > ContentEncryption:
+        // WebM encryption (Widevine/ClearKey on WebM), read as structure, not
+        // guessed from byte pairs.
+        ebmlChildren(u8, bodyStart, bodyEnd, (tid, ts0, te0) => {
+          if (tid !== 0xae) return;
+          ebmlChildren(u8, ts0, te0, (cid, cs0, ce0) => {
+            if (cid !== 0x6d80) return;
+            ebmlChildren(u8, cs0, ce0, (eid, es0, ee0) => {
+              if (eid !== 0x6240) return;
+              ebmlChildren(u8, es0, ee0, (xid) => {
+                if (xid === 0x5035) out.encrypted = true;
+              });
+            });
+          });
+        });
       } else if (id.value === 0x1549a966) {
         out.boxes.push("Info");
         out.isInit = true;
+        // TimecodeScale (0x2AD7B1, nanoseconds per tick, default 1 ms):
+        // Cluster timecodes count in it.
+        for (let p = bodyStart; p < bodyEnd; ) {
+          const cid = readVint(u8, p, true);
+          const csize = cid && readVint(u8, p + cid.len, false);
+          if (!cid || !csize) break;
+          const cstart = p + cid.len + csize.len;
+          if (cid.value === 0x2ad7b1 && csize.value >= 1 && csize.value <= 8 && cstart + csize.value <= u8.byteLength) {
+            let ns = 0;
+            for (let i = 0; i < csize.value; i++) ns = ns * 256 + u8[cstart + i];
+            if (ns > 0) out.timescale = Math.max(1, Math.round(1e9 / ns));
+          }
+          p = cstart + csize.value;
+        }
       } else if (id.value === 0x1c53bb6b) {
         out.boxes.push("Cues");
       }
@@ -270,6 +310,26 @@
     }
     if (u8[0] === 0x47 && u8[188] === 0x47) return "ts";
     return "unknown";
+  };
+
+  // Scans one chunk of a still-open init for protection markers; `state`
+  // carries the last 3 bytes over chunk borders and the WebM pair halves.
+  const INIT_SCAN_MAX = 4 * 1024 * 1024;
+  const initScan = (state, u8) => {
+    if (state.found) return;
+    const n = Math.min(u8.byteLength, INIT_SCAN_MAX);
+    const joined = new Uint8Array(state.tail.byteLength + n);
+    joined.set(state.tail, 0);
+    joined.set(u8.subarray(0, n), state.tail.byteLength);
+    if (hasAnyFourcc(joined, 0, joined.byteLength, ENCRYPTION_FOURCCS)) state.found = true;
+    // A split WebM init cannot be walked as structure: all three element IDs
+    // (ContentEncodings 0x6D80, ContentEncryption 0x5035, ContentEncKeyID
+    // 0x47E2) must appear, which clear data practically never has.
+    state.webmA = state.webmA || hasPair(joined, 0, joined.byteLength, 0x6d, 0x80);
+    state.webmB = state.webmB || hasPair(joined, 0, joined.byteLength, 0x50, 0x35);
+    state.webmC = state.webmC || hasPair(joined, 0, joined.byteLength, 0x47, 0xe2);
+    if (state.webmA && state.webmB && state.webmC) state.found = true;
+    state.tail = joined.slice(Math.max(0, joined.byteLength - 3));
   };
 
   const toU8 = (data) => {
@@ -378,22 +438,27 @@
     const parsed = kind === "mp4" ? parseIsoBmff(u8) : kind === "webm" ? parseWebm(u8) : null;
     if (parsed && parsed.timescale) info.timescale = parsed.timescale;
 
-    // DRM: protection markers in an init segment (also one whose moov did not
-    // fit this append: then the whole small buffer is scanned) or in media
-    // (senc) mark the SourceBuffer as protected for good. Its bytes are never
-    // copied: streamtap detects DRM and leaves it alone.
+    // DRM: protection markers mark the SourceBuffer as protected for good; its
+    // bytes are never copied (streamtap detects DRM and leaves it alone).
+    // - parsed markers: pssh, senc, encv/enca/tenc inside a complete moov;
+    // - an init that is still open: from an init append without media (no
+    //   moof/mdat/Cluster) until media arrives, every append is the init's
+    //   continuation (an init split anywhere, even inside a box header). Each
+    //   one is scanned whole, across chunk borders (the last 3 bytes carry
+    //   over), for the ISO fourccs and the WebM ContentEncryption pair.
     let encryptedHere = !!(parsed && parsed.encrypted);
-    if (!encryptedHere && kind === "mp4" && parsed && parsed.isInit && u8.byteLength <= 4 * 1024 * 1024) {
-      encryptedHere = hasAnyFourcc(u8, 0, u8.byteLength, ENCRYPTION_FOURCCS);
+    const hasMedia = !!(parsed && parsed.media);
+    let initCont = false;
+    if (parsed && parsed.isInit && !hasMedia) {
+      info.initOpen = { tail: new Uint8Array(0), webmA: false, webmB: false, webmC: false };
+      if (!parsed.moovComplete || kind === "webm") initScan(info.initOpen, u8);
+    } else if (info.initOpen && !hasMedia && !(parsed && parsed.isInit)) {
+      initCont = true;
+      initScan(info.initOpen, u8);
+    } else if (hasMedia) {
+      info.initOpen = null;
     }
-    // The rest of a moov that did not fit the previous append: this append
-    // starts with it, without box headers the parser could recognise.
-    if (info.openMoov > 0) {
-      const rest = Math.min(info.openMoov, u8.byteLength);
-      if (!encryptedHere) encryptedHere = hasAnyFourcc(u8, 0, rest, ENCRYPTION_FOURCCS);
-      info.openMoov -= rest;
-    }
-    if (parsed && parsed.openMoov > 0 && parsed.openMoov <= 4 * 1024 * 1024) info.openMoov = parsed.openMoov;
+    if (info.initOpen && info.initOpen.found) encryptedHere = true;
     if (encryptedHere) info.encrypted = true;
     if (info.encrypted && !info.encryptedReported) {
       info.encryptedReported = true;
@@ -422,6 +487,7 @@
       bytes: u8.byteLength,
       kind,
       isInit: parsed ? parsed.isInit : false,
+      initCont,
       boxes: parsed ? parsed.boxes : [],
       tfdt: parsed ? parsed.tfdt : null,
       timescale: ts,

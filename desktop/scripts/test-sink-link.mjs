@@ -193,5 +193,50 @@ const half = Math.ceil(segments.length / 2);
   }
 }
 
+// --- split-init replay -------------------------------------------------------
+{
+  const p = fakePort(4, "splitrep-a");
+  const cut = 200;
+  const header = (isInit, initCont, u8) => ({
+    sb: 1, seq: seq++, ms: 1, mime, isInit, initCont, kind: isInit ? "mp4" : "unknown",
+    tfdt: isInit || initCont ? null : tfdtOf(u8), timescale, tso: 0,
+  });
+  p.onMessage({ t: "segment", header: header(true, false, init), payload: dataUrl(init.subarray(0, cut)) });
+  p.onMessage({ t: "segment", header: header(false, true, init), payload: dataUrl(init.subarray(cut)) });
+  p.onMessage({ t: "segment", header: header(false, false, segments[0]), payload: dataUrl(segments[0]) });
+  await sleep(800);
+  closeSockets(4);
+  await sleep(1300);
+  p.onMessage({ t: "segment", header: header(false, false, segments[1]), payload: dataUrl(segments[1]) });
+  await sleep(800);
+  p.onDisconnect();
+  await sleep(500);
+  const dirs = newDirs("splitrep");
+  check(dirs.length === 2, `split-init: two capture directories (got ${dirs.length})`);
+  if (dirs.length === 2) {
+    const r = rows(dirs[1]);
+    const shape = r.map((x) => (x.is_init ? "I" : "M")).join("");
+    check(shape === "IIM", `split-init: both init chunks replayed before the media (got ${shape})`);
+  }
+}
+
+// --- link limit ---------------------------------------------------------------
+{
+  const ports = [];
+  for (let i = 0; i < 16; i++) ports.push(fakePort(100 + i, `limit-${i}`));
+  const extra = fakePort(200, "limit-extra");
+  await sleep(800);
+  check(!status(200).connected, "limit: the 17th port is parked, no socket");
+  ports[0].onDisconnect();
+  await sleep(300);
+  seg(extra, init, true);
+  await sleep(800);
+  check(status(200).connected, "limit: the parked port connects once a slot is free");
+  for (const p of ports.slice(1)) p.onDisconnect();
+  extra.onDisconnect();
+  await sleep(500);
+  newDirs("limit-");
+}
+
 console.log(failures.length ? `FAILED: ${failures.length} check(s)` : "ok: all checks passed");
 process.exit(failures.length ? 1 : 0);

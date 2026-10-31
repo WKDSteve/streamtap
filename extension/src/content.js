@@ -93,6 +93,7 @@
       ms: m.msId ?? null,
       mime: str(m.mime, 256),
       isInit: m.isInit === true,
+      initCont: m.initCont === true && m.isInit !== true,
       kind: str(m.kind, 16),
       tfdt: m.tfdt ?? null,
       timescale: m.timescale ?? null,
@@ -147,7 +148,9 @@
         session: (crypto.randomUUID && crypto.randomUUID()) || String(Math.random()).slice(2),
         port: null,
         ports: 0,
-        inits: new Map(), // sb -> { header, payload }: init in effect at the end of the chain
+        // sb -> [{ header, payload }, ...]: the init in effect at the end of
+        // the chain, with its continuation chunks (an init split across appends)
+        inits: new Map(),
         chain: Promise.resolve(),
         closed: false,
       };
@@ -180,8 +183,10 @@
     });
     port.postMessage({ t: "hello", session: link.session, title: document.title.slice(0, 300) });
     if (link.ports > 1) {
-      for (const { header, payload } of link.inits.values()) {
-        port.postMessage({ t: "segment", header, payload: await toDataUrl(payload) });
+      for (const chunks of link.inits.values()) {
+        for (const { header, payload } of chunks) {
+          port.postMessage({ t: "segment", header, payload: await toDataUrl(payload) });
+        }
       }
     }
     return port;
@@ -205,10 +210,22 @@
 
   // Remembered when it is handed on, in chain order: media still queued
   // behind it belongs to it, media before it to the previous one.
+  // A continuation chunk joins the kept init; a new init replaces it. An init
+  // too large to keep also drops the old one, so the old quality's init is
+  // never replayed in front of the new quality's media.
   const keepInit = (link, header, payload) => {
-    if (!header.isInit || payload.byteLength > MAX_INIT_BYTES) return;
+    if (header.initCont) {
+      const chunks = link.inits.get(header.sb);
+      if (!chunks) return;
+      const kept = chunks.reduce((n, c) => n + c.payload.byteLength, 0);
+      if (kept + payload.byteLength > MAX_INIT_BYTES) link.inits.delete(header.sb);
+      else chunks.push({ header, payload });
+      return;
+    }
+    if (!header.isInit) return;
     link.inits.delete(header.sb);
-    link.inits.set(header.sb, { header, payload });
+    if (payload.byteLength > MAX_INIT_BYTES) return;
+    link.inits.set(header.sb, [{ header, payload }]);
     while (link.inits.size > MAX_KEPT_INITS) link.inits.delete(link.inits.keys().next().value);
   };
 

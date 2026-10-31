@@ -171,6 +171,48 @@ check(last().encrypted === true && last().payload === undefined, "split encrypte
 sb3.appendBuffer(ab(media(100)));
 check(last().payload === undefined, "split encrypted init: media after it is not tapped");
 
+// Split inside the moov's own 8-byte header: the first chunk has no moov at all.
+const sb4 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const enc4 = init("encv");
+const ftypLen = 8 + 4;
+sb4.appendBuffer(ab(enc4.subarray(0, ftypLen + 4)));
+sb4.appendBuffer(ab(enc4.subarray(ftypLen + 4)));
+check(last().initCont === true, "the rest of a split init is flagged initCont");
+check(last().encrypted === true && last().payload === undefined, "init split inside the moov header: caught");
+
+// A clear init together with media whose mdat happens to contain "encv": not DRM.
+const sb5 = ms.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+const combined = Buffer.concat([init("avc1"), box("moof", box("traf", tfhd(1), tfdt(0))), box("mdat", Buffer.from("..encv.."))]);
+sb5.appendBuffer(ab(combined));
+check(last().encrypted === false && last().payload instanceof ArrayBuffer, "encv inside mdat of a clear init+media append is not DRM");
+
+// WebM: an encrypted Tracks element split across two appends.
+const ebml = (id, body) => {
+  const idBytes = [];
+  for (let v = id; v > 0; v = Math.floor(v / 256)) idBytes.unshift(v & 0xff);
+  return Buffer.concat([Buffer.from(idBytes), Buffer.from([0x80 | body.length]), body]);
+};
+const webmInit = Buffer.concat([
+  ebml(0x1a45dfa3, Buffer.from([0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d])),
+  ebml(0x1549a966, ebml(0x2ad7b1, Buffer.from([0x0f, 0x42, 0x40]))), // TimecodeScale 1,000,000 ns
+  ebml(0x1654ae6b, ebml(0xae, ebml(0x6d80, ebml(0x6240, ebml(0x5035, ebml(0x47e2, Buffer.from([1, 2, 3, 4]))))))),
+]);
+const sbw2 = ms.addSourceBuffer('video/webm; codecs="vp9"');
+sbw2.appendBuffer(ab(webmInit.subarray(0, webmInit.length - 9)));
+sbw2.appendBuffer(ab(webmInit.subarray(webmInit.length - 9)));
+check(last().encrypted === true && last().payload === undefined, "split encrypted WebM Tracks: caught");
+const sbw3 = ms.addSourceBuffer('video/webm; codecs="vp9"');
+sbw3.appendBuffer(ab(webmInit));
+check(last().encrypted === true, "whole encrypted WebM Tracks: caught by structure");
+const clearWebm = Buffer.concat([
+  ebml(0x1a45dfa3, Buffer.from([0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d])),
+  ebml(0x1549a966, ebml(0x2ad7b1, Buffer.from([0x0f, 0x42, 0x40]))),
+  ebml(0x1654ae6b, ebml(0xae, Buffer.from([0x86, 0x82, 0x56, 0x39]))),
+]);
+const sbw4 = ms.addSourceBuffer('video/webm; codecs="vp9"');
+sbw4.appendBuffer(ab(clearWebm));
+check(last().encrypted === false && last().timescale === 1000, "clear WebM init: tapped, TimecodeScale read (1 ms -> 1000/s)");
+
 // The MediaSource closing is reported for the content script.
 ms.handlers.sourceclose();
 check(posted.some((p) => p.data.type === "msclose"), "sourceclose posts msclose");
