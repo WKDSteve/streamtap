@@ -10,6 +10,8 @@ streamtap-sink.exe and streamtap-host.exe are copied to %LOCALAPPDATA%\streamtap
 sink and the host next to itself), together with a copy of uninstall.ps1. A Start menu entry
 "streamtap" and an entry in Settings > Apps (which runs that uninstall.ps1) are made for the
 current user. No administrator rights; a file built on this machine carries no Mark-of-the-Web.
+The files are all copied first and then swapped in; a copy or a swap that fails puts the old ones
+back, so the install is never a mix of versions.
 
 Your data is not touched: the settings, the token and the pairings in
 %APPDATA%\io.github.wkdsteve.streamtap and the captures folder stay as they are.
@@ -47,6 +49,8 @@ else HKCU:\Software). For tests.
 .EXAMPLE
 .\scripts\build-install.ps1
 .\scripts\build-install.ps1 -BuildOnly
+# Windows PowerShell 5.1 under its default execution policy (Restricted), from the repo folder:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-install.ps1
 #>
 [CmdletBinding()]
 param(
@@ -89,6 +93,35 @@ function Test-Under([string] $Path, [string] $Dir) {
     return $p.StartsWith($d, [StringComparison]::OrdinalIgnoreCase)
 }
 
+# An absolute folder that is not a drive root, without a trailing backslash (a "C:\x\" would end the
+# quoted argument of the Settings > Apps command line with \", which escapes the quote).
+function Get-Place([string] $Dir) {
+    if (-not $Dir -or $Dir.Contains('"') -or -not [IO.Path]::IsPathRooted($Dir)) { Exit-Build "not an absolute path: '$Dir'" }
+    $full = [IO.Path]::GetFullPath($Dir)
+    if ($full.TrimEnd('\') -eq ([IO.Path]::GetPathRoot($full)).TrimEnd('\')) { Exit-Build "a drive root is no place for this: '$Dir'" }
+    return $full.TrimEnd('\')
+}
+
+# The registry root stands for HKCU\Software: a key of the current user, never another hive or a file path.
+function Get-RegistryRoot([string] $Key) {
+    $Key = $Key.TrimEnd('\')
+    if ($Key.Contains('"') -or $Key -notmatch '^(HKCU:|Registry::HKEY_CURRENT_USER)\\.') { Exit-Build "not a key below HKCU: '$Key'" }
+    return $Key
+}
+
+# The host a native messaging manifest names ('' when it cannot be read). The app writes UTF-8
+# without a BOM, which Windows PowerShell 5.1 reads as ANSI unless told.
+function Get-ManifestHost([string] $Manifest) {
+    try {
+        $json = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($json.PSObject.Properties['path']) { return [string]$json.path }
+    }
+    catch {
+        return ''
+    }
+    return ''
+}
+
 # The streamtap processes whose program lies in $Dir.
 function Get-RunningFrom([string] $Dir) {
     @(Get-Process -Name $programs -ErrorAction SilentlyContinue |
@@ -127,11 +160,9 @@ if ($BuildOnly) { return }
 
 $InstallDir = Get-Setting $InstallDir 'STREAMTAP_INSTALL_DIR' (Join-Path $env:LOCALAPPDATA 'streamtap')
 $StartMenuDir = Get-Setting $StartMenuDir 'STREAMTAP_START_MENU_DIR' ([Environment]::GetFolderPath('Programs'))
-$RegistryRoot = Get-Setting $RegistryRoot 'STREAMTAP_REGISTRY_ROOT' 'HKCU:\Software'
-foreach ($dir in $InstallDir, $StartMenuDir) {
-    if (-not [IO.Path]::IsPathRooted($dir)) { Exit-Build "not an absolute path: $dir" }
-}
-$InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
+$RegistryRoot = Get-RegistryRoot (Get-Setting $RegistryRoot 'STREAMTAP_REGISTRY_ROOT' 'HKCU:\Software')
+$InstallDir = Get-Place $InstallDir
+$StartMenuDir = Get-Place $StartMenuDir
 
 foreach ($name in $programs) {
     $source = Join-Path $BuildDir "$name.exe"
@@ -149,13 +180,51 @@ $version = (Get-Content -LiteralPath (Join-Path $root 'desktop\crates\streamtap-
 
 Write-Output "==> copying the programs to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-# Each file through a .new copy and a rename: a copy that fails leaves the old file whole.
+# All files are copied to .new first and renamed only when every copy succeeded: a copy that fails
+# leaves the old install whole (no new app beside an old sink), and its .new files are taken away.
 $files = @($programs | ForEach-Object { [pscustomobject]@{ From = (Join-Path $BuildDir "$_.exe"); Name = "$_.exe" } })
 $files += [pscustomobject]@{ From = (Join-Path $PSScriptRoot 'uninstall.ps1'); Name = 'uninstall.ps1' }
+try {
+    foreach ($f in $files) {
+        Copy-Item -LiteralPath $f.From -Destination (Join-Path $InstallDir "$($f.Name).new") -Force
+    }
+}
+catch {
+    foreach ($f in $files) {
+        Remove-Item -LiteralPath (Join-Path $InstallDir "$($f.Name).new") -Force -ErrorAction SilentlyContinue
+    }
+    Exit-Build "copying the programs failed, the installed ones are unchanged: $($_.Exception.Message)"
+}
+# Then each old file is moved aside to .old and its .new takes its place. A rename that fails (a
+# program started meanwhile, a scanner holding a file) puts every file swapped so far back, so the
+# install is again all old, never a mix of versions.
+$swapped = New-Object System.Collections.Generic.List[object]
+try {
+    foreach ($f in $files) {
+        $dest = Join-Path $InstallDir $f.Name
+        $hadOld = Test-Path -LiteralPath $dest
+        if ($hadOld) { Move-Item -LiteralPath $dest -Destination "$dest.old" -Force }
+        $step = [pscustomobject]@{ Dest = $dest; HadOld = $hadOld; Placed = $false }
+        $swapped.Add($step)
+        Move-Item -LiteralPath "$dest.new" -Destination $dest -Force
+        $step.Placed = $true
+    }
+}
+catch {
+    $why = $_.Exception.Message
+    for ($i = $swapped.Count - 1; $i -ge 0; $i--) {
+        $s = $swapped[$i]
+        if ($s.Placed) { Remove-Item -LiteralPath $s.Dest -Force -ErrorAction SilentlyContinue }
+        if ($s.HadOld) { Move-Item -LiteralPath "$($s.Dest).old" -Destination $s.Dest -Force -ErrorAction SilentlyContinue }
+    }
+    foreach ($f in $files) {
+        Remove-Item -LiteralPath (Join-Path $InstallDir "$($f.Name).new") -Force -ErrorAction SilentlyContinue
+    }
+    Exit-Build "replacing the programs failed, the installed ones were put back: $why"
+}
+# An .old file still held by someone stays; uninstall.ps1 takes it away later.
 foreach ($f in $files) {
-    $dest = Join-Path $InstallDir $f.Name
-    Copy-Item -LiteralPath $f.From -Destination "$dest.new" -Force
-    Move-Item -LiteralPath "$dest.new" -Destination $dest -Force
+    Remove-Item -LiteralPath (Join-Path $InstallDir "$($f.Name).old") -Force -ErrorAction SilentlyContinue
 }
 $app = Join-Path $InstallDir 'streamtap-app.exe'
 
@@ -173,9 +242,18 @@ $link.Save()
 $uninstallKey = "$RegistryRoot\Microsoft\Windows\CurrentVersion\Uninstall\streamtap"
 Write-Output "==> Settings > Apps entry ($uninstallKey)"
 $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+# -PauseOnError: Settings opens a console window that would close before an error could be read.
 $command = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`"" +
-" -InstallDir `"$InstallDir`" -StartMenuDir `"$StartMenuDir`" -RegistryRoot `"$RegistryRoot`""
+" -InstallDir `"$InstallDir`" -StartMenuDir `"$StartMenuDir`" -RegistryRoot `"$RegistryRoot`" -PauseOnError"
 $size = [int](((Get-ChildItem -LiteralPath $InstallDir -File | Measure-Object -Property Length -Sum).Sum) / 1KB)
+# There is one entry: an install in another folder loses it (its files stay there), so say so.
+$previous = Get-ItemProperty -LiteralPath $uninstallKey -ErrorAction SilentlyContinue
+$previousDir = ''
+if ($previous -and $previous.PSObject.Properties['InstallLocation']) { $previousDir = ([string]$previous.InstallLocation).TrimEnd('\') }
+if ($previousDir -and $previousDir -ne $InstallDir) {
+    Write-Output "the Settings > Apps entry was for the install in $previousDir; it now names this one, that copy stays:"
+    Write-Output "  remove it with: & `"$(Join-Path $previousDir 'uninstall.ps1')`" -InstallDir `"$previousDir`""
+}
 if (Test-Path -LiteralPath $uninstallKey) { Remove-Item -LiteralPath $uninstallKey -Recurse -Force }
 New-Item -Path $uninstallKey -Force | Out-Null
 $values = [ordered]@{
@@ -206,14 +284,7 @@ foreach ($browser in $browsers.Keys) {
     $item = Get-Item -LiteralPath $key -ErrorAction SilentlyContinue
     if (-not $item) { continue }
     $manifest = [string]$item.GetValue('')
-    $hostExe = ''
-    try {
-        $json = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-        if ($json.PSObject.Properties['path']) { $hostExe = [string]$json.path }
-    }
-    catch {
-        $hostExe = ''
-    }
+    $hostExe = Get-ManifestHost $manifest
     if (-not $hostExe) {
         $others += "  ${browser}: its manifest ($manifest) cannot be read"
     }

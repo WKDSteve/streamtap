@@ -4,7 +4,8 @@ Remove streamtap for the current user on Windows, without administrator rights.
 
 .DESCRIPTION
 Takes away what scripts/build-install.ps1 made: the programs and the copy of this script in
-%LOCALAPPDATA%\streamtap, the Start menu entry and the entry in Settings > Apps (which runs this
+%LOCALAPPDATA%\streamtap (and the .new and .old files of an install that was cut short), the Start
+menu entry and the entry in Settings > Apps (which runs this
 script from there). A browser's native messaging key is removed only when its manifest names a
 host inside the install folder; a registration of another copy (a checkout) stays.
 
@@ -17,7 +18,8 @@ the settings folder) stay, and so does a folder that still holds anything. A sec
 nothing to do and says so; it is not an error.
 
 It refuses while streamtap-app, -sink or -host runs from the install folder (and names the PIDs):
-close the app first, it stops its sink.
+close the app first, it stops its sink. Before -RemoveData also close a streamtap app started from
+elsewhere (the checkout): every copy uses the same settings folder.
 
 .PARAMETER RemoveData
 Also remove the app's own files: settings, token, pairings, host manifests, WebView cache (never the
@@ -25,6 +27,10 @@ captures, never a file the app did not make).
 
 .PARAMETER AllowElevated
 Remove although the session is elevated (for a build machine).
+
+.PARAMETER PauseOnError
+On an error, print it and wait for Enter (the Settings > Apps entry passes it: its console window
+would close before the message could be read).
 
 .PARAMETER InstallDir
 The install folder (default $env:STREAMTAP_INSTALL_DIR, else %LOCALAPPDATA%\streamtap).
@@ -49,10 +55,12 @@ The app's WebView data (default $env:STREAMTAP_LOCAL_DATA_DIR, else
 .\scripts\uninstall.ps1
 .\scripts\uninstall.ps1 -RemoveData
 #>
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'PauseOnError', Justification = 'read in the trap')]
 [CmdletBinding()]
 param(
     [switch] $RemoveData,
     [switch] $AllowElevated,
+    [switch] $PauseOnError,
     [string] $InstallDir = '',
     [string] $StartMenuDir = '',
     [string] $RegistryRoot = '',
@@ -62,6 +70,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+trap {
+    if ($PauseOnError) {
+        Write-Output "uninstall failed: $($_.Exception.Message)"
+        Read-Host 'press Enter to close' | Out-Null
+    }
+    break
+}
 
 $programs = @('streamtap-app', 'streamtap-sink', 'streamtap-host')
 $hostName = 'io.github.wkdsteve.streamtap'
@@ -90,11 +106,47 @@ function Test-Under([string] $Path, [string] $Dir) {
     return $p.StartsWith($d, [StringComparison]::OrdinalIgnoreCase)
 }
 
+# An absolute folder that is not a drive root, without a trailing backslash (as build-install.ps1).
+function Get-Place([string] $Dir) {
+    if (-not $Dir -or $Dir.Contains('"') -or -not [IO.Path]::IsPathRooted($Dir)) { Exit-Uninstall "not an absolute path: '$Dir'" }
+    $full = [IO.Path]::GetFullPath($Dir)
+    if ($full.TrimEnd('\') -eq ([IO.Path]::GetPathRoot($full)).TrimEnd('\')) { Exit-Uninstall "a drive root is no place for this: '$Dir'" }
+    return $full.TrimEnd('\')
+}
+
+# The registry root stands for HKCU\Software: a key of the current user, never another hive or a file path.
+function Get-RegistryRoot([string] $Key) {
+    $Key = $Key.TrimEnd('\')
+    if ($Key.Contains('"') -or $Key -notmatch '^(HKCU:|Registry::HKEY_CURRENT_USER)\\.') { Exit-Uninstall "not a key below HKCU: '$Key'" }
+    return $Key
+}
+
+# The host a native messaging manifest names ('' when it cannot be read). The app writes UTF-8
+# without a BOM, which Windows PowerShell 5.1 (the one Settings > Apps starts) reads as ANSI unless told.
+function Get-ManifestHost([string] $Manifest) {
+    try {
+        $json = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($json.PSObject.Properties['path']) { return [string]$json.path }
+    }
+    catch {
+        return ''
+    }
+    return ''
+}
+
 # A file that cannot be removed is an error, never a "removed".
 function Invoke-Removal([string] $Path, [switch] $Recurse) {
     try { Remove-Item -LiteralPath $Path -Force -Recurse:$Recurse }
     catch { Exit-Uninstall "cannot remove ${Path}: $($_.Exception.Message)" }
     if (Test-Path -LiteralPath $Path) { Exit-Uninstall "$Path is still there" }
+}
+
+# A folder that is empty goes; one that cannot (a terminal whose current folder it is) stays with a
+# word, not an error: nothing of streamtap is in it, and the Settings > Apps entry must still go.
+function Invoke-EmptyFolderRemoval([string] $Dir) {
+    if (-not (Test-Path -LiteralPath $Dir -PathType Container) -or (Get-ChildItem -LiteralPath $Dir -Force)) { return }
+    try { Remove-Item -LiteralPath $Dir -Force }
+    catch { Write-Output "kept the empty folder $Dir (in use: $($_.Exception.Message))" }
 }
 
 if ($env:CLAUDECODE) {
@@ -107,13 +159,13 @@ if (-not $AllowElevated -and $principal.IsInRole([Security.Principal.WindowsBuil
 
 $InstallDir = Get-Setting $InstallDir 'STREAMTAP_INSTALL_DIR' (Join-Path $env:LOCALAPPDATA 'streamtap')
 $StartMenuDir = Get-Setting $StartMenuDir 'STREAMTAP_START_MENU_DIR' ([Environment]::GetFolderPath('Programs'))
-$RegistryRoot = Get-Setting $RegistryRoot 'STREAMTAP_REGISTRY_ROOT' 'HKCU:\Software'
-$DataDir = Get-Setting $DataDir 'STREAMTAP_DATA_DIR' (Join-Path $env:APPDATA $hostName)
-$LocalDataDir = Get-Setting $LocalDataDir 'STREAMTAP_LOCAL_DATA_DIR' (Join-Path $env:LOCALAPPDATA $hostName)
-foreach ($dir in $InstallDir, $StartMenuDir, $DataDir, $LocalDataDir) {
-    if (-not [IO.Path]::IsPathRooted($dir)) { Exit-Uninstall "not an absolute path: $dir" }
+$RegistryRoot = Get-RegistryRoot (Get-Setting $RegistryRoot 'STREAMTAP_REGISTRY_ROOT' 'HKCU:\Software')
+$InstallDir = Get-Place $InstallDir
+$StartMenuDir = Get-Place $StartMenuDir
+if ($RemoveData) {
+    $DataDir = Get-Place (Get-Setting $DataDir 'STREAMTAP_DATA_DIR' (Join-Path $env:APPDATA $hostName))
+    $LocalDataDir = Get-Place (Get-Setting $LocalDataDir 'STREAMTAP_LOCAL_DATA_DIR' (Join-Path $env:LOCALAPPDATA $hostName))
 }
-$InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
 
 $running = @(Get-Process -Name $programs -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -and (Test-Under $_.Path $InstallDir) })
@@ -131,18 +183,12 @@ foreach ($browser in $browsers.Keys) {
     $item = Get-Item -LiteralPath $key -ErrorAction SilentlyContinue
     if (-not $item) { continue }
     $manifest = [string]$item.GetValue('')
-    $hostExe = ''
-    try {
-        $json = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-        if ($json.PSObject.Properties['path']) { $hostExe = [string]$json.path }
-    }
-    catch {
-        $hostExe = ''
-    }
+    $hostExe = Get-ManifestHost $manifest
     $ours = $hostExe -and (Test-Under $hostExe $InstallDir)
     $withData = $RemoveData -and $manifest -and (Test-Under $manifest $DataDir)
     if (-not ($ours -or $withData)) {
-        Write-Output "kept the $browser registration (it starts $hostExe, not this install)"
+        if ($hostExe) { Write-Output "kept the $browser registration (it starts $hostExe, not this install)" }
+        else { Write-Output "kept the $browser registration (its manifest $manifest cannot be read)" }
         continue
     }
     Invoke-Removal $key -Recurse
@@ -164,16 +210,16 @@ if (Test-Path -LiteralPath $link -PathType Leaf) {
 }
 
 # 3. The files build-install.ps1 puts there; a folder that holds anything else stays.
-foreach ($name in @($programs | ForEach-Object { "$_.exe"; "$_.exe.new" }) + @('uninstall.ps1', 'uninstall.ps1.new')) {
+# The .new and .old files are what an install that was cut short leaves.
+$installed = @($programs | ForEach-Object { "$_.exe" }) + @('uninstall.ps1')
+foreach ($name in $installed | ForEach-Object { $_; "$_.new"; "$_.old" }) {
     $file = Join-Path $InstallDir $name
     if (Test-Path -LiteralPath $file) {
         Invoke-Removal $file
-        if ($name -notlike '*.new') { $removed += $file }
+        if ($installed -contains $name) { $removed += $file }
     }
 }
-if ((Test-Path -LiteralPath $InstallDir) -and -not (Get-ChildItem -LiteralPath $InstallDir -Force)) {
-    Invoke-Removal $InstallDir
-}
+Invoke-EmptyFolderRemoval $InstallDir
 
 # 4. The Settings > Apps entry last: while anything above fails, it stays to run again.
 $uninstallKey = "$RegistryRoot\Microsoft\Windows\CurrentVersion\Uninstall\streamtap"
@@ -218,9 +264,7 @@ if ($RemoveData) {
         Invoke-Removal $webView -Recurse
         $removed += $webView
     }
-    foreach ($dir in $manifests, $DataDir, $LocalDataDir) {
-        if ((Test-Path -LiteralPath $dir) -and -not (Get-ChildItem -LiteralPath $dir -Force)) { Invoke-Removal $dir }
-    }
+    foreach ($dir in $manifests, $DataDir, $LocalDataDir) { Invoke-EmptyFolderRemoval $dir }
     if (Test-Path -LiteralPath $DataDir) {
         Write-Output "kept $DataDir (it holds files that are not the app's settings, such as the captures folder)"
     }

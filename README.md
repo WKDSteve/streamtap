@@ -56,6 +56,12 @@ and the install would exist only there (the scripts refuse inside a Claude sessi
 .\scripts\uninstall.ps1 -RemoveData      # also the app's settings, token, pairings, WebView cache
 ```
 
+Windows PowerShell 5.1 runs no script under its default execution policy (`Restricted`);
+then, from the repo folder, `powershell -NoProfile -ExecutionPolicy Bypass -File
+scripts\build-install.ps1` (or `pwsh` instead of `powershell`, as `:MyNative install` does).
+Close a streamtap app started from the checkout first: the build refuses while
+`desktop\target\release\streamtap-*.exe` runs.
+
 `build-install.ps1` copies `streamtap-app.exe`, `streamtap-sink.exe` and
 `streamtap-host.exe` to `%LOCALAPPDATA%\streamtap` together with a copy of
 `uninstall.ps1`, adds a Start menu entry *streamtap* and an entry in *Settings > Apps*

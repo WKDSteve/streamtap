@@ -394,9 +394,16 @@ anywhere.
 
 Both scripts refuse while `streamtap-app`, `-sink` or `-host` runs from the install
 folder and name the PIDs (`build.ps1` does the same for the checkout); the files are
-replaced through a `.new` copy and a rename. A second `uninstall.ps1` says there is
-nothing to do; a file it cannot remove is an error, and the *Settings > Apps* entry
-then stays for the next run.
+first all copied to `.new`, then each old one is renamed to `.old` and its `.new` takes
+its place. A copy or a rename that fails puts back what was swapped, so the install is
+never a mix of an old and a new program; `uninstall.ps1` also removes `.new` and `.old`
+files left behind. There is one *Settings > Apps* entry: an install into another folder
+takes it over and names the install that lost it (its files stay). A second
+`uninstall.ps1` says there is nothing to do; a file it cannot remove is an error, and the
+*Settings > Apps* entry then stays for the next run. An empty install folder that cannot
+go (a terminal whose current folder it is) stays with a note, the entry goes anyway.
+`-RemoveData` while a streamtap app of another copy (the checkout's) runs: that app uses
+the same settings folder and keeps its WebView cache open, so close every copy first.
 
 **Browsers after an install.** The app owns the registration (manifest, key,
 rollback; see "Connect browser"), so the script does not write it. A browser
@@ -417,8 +424,11 @@ read), and for `uninstall.ps1` also `-DataDir`, `-LocalDataDir`; each defaults t
 `scripts/test-install.ps1` (CI, job `hygiene`) installs stand-ins (copies of `cmd.exe`)
 into a temp folder with a throw-away registry root `HKCU:\Software\streamtap-test-install-<id>`
 and checks files, shortcut, entry, the browser report, the refusals (Claude session, a
-running sink, a locked file), uninstalling with the installed copy, a second uninstall, and
-that `-RemoveData` keeps captures and foreign files.
+running sink, a locked file, a drive root, a registry root outside `HKCU`), a copy and a
+rename that fail (all old again), the entry taken over by another folder, uninstalling
+with the entry's command line as Windows runs it (Windows PowerShell 5.1, places with a
+space and a non-ASCII letter, the pause on an error), from inside the install folder, a
+second uninstall, and that `-RemoveData` keeps captures and foreign files.
 
 What it does:
 
