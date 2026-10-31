@@ -1935,7 +1935,8 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
 /// Runs ffprobe per part and collects what went wrong with ffprobe itself.
 struct Prober<'a> {
     tools: &'a Tools,
-    /// Set once ffprobe turned out to be missing: not asked again per part.
+    /// Set once ffprobe turned out to be missing or not startable: not asked
+    /// again per part.
     missing: bool,
     warnings: Vec<String>,
 }
@@ -1948,7 +1949,9 @@ impl Prober<'_> {
         }
         match probe_start(self.tools, format, path) {
             Ok(p) => Some(p),
-            Err(e @ SinkError::ToolMissing { .. }) => {
+            // Missing or not startable: the same for every part, so said
+            // once and not tried again (ENG-13).
+            Err(e @ (SinkError::ToolMissing { .. } | SinkError::ToolSpawn { .. })) => {
                 self.missing = true;
                 self.warnings.push(format!(
                     "{e}. Without it the parts are not checked for decodability and are aligned by the capture's own timestamps (B-frame offsets and edit lists not counted)."
@@ -2088,12 +2091,14 @@ fn run_ffmpeg(
         eprintln!("mux: some inputs have no start time; their alignment is ffmpeg's guess");
     }
     println!("mux: {} input(s) -> {}", inputs.len(), out.display());
-    let done = proc::run(&Spec {
-        tool: Tool::Ffmpeg,
-        program: tools.program(Tool::Ffmpeg),
-        args: ffmpeg_args(inputs, out),
-        extra_env: Vec::new(),
-        timeout,
+    let done = write_through_part(out, |part| {
+        proc::run(&Spec {
+            tool: Tool::Ffmpeg,
+            program: tools.program(Tool::Ffmpeg),
+            args: ffmpeg_args(inputs, part),
+            extra_env: Vec::new(),
+            timeout,
+        })
     })?;
     // Errors ffmpeg reported but survived are passed on, not dropped (RS-06).
     let notes = proc::quote_tail(&done.stderr, proc::STDERR_QUOTE);
@@ -2102,6 +2107,42 @@ fn run_ffmpeg(
     }
     println!("mux: ok");
     Ok(())
+}
+
+/// `out` with `.part` before its extension (`out.part.mp4`), next to it:
+/// ffmpeg still picks the container from the extension.
+fn part_path(out: &Path) -> PathBuf {
+    let mut name = out.file_stem().unwrap_or_default().to_os_string();
+    name.push(".part");
+    if let Some(ext) = out.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    out.with_file_name(name)
+}
+
+/// Runs `write` on a sibling part file and renames it to `out` only on
+/// success. A killed or failed ffmpeg leaves a truncated file (with
+/// `+faststart` the moov comes last, so it does not play); that file is
+/// removed, and an older `out` stays untouched.
+fn write_through_part<T>(
+    out: &Path,
+    write: impl FnOnce(&Path) -> Result<T, SinkError>,
+) -> Result<T, SinkError> {
+    let part = part_path(out);
+    let result = write(&part).and_then(|v| {
+        fs::rename(&part, out)
+            .map(|()| v)
+            .map_err(|e| SinkError::io("cannot rename", Some(part.clone()), e))
+    });
+    if result.is_err() {
+        if let Err(e) = fs::remove_file(&part) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("mux: cannot remove {}: {e}", part.display());
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2966,7 +3007,32 @@ mod tests {
     /// capture's own start instead of silently counting as "start unknown".
     #[test]
     fn a_missing_ffprobe_is_reported_not_swallowed() {
-        let dir = temp_dir("noprobe");
+        let warnings = plan_two_parts_with("noprobe", &tools_without(Tool::Ffprobe));
+        assert!(warnings[0].starts_with("ffprobe not found"), "{warnings:?}");
+    }
+
+    /// ENG-13 also for an ffprobe that exists but cannot be started: one
+    /// warning, not one (and one spawn attempt) per part.
+    #[test]
+    fn an_unstartable_ffprobe_is_reported_once() {
+        let dir = temp_dir("badprobe");
+        let bad = dir.join("ffprobe-not-a-program.exe");
+        fs::write(&bad, "this is a text file, not a program").expect("write");
+        let tools = Tools {
+            ffprobe: bad.into(),
+            ..Tools::default()
+        };
+        let warnings = plan_two_parts_with("badprobe-parts", &tools);
+        assert!(
+            warnings[0].starts_with("cannot run ffprobe"),
+            "{warnings:?}"
+        );
+    }
+
+    /// Plans two MP4 parts with `tools` (ffprobe unusable); expects both kept
+    /// with the capture's start and exactly one warning, which it returns.
+    fn plan_two_parts_with(name: &str, tools: &Tools) -> Vec<String> {
+        let dir = temp_dir(name);
         let init = init_with_traks(1);
         let mut seg = init.clone();
         seg.extend(moof(2000));
@@ -2986,18 +3052,57 @@ mod tests {
             rows.push(i);
             rows.push(m);
         }
-        let plan = mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)).expect("plan");
+        let plan = mux_inputs(&dir, &rows, tools).expect("plan");
         assert_eq!(plan.inputs.len(), 2, "parts are kept: {plan:?}");
         assert!(
             plan.inputs.iter().all(|i| i.start == Some(2.0)),
             "the capture's start is used: {plan:?}"
         );
         assert_eq!(plan.warnings.len(), 1, "said once: {:?}", plan.warnings);
-        assert!(
-            plan.warnings[0].starts_with("ffprobe not found"),
-            "{:?}",
-            plan.warnings
+        plan.warnings
+    }
+
+    #[test]
+    fn the_part_file_keeps_the_extension() {
+        assert_eq!(
+            part_path(Path::new("cap/out.mp4")),
+            Path::new("cap/out.part.mp4")
         );
+        assert_eq!(part_path(Path::new("cap/out")), Path::new("cap/out.part"));
+    }
+
+    /// A mux killed at its deadline (or the output limit) leaves neither a
+    /// truncated `out` nor its part file, and an older `out` stays intact.
+    #[test]
+    fn a_killed_mux_leaves_no_truncated_output() {
+        let dir = temp_dir("killedmux");
+        let out = dir.join("out.mp4");
+        fs::write(&out, b"older result").expect("write");
+        let err = write_through_part(&out, |part| -> Result<(), SinkError> {
+            fs::write(part, b"truncated, no moov").expect("write part");
+            Err(SinkError::ToolTimeout {
+                tool: Tool::Ffmpeg,
+                after: Duration::from_secs(1),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        assert_eq!(fs::read(&out).expect("out"), b"older result");
+        assert!(!part_path(&out).exists(), "part file removed");
+    }
+
+    #[test]
+    fn a_finished_mux_replaces_the_output() {
+        let dir = temp_dir("finishedmux");
+        let out = dir.join("out.mp4");
+        fs::write(&out, b"older result").expect("write");
+        write_through_part(&out, |part| {
+            fs::write(part, b"new result").expect("write part");
+            Ok(())
+        })
+        .expect("mux");
+        assert_eq!(fs::read(&out).expect("out"), b"new result");
+        assert!(!part_path(&out).exists());
     }
 
     #[test]

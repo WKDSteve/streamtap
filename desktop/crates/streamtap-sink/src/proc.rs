@@ -1,7 +1,7 @@
 //! Child processes (ffmpeg, ffprobe) under one frame (RS-04, RS-06,
 //! ENG-01..03): no shell, an empty environment plus a fixed allow-list, the
 //! program from a closed enum, stdin null, both pipes drained on their own
-//! threads with byte limits, one deadline for pipes and exit, no console
+//! threads with byte limits (stdout capped, stderr keeps its tail), one deadline for pipes and exit, no console
 //! window. Every path ends with the child killed or exited and reaped.
 
 use std::ffi::OsString;
@@ -29,7 +29,9 @@ pub const ENV_ALLOW: &[&str] = &[
     "USERPROFILE",
 ];
 
-/// Bytes kept per pipe; more kills the child (ENG-03).
+/// Bytes kept per pipe (ENG-03): more on stdout kills the child; stderr is
+/// drained to its end and only the last `PIPE_LIMIT` bytes are kept, so a
+/// long mux that logs many errors is not killed for it.
 pub const PIPE_LIMIT: usize = 64 * 1024;
 /// Bytes of stderr quoted in an error message (the tail).
 pub const STDERR_QUOTE: usize = 4 * 1024;
@@ -141,23 +143,7 @@ pub struct Output {
 /// the tail of stderr; a missing program `ToolMissing`.
 pub fn run(spec: &Spec<'_>) -> Result<Output, SinkError> {
     let tool = spec.tool;
-    let mut cmd = Command::new(spec.program);
-    cmd.args(&spec.args)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for name in ENV_ALLOW {
-        if let Some(v) = std::env::var_os(name) {
-            cmd.env(name, v);
-        }
-    }
-    for (k, v) in &spec.extra_env {
-        cmd.env(k, v);
-    }
-    no_window(&mut cmd);
-
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = command(spec).spawn().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             SinkError::ToolMissing { tool }
         } else {
@@ -176,11 +162,23 @@ pub fn run(spec: &Spec<'_>) -> Result<Output, SinkError> {
         let tx = tx.clone();
         let overflow = Arc::clone(&overflow);
         thread::spawn(move || {
-            let (buf, over) = read_limited(reader, PIPE_LIMIT);
-            if over {
-                let _ =
-                    overflow.compare_exchange(0, pipe.code(), Ordering::SeqCst, Ordering::SeqCst);
-            }
+            let buf = match pipe {
+                // More stdout than the limit is a misbehaving tool: kill it.
+                Pipe::Stdout => {
+                    let (buf, over) = read_limited(reader, PIPE_LIMIT);
+                    if over {
+                        let _ = overflow.compare_exchange(
+                            0,
+                            pipe.code(),
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
+                    }
+                    buf
+                }
+                // A long run may log many errors: drain on, keep the tail.
+                Pipe::Stderr => read_tail(reader, PIPE_LIMIT),
+            };
             let _ = tx.send((pipe, buf));
         });
     }
@@ -243,6 +241,27 @@ pub fn run(spec: &Spec<'_>) -> Result<Output, SinkError> {
     }
 }
 
+/// The child as `run` starts it: no shell, cleared environment plus the
+/// allow-list, stdin null, both pipes captured, no console window.
+fn command(spec: &Spec<'_>) -> Command {
+    let mut cmd = Command::new(spec.program);
+    cmd.args(&spec.args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in ENV_ALLOW {
+        if let Some(v) = std::env::var_os(name) {
+            cmd.env(name, v);
+        }
+    }
+    for (k, v) in &spec.extra_env {
+        cmd.env(k, v);
+    }
+    no_window(&mut cmd);
+    cmd
+}
+
 enum Waited {
     Exited(ExitStatus),
     TimedOut,
@@ -300,6 +319,29 @@ fn read_limited(mut r: impl Read, limit: usize) -> (Vec<u8>, bool) {
             }
         }
     }
+}
+
+/// Reads to EOF and keeps the last `limit` bytes; the pipe stays drained, so
+/// the child never blocks on it.
+fn read_tail(mut r: impl Read, limit: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                // Trimmed in batches: at most about 2 * limit held.
+                if buf.len() > 2 * limit {
+                    buf.drain(..buf.len() - limit);
+                }
+            }
+        }
+    }
+    if buf.len() > limit {
+        buf.drain(..buf.len() - limit);
+    }
+    buf
 }
 
 fn describe(st: ExitStatus) -> String {
@@ -360,10 +402,24 @@ mod tests {
         match mode.as_str() {
             "sleep" => thread::sleep(Duration::from_secs(120)),
             "spam" => {
-                let line = vec![b'x'; 1023];
+                let line = "x".repeat(1023);
                 for _ in 0..1024 {
-                    eprintln!("{}", String::from_utf8_lossy(&line));
+                    eprintln!("{line}");
                 }
+                eprintln!("spam: the last line");
+            }
+            "flood" => {
+                use std::io::Write;
+                let line = "z".repeat(1023);
+                let mut out = io::stdout().lock();
+                for _ in 0..1024 {
+                    if writeln!(out, "{line}").is_err() {
+                        break;
+                    }
+                }
+                drop(out);
+                // Stays alive: only the kill ends it within the test's bound.
+                thread::sleep(Duration::from_secs(120));
             }
             "fail" => {
                 eprintln!("{}", "y".repeat(10_000));
@@ -379,9 +435,9 @@ mod tests {
         }
     }
 
-    fn helper(mode: &str, timeout: Duration) -> Result<Output, SinkError> {
+    fn with_helper<T>(mode: &str, timeout: Duration, f: impl FnOnce(&Spec<'_>) -> T) -> T {
         let exe: OsString = std::env::current_exe().expect("test exe").into();
-        run(&Spec {
+        f(&Spec {
             tool: Tool::Ffmpeg,
             program: &exe,
             args: ["--exact", "proc::tests::child_helper", "--nocapture"]
@@ -391,6 +447,53 @@ mod tests {
             extra_env: vec![(CHILD.to_owned(), mode.to_owned())],
             timeout,
         })
+    }
+
+    fn helper(mode: &str, timeout: Duration) -> Result<Output, SinkError> {
+        with_helper(mode, timeout, run)
+    }
+
+    fn sleeping_child() -> Child {
+        with_helper("sleep", Duration::ZERO, |s| command(s).spawn()).expect("spawn")
+    }
+
+    /// `wait_until` itself must kill and reap: with a no-op kill `run` would
+    /// still report the error after the reader grace and orphan the child.
+    fn assert_killed(child: &mut Child, started: Instant) {
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "the child is dead and reaped"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "killed, not waited for"
+        );
+    }
+
+    #[test]
+    fn wait_until_kills_the_child_at_the_deadline() {
+        let t = Instant::now();
+        let mut child = sleeping_child();
+        let w = wait_until(
+            &mut child,
+            Instant::now() + Duration::from_secs(1),
+            &AtomicU8::new(0),
+        );
+        assert!(matches!(w, Waited::TimedOut));
+        assert_killed(&mut child, t);
+    }
+
+    #[test]
+    fn wait_until_kills_the_child_on_overflow() {
+        let t = Instant::now();
+        let mut child = sleeping_child();
+        let w = wait_until(
+            &mut child,
+            Instant::now() + Duration::from_secs(60),
+            &AtomicU8::new(Pipe::Stdout.code()),
+        );
+        assert!(matches!(w, Waited::Overflow(Pipe::Stdout)));
+        assert_killed(&mut child, t);
     }
 
     #[test]
@@ -414,18 +517,43 @@ mod tests {
     }
 
     #[test]
-    fn a_flooding_child_is_killed_at_the_byte_limit() {
-        let err = helper("spam", Duration::from_secs(60)).unwrap_err();
+    fn a_flooding_child_is_killed_at_the_stdout_limit() {
+        let t = Instant::now();
+        let err = helper("flood", Duration::from_secs(60)).unwrap_err();
         assert!(
             matches!(
                 err,
                 SinkError::ToolOutputLimit {
-                    pipe: Pipe::Stderr,
+                    pipe: Pipe::Stdout,
                     ..
                 }
             ),
             "{err}"
         );
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "killed, not waited for"
+        );
+    }
+
+    /// A long mux that logs many errors is not killed for it: stderr is
+    /// drained to its end and only the tail is kept.
+    #[test]
+    fn a_chatty_stderr_keeps_its_tail_and_does_not_kill() {
+        let out = helper("spam", Duration::from_secs(60)).expect("spam child succeeds");
+        assert!(out.stderr.len() <= PIPE_LIMIT, "{}", out.stderr.len());
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            text.trim_end().ends_with("spam: the last line"),
+            "the tail is kept"
+        );
+    }
+
+    #[test]
+    fn read_tail_keeps_the_last_bytes() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(read_tail(&data[..], 1000), &data[data.len() - 1000..]);
+        assert_eq!(read_tail(&b"short"[..], 1000), b"short");
     }
 
     #[test]

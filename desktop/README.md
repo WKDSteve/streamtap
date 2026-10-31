@@ -108,17 +108,21 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   `TMP`, `TMPDIR`, `HOME`, `USERPROFILE`, stdin null and no console window.
   One deadline covers exit and pipes: `ffmpeg -version` 20 s, ffprobe 60 s
   per part, the mux `--timeout-secs` (default 3600); then the child is
-  killed. stdout and stderr are capped at 64 KiB each (more kills the
-  child); a failure quotes the last 4 KiB of stderr. ffmpeg logs errors only,
+  killed. stdout is capped at 64 KiB (more kills the child); stderr is read
+  to its end and only its last 64 KiB are kept, so a long mux that logs many
+  errors is not killed for it; a failure quotes the last 4 KiB of stderr.
+  ffmpeg writes to `out.part.mp4` next to the result and the file is renamed
+  to `out.mp4` only when ffmpeg succeeded: a killed or failed mux leaves no
+  truncated file and an older result in place. ffmpeg logs errors only,
   and what it reports on success is printed after the run.
 - **Version and missing tools:** `mux` first runs `ffmpeg -version` and
   prints the version line (`mux: ffmpeg version …`); without ffmpeg it stops
   before any work with "ffmpeg not found on PATH". A missing ffprobe is a
-  warning, said once: the parts are then not checked for decodability and
+  warning, said once (also when it exists but cannot be started): the parts are then not checked for decodability and
   are aligned by the capture's own timestamps (without B-frame offsets and
   edit lists). ffprobe timing out on a part is a warning for that part.
 - **Exit codes:** `0` ok, `1` file or socket error, `2` usage, `3` the capture
-  holds nothing to mux, `4` ffmpeg/ffprobe missing or not startable, `5` a tool
+  holds nothing to mux, `4` ffmpeg missing or not startable (a missing ffprobe is only a warning), `5` a tool
   timed out or exceeded its output limit, `6` ffmpeg failed (its stderr tail is
   printed).
 
