@@ -22,6 +22,9 @@ streamtap-host = { path = "../streamtap-host" }
 win32job = "2"
 # Per-user registration of the native messaging host (HKCU). Safe wrapper over the registry API (MIT).
 winreg = "0.56"
+# Reads the DACL of config.json to warn when broad groups can read it (SRV-14). Safe wrapper over the
+# security APIs (MIT); its dependencies (winapi 0.3, bitflags 1) are already in the tree.
+windows-permissions = "0.2"
 
 [dev-dependencies]
 # WebSocket client for the end-to-end test against the real sink (already in the tree through the sink).

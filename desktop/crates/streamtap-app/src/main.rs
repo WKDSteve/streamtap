@@ -8,6 +8,7 @@
 
 mod captures;
 mod config;
+mod config_access;
 mod hub;
 mod jobs;
 mod pairings;
@@ -53,6 +54,8 @@ struct Inner {
     config_path: PathBuf,
     /// Why the stored config could not be used (the defaults run meanwhile).
     config_error: Option<String>,
+    /// Broad groups that can read `config.json`, checked at start (SRV-14).
+    config_access: Option<config_access::ConfigAccess>,
     sink: Option<SinkProc>,
     crashed: Option<SinkExit>,
     log: VecDeque<String>,
@@ -118,6 +121,7 @@ impl Inner {
             bridge: None,
             bridge_error: None,
             config_error,
+            config_access: None,
             sink: None,
             crashed: None,
             log: VecDeque::new(),
@@ -150,6 +154,18 @@ impl Inner {
         self.sink.as_ref().map(|p| p.run)
     }
 
+    /// Checks who can read `config.json` and notes a finding in the log (and
+    /// on stderr) as well as for the UI.
+    fn check_config_access(&mut self) {
+        let access = config_access::check(&self.config_path);
+        if let Some(a) = &access {
+            let line = a.log_line(&self.config_path);
+            eprintln!("{line}");
+            sink::push_log(&mut self.log, line);
+        }
+        self.config_access = access;
+    }
+
     fn stop_sink(&mut self) {
         if let Some(mut proc) = self.sink.take() {
             let _ = proc.child.kill();
@@ -173,6 +189,7 @@ struct Snapshot {
     sink_path: Option<String>,
     ffmpeg: Option<String>,
     config_error: Option<String>,
+    config_access: Option<config_access::ConfigAccess>,
     captures: Vec<CaptureInfo>,
     captures_error: Option<String>,
     mux: HashMap<String, MuxState>,
@@ -255,6 +272,7 @@ async fn snapshot(state: State<'_, AppState>) -> CmdResult<Snapshot> {
         sink_path: sink::find_sink().map(|p| p.display().to_string()),
         ffmpeg: sink::find_ffmpeg().map(|p| p.display().to_string()),
         config_error: g.config_error.clone(),
+        config_access: g.config_access.clone(),
         captures,
         captures_error,
         mux: g.mux.clone(),
@@ -629,6 +647,7 @@ fn main() {
                 Err(e) => (Settings::defaults(&data_dir), Some(e)),
             };
             let mut inner = Inner::new(settings, config_path, config_error);
+            inner.check_config_access();
             match hub::Server::start(&inner.hub, &inner.config_dir) {
                 Ok(server) => inner.bridge = Some(server),
                 Err(e) => inner.bridge_error = Some(e),
@@ -710,6 +729,37 @@ mod tests {
         );
         on_sink_line(&st, &real, "tok", &root, 1);
         assert!(victim.join(captures::DRM_FLAG).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The start-up check of `config.json` (SRV-14): a log line and a snapshot
+    /// field once Everyone may read it. (Before the grant the temp folder's
+    /// own rights decide; a CI runner's may already include Users.)
+    #[cfg(windows)]
+    #[test]
+    fn a_config_readable_by_everyone_is_reported_at_start() {
+        let (st, dir) = state("config-access");
+        let path = dir.join("config.json");
+        config::save(&path, &st.lock().settings).unwrap();
+        let mut g = st.lock();
+        g.check_config_access();
+        let everyone = |a: &Option<config_access::ConfigAccess>| matches!(a, Some(config_access::ConfigAccess::Exposed { groups }) if groups.contains(&"everyone"));
+        assert!(!everyone(&g.config_access), "{:?}", g.config_access);
+        assert_eq!(g.log.len(), usize::from(g.config_access.is_some()));
+        g.log.clear();
+        let granted = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:(R)"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(granted.success());
+        g.check_config_access();
+        assert!(everyone(&g.config_access), "{:?}", g.config_access);
+        assert_eq!(g.log.len(), 1);
+        assert!(g.log[0].starts_with("warning: ") && g.log[0].contains("everyone"));
+        assert!(!g.log[0].contains(g.settings.token.expose()));
+        drop(g);
         fs::remove_dir_all(&dir).unwrap();
     }
 

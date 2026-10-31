@@ -378,7 +378,8 @@ What it does:
   are locked while the sink runs. They live in `config.json` in the app config
   dir (`%APPDATA%\io.github.wkdsteve.streamtap`); the token is generated on
   first run. A config that does not parse is not overwritten: defaults run and
-  the UI says so.
+  the UI says so. When other accounts may read `config.json`, the panel warns
+  (see Security).
 - **Appearance** (in Settings): language *System* (default; German when the
   webview's language starts with `de`, else English), *Deutsch* or *English*,
   and theme *System* (default; follows the Windows light/dark mode live),
@@ -443,6 +444,19 @@ Security:
   `PartialEq`, whose `Debug` prints `Token(hidden)`; it is compared in constant
   time only. `config.json` keeps the token as a plain string under `token`, as
   before.
+- `config.json` gets no ACL of its own: the rights of the user profile on
+  `%APPDATA%` (you, SYSTEM, Administrators) are enough. At every start the app
+  reads the file's DACL and checks that none of the broad groups *Everyone*
+  (`S-1-1-0`), *Users* (`S-1-5-32-545`) or *Authenticated Users* (`S-1-5-11`)
+  may read it (an allow entry with read data, generic read or generic all; a
+  deny of that group or of Everyone before it counts; no DACL at all means
+  everyone). If one may, the Settings panel shows a warning naming the groups
+  (translated) and the app logs it (the sink output panel until the next sink
+  start, and stderr); the fix is to remove those entries under *Properties >
+  Security* of the file or its folder and restart the app. A DACL that cannot
+  be read gives a warning as well. The check uses the `windows-permissions`
+  crate (MIT, a safe wrapper; its `winapi` and `bitflags` 1 were already in the
+  tree), so the workspace stays free of `unsafe`.
 
 - **Connection state:** the sink writes `"state":"open"` and its own `sink_pid`
   into `session.json` when a connection starts and rewrites it atomically with
@@ -600,7 +614,17 @@ placeholders, every key `index.html` and `app.js` use exists, and both themes
 in `style.css` keep WCAG contrast (4.5:1 for text, 3:1 for focus ring and
 status dot) for every colour pair the UI uses; then it runs `app.js` against a
 fake DOM and fake commands and checks that after a revoke (also one that fails
-after the token changed) the token field and *Copy* give the new token.
+after the token changed) the token field and *Copy* give the new token, and
+that the Settings panel shows the translated `config.json` access warning (or
+none). The access decision is unit-tested on made-up DACLs (profile default,
+each broad group with each read right, rights without reading, inherit-only and
+audit entries, deny order, no DACL); one test reads the real DACL of a temp
+file and finds Everyone after `icacls /grant *S-1-1-0:(R)`. The token handover
+is covered by the sink's stdin tests (first line, CRLF, EOF, 4 KiB bound,
+blank, non-UTF-8, read error, `--token` and `--token-stdin` together, no read
+of stdin before the other flags are checked) and by the end-to-end tests,
+which start the real sink with `--token-stdin` and send it a `hello` with the
+token.
 
 Linux and macOS: the project is Windows-only for now and has no Linux CI. Two
 advisories only exist in Tauri's Linux backend (GTK3): RUSTSEC-2024-0370

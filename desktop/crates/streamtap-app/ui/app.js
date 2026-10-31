@@ -259,7 +259,26 @@ const renderList = (snap) => {
   $("captures-count").textContent = snap.captures.length ? `(${snap.captures.length})` : "";
 };
 
+// Broad groups that may read config.json, by the stable id the app sends (SRV-14).
+const GROUP_KEYS = { everyone: "groupEveryone", users: "groupUsers", "authenticated-users": "groupAuthenticatedUsers" };
+
+const renderConfigAccess = (snap) => {
+  const box = $("config-access");
+  const access = snap.config_access;
+  if (!access) {
+    box.replaceChildren();
+    return;
+  }
+  if (access.state === "exposed") {
+    const groups = (access.groups ?? []).map((g) => (GROUP_KEYS[g] ? t(GROUP_KEYS[g]) : String(g))).join(", ");
+    box.replaceChildren(notice("warn", t("configAccessTitle"), t("configAccessBody", { groups })));
+  } else {
+    box.replaceChildren(notice("warn", t("configAccessUnknownTitle"), t("configAccessUnknownBody", { error: access.error ?? "" })));
+  }
+};
+
 const renderSettings = (snap) => {
+  renderConfigAccess(snap);
   const running = snap.sink.state === "running";
   const s = state.settings;
   $("settings-lock").hidden = !running;

@@ -71,6 +71,13 @@ for (const m of app.matchAll(/\?\s*"(\w+)"\s*:\s*"(\w+)"\s*,\s*\{/g)) {
 const regKeys = app.match(/const REG_KEYS = \{([^}]*)\}/);
 check(regKeys, "REG_KEYS found");
 if (regKeys) for (const m of regKeys[1].matchAll(/:\s*"(\w+)"/g)) check(m[1] in en, `REG_KEYS uses unknown key ${m[1]}`);
+const groupKeys = app.match(/const GROUP_KEYS = \{([^}]*)\}/);
+check(groupKeys, "GROUP_KEYS found");
+if (groupKeys) {
+  const ids = [...groupKeys[1].matchAll(/"?([\w-]+)"?:\s*"(\w+)"/g)];
+  check(ids.map((m) => m[1]).sort().join(",") === "authenticated-users,everyone,users", "GROUP_KEYS covers the three broad groups the app reports");
+  for (const m of ids) check(m[2] in en, `GROUP_KEYS uses unknown key ${m[2]}`);
+}
 for (const reason of ["exit-1", "exit-2", "exit-3", "exit-4", "exit-5", "exit-6", "exit-unexpected", "signal", "spawn", "aborted", "wait"]) {
   check(`reason.${reason}` in en, `no text for the mux reason ${reason}`);
 }
@@ -263,8 +270,31 @@ for (const failAfterRotation of [false, true]) {
   check(app.copied.at(-1) === "new-token", `${what}: Copy gives the new token, not ${app.copied.at(-1)}`);
 }
 
+// The settings panel warns when broad groups may read config.json (SRV-14), with the
+// group names translated, and says when the check itself failed. No warning otherwise.
+const texts = (node) => (node?.children ?? []).map((c) => c.textContent);
+for (const [language, access, want] of [
+  ["en", { state: "exposed", groups: ["everyone", "authenticated-users"] }, ["Other accounts can read config.json.", "Everyone, Authenticated Users may read"]],
+  ["de", { state: "exposed", groups: ["users"] }, ["Andere Konten können config.json lesen.", "Benutzer dürfen"]],
+  ["en", { state: "unknown", error: "access denied" }, ["Access to config.json was not checked.", "access denied"]],
+  ["en", null, null],
+]) {
+  const app = loadApp({ get_settings: () => ({ ...SETTINGS, language }), snapshot: () => ({ ...SNAPSHOT, config_access: access }) });
+  await settle();
+  const box = app.byId("config-access");
+  const what = `config access ${JSON.stringify(access)} (${language})`;
+  if (!want) {
+    check(box.children.length === 0, `${what}: no warning`);
+    continue;
+  }
+  check(box.children.length === 1, `${what}: one warning, not ${box.children.length}`);
+  const [title, body] = texts(box.children[0]);
+  check(title === want[0], `${what}: title ${title}`);
+  check(typeof body === "string" && body.includes(want[1]), `${what}: body ${body}`);
+}
+
 if (failures) {
   console.error(`${failures} check(s) failed`);
   process.exit(1);
 }
-console.log("app UI: i18n tables, keys, theme contrast and the revoke flow ok");
+console.log("app UI: i18n tables, keys, theme contrast, the revoke flow and the config access warning ok");
