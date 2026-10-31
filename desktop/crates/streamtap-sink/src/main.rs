@@ -198,6 +198,24 @@ fn check_origin(
     if got == Some(origin.as_bytes()) {
         return Ok(resp);
     }
+    // Name the rejected origin (printable ASCII, truncated) so a stale
+    // extension or a page is recognisable in the log.
+    let shown: String = got.map_or_else(
+        || "<none>".to_owned(),
+        |b| {
+            b.iter()
+                .take(120)
+                .map(|&c| {
+                    if (0x20..0x7f).contains(&c) {
+                        char::from(c)
+                    } else {
+                        '?'
+                    }
+                })
+                .collect()
+        },
+    );
+    eprintln!("origin rejected: {shown}");
     let mut err =
         tungstenite::handshake::server::ErrorResponse::new(Some("origin not allowed".to_owned()));
     *err.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;

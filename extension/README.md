@@ -51,7 +51,9 @@ the page.
 
 Updating from 0.1 (before the `key`): the id changes, so Chrome treats it as
 a new extension. Remove the old entry, load the folder again and enter port
-and token again (the settings belong to the old id).
+and token again (the settings belong to the old id). Reload the tabs that
+were open: the old build's content scripts keep knocking with the page
+origin until then (the sink logs them as `origin rejected: https://…`).
 
 Chrome ≥ 116 (an open WebSocket keeps the service worker alive).
 
@@ -101,6 +103,14 @@ Injected into a running ARD Mediathek page (hls.js → fMP4), 7 s after a seek:
   load; the reconnect succeeded and all segments arrived. No CSP message on
   this site. Since then the socket lives in the service worker (decided
   2026-10-31), so a page `connect-src` no longer matters.
+- **Service-worker path, real Chrome, 2026-10-31:** the sink accepted the
+  extension origin and wrote one session (47 segments, audio + video with a
+  quality switch after the start, URL taken from `port.sender.url`); `mux`
+  gave H.264 1280×720 + AAC, 156 s, full decode without errors. At the same
+  time it rejected `https://www.ardmediathek.de` and
+  `https://www.paramountplus.com` with 403: content scripts of the removed
+  0.1 build keep running in tabs that were open before (orphaned scripts can
+  still open sockets) until those tabs are reloaded.
 - Two things the real run taught the mux (see `../desktop/README.md`):
   hls.js starts at a low quality and switches after the first segment (new
   init segment → new part), and after seeks segments arrive out of order.
