@@ -32,9 +32,12 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   the streamtap extension, whose id the manifest `key` fixes). A web page,
   another extension or a client without `Origin` gets `403` before anything
   is written.
-- `--token` is required. The extension sends the same value in its first
-  message (`hello`); a wrong token closes the socket before anything is
-  written. Set it in the extension popup (port + token).
+- `--token` is required and must not be empty or blank (an unset variable
+  in `--token "$VAR"` would let any local process in). The extension sends
+  the same value in its first message (`hello`); a wrong token closes the
+  socket before anything is written. Set it in the extension popup (port +
+  token). A flag without a value, or followed by another flag
+  (`--token --port 1`), is a usage error (exit 2) before anything is bound.
 - Every connection becomes one capture directory
   `captures/<unix-seconds>_<session-prefix>[-n]/` (a suffix when the name is
   taken, e.g. a reconnect within the same second) with `session.json` (page
@@ -58,19 +61,26 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   message closes it. Every way a connection ends prints the per-SourceBuffer
   summary. Page strings (URL, MIME) are printed as printable ASCII only.
 - **DRM:** a segment that carries protection is not written, nor anything
-  after it on that SourceBuffer until a clear init segment arrives. Init bytes
-  (an init and its continuation chunks) are scanned for `encv`/`enca`/`tenc`/
-  `pssh` (MP4) or the `ContentEncodings`, `ContentEncryption` and
-  `ContentEncKeyID` IDs together (WebM). Media is only read as structure: a
-  top-level `moov` or `pssh`, sample encryption (`senc` or PIFF) in a `moof`;
-  random bytes in media never count. The extension does not send protected
+  after it on that SourceBuffer until a complete, clear init segment arrives.
+  Init bytes (an init and its continuation chunks) are scanned for `encv`/
+  `enca`/`tenc`/`pssh` (MP4) or the `ContentEncodings`, `ContentEncryption`
+  and `ContentEncKeyID` IDs together (WebM): each chunk as it comes, and the
+  whole init once more when it is decided, so markers split across appends
+  count too. That whole-init scan covers what is held of an init, up to
+  4 MiB; chunks of a larger init beyond that are scanned one at a time
+  (real inits carry their markers in a `moov` or `Tracks` well below that). An init after a refusal that is still incomplete when it is
+  decided (media came, or the connection ended) keeps the track refused.
+  Media is only read as structure: a top-level `moov` or `pssh`, sample
+  encryption (`senc` or PIFF) in a `moof`; random bytes in media never
+  count. The extension does not send protected
   segments in the first place; this is the second line.
 - **DRM across reconnects:** a reconnect opens a new session that may never
   see the encrypted init again, and WebM media carries no marker of its own.
   The sink process therefore remembers each refused track by the extension's
   session id (one per MediaSource, the same on every socket) and
-  SourceBuffer: on the next connection that track stays refused until a clear
-  init arrives, which lifts it for later connections too. The list lives in
+  SourceBuffer: on the next connection that track stays refused until a
+  complete, clear init is decided, which lifts it for later connections too
+  (its first chunk alone does not). The list lives in
   memory (at most 4096 tracks, oldest forgotten first); a client that sends
   no session id gets no such memory.
 
@@ -99,7 +109,10 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   init has no complete `moov` / `Tracks` yet) are held, up to 4 MiB with
   512 bytes counted per chunk for its header, until
   the next media, then compared as a whole. After a complete init an untimed
-  chunk (a segment cut inside its `moof`) is media.
+  chunk (a segment cut inside its `moof`) is media. A chunk that no longer
+  fits decides the init on what came so far and is written as its init
+  bytes; when that init was a duplicate or a switch back, the chunk and the
+  untimed chunks after it are dropped instead.
 - A repeated, identical init is skipped. A **different** init (codec or
   quality change, `changeType`) starts a new part file `sbN.p(M+1).bin`; a
   switch **back** to an init seen before continues that earlier part. The
@@ -163,11 +176,21 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   session; `mux` takes the one with the most bytes and names the others.
 - **Which part:** per SourceBuffer the part with an init segment and the
   most bytes. Adaptive players often start at a low quality and switch after
-  the first segment, so part 0 can be a single segment. The other parts are
+  the first segment, so part 0 can be a single segment. When that part
+  cannot be muxed (its init is cut, it does not start like media, ffprobe
+  cannot decode it, or a fallback part cannot be read), the next one by
+  size is used, which is said; at most 3 after the largest, since each try
+  may cost a sorted copy and an ffprobe run. The init is checked (complete
+  `moov`, starts like media) before anything is sorted, and the sorted copy
+  of a part that is left out is removed. A fallback part that fails only
+  when the parts are laid out again (see below) leaves its SourceBuffer out,
+  which is said; no further part of it is tried then. The other parts are
   named in a warning and left out (spike limit).
 - **Order:** the sink writes in arrival order. Unless the part already is
-  init-first and in timeline order, `mux` writes `sbN.pM.sorted.bin`: all init
-  bytes first, then media segments by presentation time (`tfdt` plus
+  init-first and in timeline order, `mux` writes `sbN.pM.sorted.bin`: the
+  init rows first (only its first run of them: an init row after media is a
+  stray piece of another copy and left out, which is said), then media
+  segments by presentation time (`tfdt` plus
   `timestampOffset` in ticks, computed exactly). Segments moved by a
   `timestampOffset` get their `tfdt` rewritten so the timeline stays
   monotonic; in a SourceBuffer with several tracks each `traf` is moved in
@@ -202,14 +225,20 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   `timestampOffset`), every SourceBuffer is moved later by the same amount,
   which is said, so they stay aligned. Only the parts that are muxed count
   for that amount (not one left out for a missing `moov`, bytes that do not
-  start like media, or one ffprobe cannot decode: then the parts are laid
-  out again without it, which is said); a part whose bytes cannot be moved (WebM,
+  start like media, one ffprobe cannot decode, or a fallback that cannot be
+  read: then the parts are laid out again without it, until the amount
+  holds, which is said); a part whose bytes cannot be moved (WebM,
   several tracks without per-track timescales) is aligned as if they had
   been. Index lines of duplicates (`mark`) never count as bytes, also not
   when picking the main MediaSource. The first append keeps its own time (the browser may start
   it at 0; the alignment between SourceBuffers is relative anyway).
-- **Gaps:** ranges skipped by a forward seek are reported with their
-  approximate length.
+- **Gaps:** ranges skipped by a forward seek are reported. With durations on
+  every segment they are exact: a start past the end of everything before it
+  by more than 50 ms or 1 % of the typical (lower median) segment duration,
+  whichever is larger. Without durations a step well above
+  the typical step (the lower median) counts, with an approximate length;
+  there, gaps that make up most of the steps (a capture sampled by seeking
+  again and again) are not found.
 - **Lost inits:** when the extension had to drop an init (its queue was
   full), or a new connection cannot replay one (its kept copy was dropped to
   stay within the kept-init budget, where the tab and frame keeping the most
@@ -268,6 +297,11 @@ first socket that fails (the dropped init still arrives), a quality switch
 during a reconnect (old init before old media, new init before new media),
 a split init (both chunks replayed), and the worker-wide link limit (a
 parked 17th port connects once a slot frees up).
+Without arguments, `node scripts/test-sink-link.mjs` runs only its mock
+scenarios against a fake WebSocket (e.g. inits dropped on an open, a
+connecting or a failed socket, lost inits, a port that closes while its
+socket connects; the full list is in the script's header comment); they
+need no sink.
 Both clients send the extension origin (`--origin` to change it).
 `../extension/scripts/test-hook.mjs` checks the page hook in Node (DRM
 marking and EME stop, inits split anywhere incl. WebM Tracks, no false DRM

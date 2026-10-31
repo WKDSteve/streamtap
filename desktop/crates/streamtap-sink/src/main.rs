@@ -83,41 +83,81 @@ fn main() {
     std::process::exit(code);
 }
 
-fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
+/// The value after `name`, `None` when the flag is absent. A flag without a
+/// value, or followed by another flag (`--token --port 1` would make
+/// "--port" the token), is a usage error, not a silent default.
+fn flag<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, SinkError> {
+    let Some(i) = args.iter().position(|a| a == name) else {
+        return Ok(None);
+    };
+    match args.get(i + 1).map(String::as_str) {
+        Some(v) if !v.starts_with("--") => Ok(Some(v)),
+        _ => Err(SinkError::Usage(format!("{name} needs a value"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // serve
 // ---------------------------------------------------------------------------
 
-fn run_serve(args: &[String]) -> Result<(), SinkError> {
-    let Some(token) = flag(args, "--token") else {
+/// `serve`'s settings, checked before anything is created or bound.
+#[derive(Debug)]
+struct ServeConfig {
+    token: Vec<u8>,
+    port: u16,
+    out: PathBuf,
+    origin: String,
+    per_session: u64,
+    total_max: u64,
+}
+
+fn serve_config(args: &[String]) -> Result<ServeConfig, SinkError> {
+    let Some(token) = flag(args, "--token")? else {
         return Err(SinkError::Usage(
             "--token is required (the extension must send the same value)".into(),
         ));
     };
-    let port = match flag(args, "--port").map(str::parse::<u16>) {
+    // An empty token (an unset variable in `--token "$VAR"`) would let any
+    // local process in with an empty hello, while the extension never
+    // connects without one.
+    if token.trim().is_empty() {
+        return Err(SinkError::Usage("--token must not be empty".into()));
+    }
+    let port = match flag(args, "--port")?.map(str::parse::<u16>) {
         None => DEFAULT_PORT,
         Some(Ok(p)) => p,
         Some(Err(_)) => return Err(SinkError::Usage("--port must be a number".into())),
     };
-    let out = PathBuf::from(flag(args, "--out").unwrap_or("captures"));
-    let origin = flag(args, "--allow-origin")
+    let out = PathBuf::from(flag(args, "--out")?.unwrap_or("captures"));
+    let origin = flag(args, "--allow-origin")?
         .unwrap_or(DEFAULT_ORIGIN)
         .to_owned();
-    let gib = |name: &str, default: u64| match flag(args, name).map(str::parse::<u64>) {
+    let gib = |name: &str, default: u64| match flag(args, name)?.map(str::parse::<u64>) {
         None => Ok(default << 30),
         Some(Ok(g)) if (1..=4096).contains(&g) => Ok(g << 30),
         Some(_) => Err(SinkError::Usage(format!(
             "{name} must be a whole number from 1 to 4096"
         ))),
     };
-    let per_session = gib("--max-session-gib", DEFAULT_MAX_SESSION_GIB)?;
-    let total_max = gib("--max-total-gib", DEFAULT_MAX_TOTAL_GIB)?;
+    Ok(ServeConfig {
+        token: token.as_bytes().to_vec(),
+        port,
+        out,
+        origin,
+        per_session: gib("--max-session-gib", DEFAULT_MAX_SESSION_GIB)?,
+        total_max: gib("--max-total-gib", DEFAULT_MAX_TOTAL_GIB)?,
+    })
+}
+
+fn run_serve(args: &[String]) -> Result<(), SinkError> {
+    let ServeConfig {
+        token,
+        port,
+        out,
+        origin,
+        per_session,
+        total_max,
+    } = serve_config(args)?;
     let budget = Arc::new(Budget {
         per_session,
         total_max,
@@ -134,7 +174,6 @@ fn run_serve(args: &[String]) -> Result<(), SinkError> {
         out.display()
     );
 
-    let token = token.as_bytes().to_vec();
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -272,6 +311,9 @@ const MAX_SEEN_PER_SESSION: usize = 400_000;
 /// Init bytes held until the init is complete (an init split across appends),
 /// counting `PENDING_CHUNK_COST` for each chunk's header.
 const MAX_PENDING_INIT: usize = 4 * 1024 * 1024;
+/// Parts of a `SourceBuffer` tried after its largest one when that cannot be
+/// muxed (`mux_inputs`): each try may cost a sorted copy and an ffprobe run.
+const MAX_FALLBACK_PARTS: usize = 3;
 const PENDING_CHUNK_COST: usize = 512;
 /// Part files per `SourceBuffer` (one per distinct init).
 const MAX_PARTS_PER_TRACK: u32 = 64;
@@ -320,7 +362,7 @@ struct TrackState {
     /// Boxes in front of the samples appended without them.
     segment_head: Option<SegmentHead>,
     /// The current init segment is encrypted (EME/DRM): nothing is written
-    /// until a clear init segment arrives.
+    /// until a complete, clear init is decided (`flush_init`).
     refused: bool,
     /// A new init came beyond `MAX_PARTS_PER_TRACK`: its media is skipped.
     parts_full: bool,
@@ -363,7 +405,7 @@ impl Budget {
 /// Tracks refused as DRM, shared by all connections of one sink process. A
 /// reconnect opens a new session that may never see the encrypted init again,
 /// and `WebM` media carries no marker of its own: the track stays refused
-/// until a clear init arrives. Key: the extension's session id (one per
+/// until a complete, clear init is decided (`flush_init`). Key: the extension's session id (one per
 /// `MediaSource`, the same on every socket) and the `SourceBuffer`.
 #[derive(Default)]
 struct Refusals {
@@ -1205,28 +1247,62 @@ impl Session {
     }
 
     /// Decides about and writes a track's pending init (all its chunks).
-    fn flush_init(&mut self, sb: u32) -> io::Result<()> {
+    /// True when it was written: not for a duplicate, a switch back, a new
+    /// init beyond the part limit, an encrypted one or one over the budget.
+    fn flush_init(&mut self, sb: u32) -> io::Result<bool> {
         let dir = self.dir.clone();
         let Some(track) = self.tracks.get_mut(&sb) else {
-            return Ok(());
+            return Ok(false);
         };
         if track.pending.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
+        // Read before `take_pending` resets them.
+        let after_refusal = track.pending_after_refusal;
+        let done = track.pending_done;
         let (chunks, whole) = track.take_pending();
+        // Each chunk was scanned on its own; markers split across chunks (a
+        // WebM ID cut in two, its three IDs in three appends) only show in
+        // the whole init.
+        let flagged = if track.init_kind == "webm" {
+            webm_encrypted(&whole)
+        } else {
+            looks_encrypted(&whole)
+        };
+        // After a refusal only a complete, clear init lifts it. An
+        // incomplete one (the connection ended, its continuation may carry
+        // the markers) keeps the track refused, here and on the next
+        // connection.
+        if flagged || (after_refusal && !done) {
+            if flagged && !track.refused {
+                eprintln!(
+                    "{}: sb{sb} carries encrypted media (DRM); not capturing this track",
+                    dir.display()
+                );
+            }
+            track.refused = true;
+            track.pending_after_refusal = false;
+            track.skipped += chunks.len() as u64;
+            self.remember_refusal(sb, true);
+            return Ok(false);
+        }
+        if after_refusal {
+            self.remember_refusal(sb, false);
+        }
+        let track = self.tracks.get_mut(&sb).expect("present");
         let parts_before = track.parts;
         let write = track.decide_init(fnv1a(&whole), &dir, sb)?;
         let new_file = track.parts != parts_before;
         // A new part file costs more than its bytes.
         if (new_file && !self.within_budget(PART_FILE_COST)) || !write {
-            return Ok(());
+            return Ok(false);
         }
         let mut at = 0;
         for (h, len) in &chunks {
             self.write_row(sb, h, &whole[at..at + len], true)?;
             at += len;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// The extension lost an init of `sb` (its backlog was full, or the kept
@@ -1276,7 +1352,8 @@ impl Session {
         }
         let file = Self::open_part(&self.dir, sb, 0)?;
         let mut track = TrackState::new(file);
-        // Refused on an earlier connection: stays refused until a clear init.
+        // Refused on an earlier connection: stays refused until a complete,
+        // clear init is decided (`flush_init`).
         if !self.id.is_empty() && self.refusals.contains(&self.id, sb) {
             eprintln!(
                 "{}: sb{sb} was refused as DRM before this reconnect; not capturing it",
@@ -1425,14 +1502,12 @@ impl Session {
         if h.is_init {
             self.flush_init(h.sb)?;
             let track = self.tracks.get_mut(&h.sb).expect("present");
-            // A clear init ends an encrypted stretch.
+            // A clear init may end an encrypted stretch. The refusal is only
+            // lifted once that init is complete and clear (`flush_init`):
+            // its first chunk alone says nothing about the rest.
             track.pending_after_refusal = std::mem::take(&mut track.refused);
             track.init_kind.clone_from(&h.kind);
             track.push_pending(h, payload);
-            if track.pending_after_refusal {
-                self.remember_refusal(h.sb, false);
-            }
-            let track = self.tracks.get_mut(&h.sb).expect("present");
             if track.pending_cost() > MAX_PENDING_INIT {
                 self.flush_init(h.sb)?;
             }
@@ -1444,16 +1519,30 @@ impl Session {
                 return Ok(());
             }
             // Too large to hold: decide on what came so far, write the rest
-            // as init bytes of that part.
-            self.flush_init(h.sb)?;
-            if self.tracks[&h.sb].parts_full {
+            // as init bytes of that part. Only when that init was written:
+            // the rest of a duplicate or a switch back would land as a stray
+            // init row after the part's media.
+            if !self.flush_init(h.sb)? {
+                // A new part file over the budget stopped the session: that
+                // init and its rest are skipped, not duplicates.
+                let stopped = self.stopped;
+                let track = self.tracks.get_mut(&h.sb).expect("present");
+                if track.refused || track.parts_full || stopped {
+                    track.skipped += 1;
+                } else {
+                    // Its further untimed chunks are dropped too.
+                    track.skip_tail = true;
+                    track.dupes += 1;
+                }
                 return Ok(());
             }
             return self.write_row(h.sb, h, payload, true);
         }
         self.flush_init(h.sb)?;
         let track = self.tracks.get_mut(&h.sb).expect("present");
-        if track.parts_full {
+        // The pending init was refused (encrypted as a whole, or incomplete
+        // after a refusal) or is beyond the part limit.
+        if track.refused || track.parts_full {
             track.skipped += 1;
             return Ok(());
         }
@@ -1914,6 +2003,30 @@ fn elst_media_time(init: &[u8]) -> i64 {
     0
 }
 
+/// The init rows of a part: its first run of consecutive init rows (an init
+/// split across appends). An init row after media is a stray piece of
+/// another copy (an older sink stored the overflow of a duplicate init so):
+/// joined in, it would break the init, and a page could grow it without
+/// bound.
+fn init_run<'a>(rows: &[&'a IndexRow]) -> Vec<&'a IndexRow> {
+    rows.iter()
+        .copied()
+        .skip_while(|r| !r.is_init)
+        .take_while(|r| r.is_init)
+        .collect()
+}
+
+/// `init_run` of one part, saying what it leaves out; also whether nothing
+/// was left out (only then can the raw file serve as it is).
+fn part_init<'a>(sb: u32, part: u32, rows: &[&'a IndexRow]) -> (Vec<&'a IndexRow>, bool) {
+    let init = init_run(rows);
+    let stray = rows.iter().filter(|r| r.is_init).count() - init.len();
+    if stray > 0 {
+        eprintln!("mux: sb{sb}.p{part}: {stray} stray init row(s) after media left out");
+    }
+    (init, stray == 0)
+}
+
 /// The presentation lead (`seq_layout`) of every sequence-mode row appended
 /// right after a set `timestampOffset`: read from its segment and its part's
 /// init. Unreadable rows get none.
@@ -1931,8 +2044,9 @@ fn seq_leads(dir: &Path, sb: u32, rows: &[&IndexRow]) -> SeqMoves {
         let Ok(mut src) = File::open(dir.join(format!("sb{sb}.p{part}.bin"))) else {
             continue;
         };
+        let part_rows: Vec<&IndexRow> = rows.iter().copied().filter(|r| r.part == part).collect();
         let mut init = Vec::new();
-        for r in rows.iter().filter(|r| r.part == part && r.is_init) {
+        for r in init_run(&part_rows) {
             if read_segment(&mut src, r, &mut buf).is_ok() {
                 init.extend_from_slice(&buf);
             }
@@ -2016,27 +2130,60 @@ fn read_segment(src: &mut File, r: &IndexRow, buf: &mut Vec<u8>) -> io::Result<(
     src.read_exact(buf)
 }
 
-/// Reports ranges skipped by a forward seek, from the sorted start times.
-fn report_gaps(sb: u32, part: u32, starts: &[i128], ts: u32) {
-    let steps: Vec<u64> = starts
+/// Ranges skipped by a forward seek in the kept segments, sorted by start,
+/// as (start, duration) in track ticks: (count, missing ticks, exact).
+///
+/// With a duration on every segment the gaps are exact: a start past the
+/// end of everything before it (a running end, so a longer earlier segment
+/// causes no false gap), beyond a tolerance for rounding. Without, a step
+/// well above the typical (lower median) step counts, measured against it;
+/// gaps that make up most of the steps are missed there.
+fn find_gaps(segs: &[(i128, Option<u64>)], ts: u32) -> (usize, u128, bool) {
+    let mut durs: Vec<u64> = segs.iter().filter_map(|s| s.1.filter(|d| *d > 0)).collect();
+    if !segs.is_empty() && durs.len() == segs.len() {
+        durs.sort_unstable();
+        // 50 ms, or 1 % of a typical segment, absorbs frame rounding.
+        let median_dur = durs[(durs.len() - 1) / 2];
+        let tolerance = i128::from((ts / 20).max(1)).max(i128::from(median_dur / 100));
+        let (mut count, mut missing) = (0, 0u128);
+        let mut covered_end = segs[0].0;
+        for &(start, dur) in segs {
+            let gap = start - covered_end;
+            if gap > tolerance {
+                count += 1;
+                missing = missing.saturating_add(gap.unsigned_abs());
+            }
+            covered_end = covered_end.max(start + i128::from(dur.unwrap_or(0)));
+        }
+        return (count, missing, true);
+    }
+    let steps: Vec<u128> = segs
         .windows(2)
-        .filter_map(|w| u64::try_from(w[1] - w[0]).ok())
+        .filter_map(|w| u128::try_from(w[1].0 - w[0].0).ok())
         .collect();
     let mut typical = steps.clone();
     typical.sort_unstable();
-    let Some(&median) = typical.get(typical.len() / 2) else {
-        return;
+    let Some(&median) = typical.get(typical.len().saturating_sub(1) / 2) else {
+        return (0, 0, false);
     };
     let threshold = median.saturating_add(median / 2);
-    let big: Vec<u64> = steps.iter().copied().filter(|s| *s > threshold).collect();
-    if !big.is_empty() {
-        let missing = big
-            .iter()
-            .fold(0u64, |acc, s| acc.saturating_add(s.saturating_sub(median)));
+    let big: Vec<u128> = steps.into_iter().filter(|s| *s > threshold).collect();
+    let missing = big
+        .iter()
+        .fold(0u128, |acc, s| acc.saturating_add(s - median));
+    (big.len(), missing, false)
+}
+
+/// Reports ranges skipped by a forward seek (`find_gaps`).
+fn report_gaps(sb: u32, part: u32, segs: &[(i128, Option<u64>)], ts: u32) {
+    let (count, missing, exact) = find_gaps(segs, ts);
+    if count > 0 {
+        // Seconds for a message; precision far beyond what it shows.
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = missing as f64 / f64::from(ts);
         eprintln!(
-            "mux: sb{sb}.p{part}: {} gap(s), about {} s not captured (seeked past them)",
-            big.len(),
-            missing / u64::from(ts)
+            "mux: sb{sb}.p{part}: {count} gap(s), {}{seconds:.1} s not captured (seeked past them)",
+            if exact { "" } else { "about " }
         );
     }
 }
@@ -2111,7 +2258,7 @@ fn ordered_part(
     lift_ns: i64,
 ) -> io::Result<(PathBuf, Option<f64>, usize, bool)> {
     let raw = dir.join(format!("sb{sb}.p{part}.bin"));
-    let init: Vec<&IndexRow> = rows.iter().copied().filter(|r| r.is_init).collect();
+    let (init, no_stray) = part_init(sb, part, rows);
     let media: Vec<&IndexRow> = rows.iter().copied().filter(|r| !r.is_init).collect();
     // The media rows carry the timescale of their tfdt; the first row of a
     // split init may still carry the previous rendition's.
@@ -2165,7 +2312,8 @@ fn ordered_part(
     // Sequence mode needs durations to lay out the jumps; without them the
     // arrival order (duplicates already removed by the sink) is kept.
     let timed = !media.is_empty() && media.iter().all(|r| r.tfdt.is_some()) && seq_ok;
-    let init_first = rows.iter().take(init.len()).all(|r| r.is_init);
+    // The raw file only serves when it holds nothing left out.
+    let init_first = no_stray && rows.iter().take(init.len()).all(|r| r.is_init);
 
     let mut order: Vec<&IndexRow> = media.clone();
     if timed {
@@ -2174,8 +2322,8 @@ fn ordered_part(
         let (covered, partial);
         (order, covered, partial) = drop_covered(order, &pts);
         if let Some(ts) = ts {
-            let starts: Vec<i128> = order.iter().map(|r| pts(r)).collect();
-            report_gaps(sb, part, &starts, ts);
+            let segs: Vec<(i128, Option<u64>)> = order.iter().map(|r| (pts(r), r.dur)).collect();
+            report_gaps(sb, part, &segs, ts);
         }
         if covered > 0 || partial > 0 {
             eprintln!(
@@ -2305,8 +2453,8 @@ fn run_mux(args: &[String], tools: &Tools) -> Result<(), SinkError> {
         return Err(SinkError::Usage("capture directory required".into()));
     };
     let dir = PathBuf::from(dir);
-    let out = flag(args, "--out").map_or_else(|| dir.join("out.mp4"), PathBuf::from);
-    let timeout = match flag(args, "--timeout-secs").map(str::parse::<u64>) {
+    let out = flag(args, "--out")?.map_or_else(|| dir.join("out.mp4"), PathBuf::from);
+    let timeout = match flag(args, "--timeout-secs")?.map(str::parse::<u64>) {
         None => Duration::from_secs(DEFAULT_MUX_TIMEOUT_SECS),
         Some(Ok(s)) if (1..=86_400).contains(&s) => Duration::from_secs(s),
         Some(_) => {
@@ -2436,6 +2584,11 @@ fn keep_main_media_source(rows: &mut Vec<IndexRow>) {
 fn input_format(kind: &str, path: &Path) -> Option<&'static str> {
     let mut head = [0u8; 8];
     File::open(path).ok()?.read_exact(&mut head).ok()?;
+    head_format(kind, head)
+}
+
+/// `input_format` of a part whose first 8 bytes are `head`.
+fn head_format(kind: &str, head: [u8; 8]) -> Option<&'static str> {
     match kind {
         "mp4" if matches!(&head[4..8], b"ftyp" | b"moov" | b"styp") => Some("mp4"),
         "webm" if head[..4] == [0x1a, 0x45, 0xdf, 0xa3] => Some("matroska"),
@@ -2451,11 +2604,21 @@ struct MuxPlan {
     warnings: Vec<String>,
 }
 
-/// Per `SourceBuffer` the part to mux, as (`SourceBuffer`, part). Adaptive
-/// players often start at a low quality and switch after the first
-/// segment, which starts a new part: the decodable part (has an init
-/// segment) with the most bytes.
-fn pick_parts(stored: &[&IndexRow]) -> Vec<(u32, u32)> {
+/// The parts of one `SourceBuffer` that may be muxed (`pick_parts`).
+struct Candidates {
+    sb: u32,
+    /// All its parts, with or without an init.
+    total: usize,
+    /// (part, bytes, MIME) of the parts with an init segment, the most
+    /// bytes first.
+    ranked: Vec<(u32, u64, String)>,
+}
+
+/// Per `SourceBuffer` the parts to try, best first. Adaptive players often
+/// start at a low quality and switch after the first segment, which starts
+/// a new part: the parts with an init segment, the most bytes first. The
+/// first one `part_input` can mux is used.
+fn pick_parts(stored: &[&IndexRow]) -> Vec<Candidates> {
     let mut parts: HashMap<(u32, u32), (u64, bool, String)> = HashMap::new();
     for row in stored {
         let e = parts
@@ -2467,32 +2630,29 @@ fn pick_parts(stored: &[&IndexRow]) -> Vec<(u32, u32)> {
     let mut ids: Vec<u32> = parts.keys().map(|(sb, _)| *sb).collect();
     ids.sort_unstable();
     ids.dedup();
-    let mut chosen = Vec::new();
-    for id in &ids {
-        let mut candidates: Vec<_> = parts
+    let mut picked = Vec::new();
+    for id in ids {
+        let total = parts.keys().filter(|(sb, _)| *sb == id).count();
+        let mut ranked: Vec<(u32, u64, String)> = parts
             .iter()
-            .filter(|((sb, _), _)| sb == id)
-            .map(|((_, part), v)| (*part, v))
+            .filter(|((sb, _), (_, has_init, _))| *sb == id && *has_init)
+            .map(|((_, part), (bytes, _, mime))| (*part, *bytes, mime.clone()))
             .collect();
-        candidates.sort_unstable_by_key(|(part, _)| *part);
-        let total = candidates.len();
-        let best = candidates
-            .iter()
-            .filter(|(_, (_, has_init, _))| *has_init)
-            .max_by_key(|(_, (bytes, _, _))| *bytes);
-        let Some((part, (bytes, _, mime))) = best else {
+        // The later part first at equal size.
+        ranked.sort_unstable_by_key(|(part, bytes, _)| {
+            (std::cmp::Reverse(*bytes), std::cmp::Reverse(*part))
+        });
+        if ranked.is_empty() {
             eprintln!("mux: sb{id} has no part with an init segment; skipped. Capture with the hook active from page load.");
             continue;
-        };
-        if total > 1 {
-            eprintln!(
-                "mux: sb{id} has {total} parts (codec/quality changes); using part {part} ({bytes} bytes, {})",
-                printable(mime, 120)
-            );
         }
-        chosen.push((*id, *part));
+        picked.push(Candidates {
+            sb: id,
+            total,
+            ranked,
+        });
     }
-    chosen
+    picked
 }
 
 /// The ffmpeg input of one chosen (`SourceBuffer`, part) in timeline order,
@@ -2516,17 +2676,7 @@ fn part_input(
         .iter()
         .find(|r| r.is_init)
         .map_or("", |r| r.kind.as_str());
-    let (path, start, traks, lifted) =
-        ordered_part(dir, id, part, &part_rows, Some(seq_moves), lift).map_err(|e| {
-            SinkError::io(format!("sb{id}.p{part}: cannot reorder segments"), None, e)
-        })?;
-    // An MP4 init without a complete moov (cut short) cannot be decoded, and
-    // ffmpeg would fail the whole mux with it.
-    if kind == "mp4" && traks == 0 {
-        eprintln!("mux: sb{id}.p{part}: its init has no complete moov; skipped");
-        return Ok(None);
-    }
-    let Some(format) = input_format(kind, &path) else {
+    let not_media = || {
         eprintln!(
             "mux: sb{id}.p{part} does not start like {} media; skipped",
             if kind.is_empty() {
@@ -2535,6 +2685,37 @@ fn part_input(
                 printable(kind, 16)
             }
         );
+    };
+    let raw = dir.join(format!("sb{id}.p{part}.bin"));
+    let sorted = dir.join(format!("sb{id}.p{part}.sorted.bin"));
+    let cannot_reorder =
+        |e| SinkError::io(format!("sb{id}.p{part}: cannot reorder segments"), None, e);
+    // The cheap checks on the init first: a part they reject costs no sorted
+    // copy and no ffprobe run. The sorted file starts with this init.
+    let init = read_init(&raw, &part_rows).map_err(cannot_reorder)?;
+    // An MP4 init without a complete moov (cut short) cannot be decoded, and
+    // ffmpeg would fail the whole mux with it.
+    if kind == "mp4" && trak_count(&init) == 0 {
+        eprintln!("mux: sb{id}.p{part}: its init has no complete moov; skipped");
+        return Ok(None);
+    }
+    if let Some(head) = init.first_chunk::<8>() {
+        if head_format(kind, *head).is_none() {
+            not_media();
+            return Ok(None);
+        }
+    }
+    let (path, start, _, lifted) =
+        match ordered_part(dir, id, part, &part_rows, Some(seq_moves), lift) {
+            Ok(v) => v,
+            Err(e) => {
+                discard_sorted(&sorted);
+                return Err(cannot_reorder(e));
+            }
+        };
+    let Some(format) = input_format(kind, &path) else {
+        not_media();
+        discard_sorted(&sorted);
         return Ok(None);
     };
     // The first presentation time as ffmpeg sees it (B-frame composition
@@ -2545,6 +2726,7 @@ fn part_input(
     let start = match prober.probe(format, &path, &format!("sb{id}.p{part}")) {
         Some(Probe::Undecodable) => {
             eprintln!("mux: sb{id}.p{part} cannot be decoded; skipped");
+            discard_sorted(&sorted);
             return Ok(None);
         }
         // A part whose bytes could not take the lift is aligned as if they
@@ -2562,6 +2744,26 @@ fn part_input(
     }))
 }
 
+/// The bytes of a part's init (`init_run` of its rows) from its raw file.
+fn read_init(raw: &Path, part_rows: &[&IndexRow]) -> io::Result<Vec<u8>> {
+    let mut src = File::open(raw)?;
+    let (mut init, mut buf) = (Vec::new(), Vec::new());
+    for r in init_run(part_rows) {
+        read_segment(&mut src, r, &mut buf)?;
+        init.extend_from_slice(&buf);
+    }
+    Ok(init)
+}
+
+/// Removes the sorted copy of a part that is not muxed (none is fine).
+fn discard_sorted(sorted: &Path) {
+    if let Err(e) = fs::remove_file(sorted) {
+        if e.kind() != io::ErrorKind::NotFound {
+            eprintln!("mux: cannot remove {}: {e}", sorted.display());
+        }
+    }
+}
+
 /// The ffmpeg inputs: per `SourceBuffer` the chosen part in timeline order.
 fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, SinkError> {
     // Marks only hold a duplicate's place in the sequence-mode layout; they
@@ -2575,28 +2777,94 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
         missing: false,
         warnings: Vec::new(),
     };
-    let chosen = pick_parts(&stored);
-    let layouts = seq_layouts(dir, rows, &chosen);
-    let mut lift = seq_lift(rows, &layouts, &chosen);
+    let picked = pick_parts(&stored);
+    // The layout covers all parts of a SourceBuffer, so a fallback part has
+    // its own; the lift starts from each one's best part.
+    let best: Vec<(u32, u32)> = picked.iter().map(|c| (c.sb, c.ranked[0].0)).collect();
+    let layouts = seq_layouts(dir, rows, &best);
+    let mut lift = seq_lift(rows, &layouts, &best);
     let mut inputs = Vec::new();
     let mut muxed = Vec::new();
-    for &p in &chosen {
-        if let Some(input) = part_input(dir, &stored, &layouts, p, lift, &mut prober)? {
+    for c in &picked {
+        let sb = c.sb;
+        // The largest part may not decode (a cut init, garbled bytes): the
+        // next one by size then, rather than none of this SourceBuffer. Only
+        // a few: each try may cost a sorted copy and an ffprobe run.
+        let tries = c.ranked.len().min(1 + MAX_FALLBACK_PARTS);
+        for (i, (part, bytes, mime)) in c.ranked.iter().take(tries).enumerate() {
+            let p = (sb, *part);
+            let outcome = match part_input(dir, &stored, &layouts, p, lift, &mut prober) {
+                Ok(v) => v,
+                // A fallback that cannot be read (a truncated part) is left
+                // out like one that does not decode; the largest part's
+                // error still ends the mux, as before.
+                Err(e) if i > 0 => {
+                    eprintln!("mux: {e}; skipped");
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            let Some(input) = outcome else {
+                if i + 1 == tries && tries < c.ranked.len() {
+                    eprintln!(
+                        "mux: sb{sb}: none of its {tries} largest parts can be muxed; {} smaller one(s) not tried",
+                        c.ranked.len() - tries
+                    );
+                }
+                continue;
+            };
+            if i > 0 {
+                eprintln!(
+                    "mux: sb{sb}.p{} skipped; using sb{sb}.p{part} ({bytes} bytes) instead",
+                    c.ranked[0].0
+                );
+            }
+            if c.total > 1 {
+                eprintln!(
+                    "mux: sb{sb} has {} parts (codec/quality changes); using part {part} ({bytes} bytes, {})",
+                    c.total,
+                    printable(mime, 120)
+                );
+            }
             inputs.push(input);
             muxed.push(p);
+            break;
         }
     }
     // A part left out above must not move the others: once more without it.
-    let muxed_lift = seq_lift(rows, &layouts, &muxed);
-    if muxed_lift != lift {
+    // A part can fail only now (the new lift makes it read rows the raw file
+    // served before); it is left out like above, so the lift is worked out
+    // again until it holds for the parts actually muxed. Each further round
+    // has fewer parts, so this ends.
+    loop {
+        let muxed_lift = seq_lift(rows, &layouts, &muxed);
+        if muxed_lift == lift {
+            break;
+        }
         eprintln!(
             "mux: a part left out set how far to move the others; laid out again without it (this replaces the lines above)"
         );
         lift = muxed_lift;
         inputs.clear();
+        let mut kept = Vec::new();
         for &p in &muxed {
-            inputs.extend(part_input(dir, &stored, &layouts, p, lift, &mut prober)?);
+            match part_input(dir, &stored, &layouts, p, lift, &mut prober) {
+                Ok(Some(input)) => {
+                    inputs.push(input);
+                    kept.push(p);
+                }
+                // Its SourceBuffer is then left out: no further part of it
+                // is tried at this point.
+                Ok(None) => eprintln!("mux: sb{} left out after the new layout", p.0),
+                // As above: a fallback is left out, the largest part's
+                // error ends the mux.
+                Err(e) if !best.contains(&p) => {
+                    eprintln!("mux: {e}; sb{} left out after the new layout", p.0);
+                }
+                Err(e) => return Err(e),
+            }
         }
+        muxed = kept;
     }
     if lift > 0 {
         eprintln!(
@@ -3133,6 +3401,26 @@ mod tests {
         );
     }
 
+    /// An init row after the media (the overflow of a duplicate init, as an
+    /// older sink stored it) is not joined into the init.
+    #[test]
+    fn ordered_part_leaves_out_stray_init_rows() {
+        let dir = temp_dir("strayinit");
+        let m = moof(0);
+        let rows = write_part(
+            &dir,
+            &[
+                (b"IN", true, None, None),
+                (b"IT", true, None, None),
+                (&m, false, Some(0), None),
+                (b"XX", true, None, None),
+            ],
+        );
+        let (got, path, _) = order(&dir, &rows);
+        assert!(path.ends_with("sb1.p0.sorted.bin"), "not the raw file");
+        assert_eq!(got, [&b"INIT"[..], &m].concat());
+    }
+
     #[test]
     fn ordered_part_moves_init_to_the_front() {
         let dir = temp_dir("initlate");
@@ -3220,12 +3508,69 @@ mod tests {
 
     #[test]
     fn gap_report_survives_huge_steps() {
-        report_gaps(1, 0, &[0, 10, i128::from(u64::MAX)], 1000);
+        let untimed = |starts: &[i128]| -> Vec<(i128, Option<u64>)> {
+            starts.iter().map(|s| (*s, None)).collect()
+        };
+        report_gaps(1, 0, &untimed(&[0, 10, i128::from(u64::MAX)]), 1000);
         report_gaps(
             1,
             0,
-            &[0, i128::from(u64::MAX), i128::from(u64::MAX) * 2],
+            &untimed(&[0, i128::from(u64::MAX), i128::from(u64::MAX) * 2]),
             1,
+        );
+        let huge = [
+            (0, Some(u64::MAX)),
+            (i128::from(u64::MAX) * 3, Some(u64::MAX)),
+        ];
+        report_gaps(1, 0, &huge, 1);
+    }
+
+    /// (start, 6 s) segments at 1000 ticks/s with these start steps (s).
+    fn timed_steps(steps: &[i128]) -> Vec<(i128, Option<u64>)> {
+        let mut start = 0;
+        let mut segs = vec![(0, Some(6000))];
+        for s in steps {
+            start += s * 1000;
+            segs.push((start, Some(6000)));
+        }
+        segs
+    }
+
+    /// One played segment, a seek to 10:00, two more: the gap is the seek,
+    /// not the typical step (the upper median was the gap itself).
+    #[test]
+    fn a_gap_is_found_from_durations() {
+        assert_eq!(find_gaps(&timed_steps(&[600, 6]), 1000), (1, 594_000, true));
+        assert_eq!(
+            find_gaps(&timed_steps(&[6, 6, 300, 300]), 1000),
+            (2, 588_000, true),
+            "sampling by seeking: gaps make up half the steps"
+        );
+        assert_eq!(find_gaps(&timed_steps(&[60]), 1000), (1, 54_000, true));
+        assert_eq!(
+            find_gaps(&timed_steps(&[6, 6, 6]), 1000),
+            (0, 0, true),
+            "back to back"
+        );
+        // A longer earlier segment covers the next start: no false gap.
+        let segs = [(0, Some(20_000)), (6000, Some(6000)), (20_000, Some(6000))];
+        assert_eq!(find_gaps(&segs, 1000), (0, 0, true));
+        // Rounding of a few ticks is no gap.
+        let segs = [(0, Some(6000)), (6010, Some(6000))];
+        assert_eq!(find_gaps(&segs, 1000), (0, 0, true));
+    }
+
+    /// Without durations the lower median is the typical step.
+    #[test]
+    fn a_gap_without_durations_uses_the_lower_median() {
+        let segs: Vec<(i128, Option<u64>)> =
+            [0, 6000, 606_000].iter().map(|s| (*s, None)).collect();
+        assert_eq!(find_gaps(&segs, 1000), (1, 594_000, false));
+        let segs: Vec<(i128, Option<u64>)> = [0, 6000].iter().map(|s| (*s, None)).collect();
+        assert_eq!(
+            find_gaps(&segs, 1000),
+            (0, 0, false),
+            "one step: no typical"
         );
     }
 
@@ -3434,6 +3779,97 @@ mod tests {
         assert_eq!(rows[1]["is_init"], true, "the continuation is init bytes");
     }
 
+    /// An init over `MAX_PENDING_INIT`: a first chunk and 1 MiB `initCont`
+    /// chunks, the last of which no longer fits the pending init.
+    fn send_big_init(s: &mut Session, tag: u8) {
+        write(s, &seg(1, true, None, None), &[tag; 8]);
+        let mut cont = seg(1, false, None, None);
+        cont.init_cont = true;
+        for _ in 0..4 {
+            write(s, &cont, &vec![tag; 1 << 20]);
+        }
+    }
+
+    /// Init rows of `part` that come after one of its media rows.
+    fn init_rows_after_media(dir: &Path, part: u64) -> usize {
+        let rows: Vec<serde_json::Value> = index_rows(dir)
+            .into_iter()
+            .filter(|r| r["part"] == part)
+            .collect();
+        let first_media = rows
+            .iter()
+            .position(|r| r["is_init"] == false)
+            .unwrap_or(rows.len());
+        rows[first_media..]
+            .iter()
+            .filter(|r| r["is_init"] == true)
+            .count()
+    }
+
+    /// The overflow chunk of a re-appended init is not written as an init
+    /// row after the media: the init it continues was a duplicate.
+    #[test]
+    fn overflow_of_a_duplicate_init_is_not_written() {
+        let mut s = session("overflowdup");
+        send_big_init(&mut s, b'A');
+        write(&mut s, &seg(1, false, Some(0), None), &moof(0));
+        let before = written(&s, 1);
+        send_big_init(&mut s, b'A');
+        assert_eq!(written(&s, 1), before, "nothing of the duplicate");
+        write(&mut s, &seg(1, false, Some(1000), None), &moof(1000));
+        assert_eq!(
+            init_rows_after_media(&s.dir, 0),
+            0,
+            "{:?}",
+            index_rows(&s.dir)
+        );
+    }
+
+    /// The overflow of a new init whose part file no longer fits the budget
+    /// is counted as skipped (the session stops), not as a duplicate.
+    #[test]
+    fn overflow_of_an_init_over_the_budget_counts_as_skipped() {
+        // What the first init and its media cost.
+        let mut probe = session("overflowcost");
+        send_big_init(&mut probe, b'A');
+        write(&mut probe, &seg(1, false, Some(0), None), &moof(0));
+        let used = probe.bytes_total;
+        let dir = temp_dir("overflowbudget");
+        let shared = budget(used + PART_FILE_COST - 1, 64 * GIB);
+        let s = Session::open(&dir, "test", "u", "t", &shared, &refusals())
+            .expect("session")
+            .expect("within budget");
+        let mut s = TestSession { s, _dir: dir };
+        send_big_init(&mut s, b'A');
+        write(&mut s, &seg(1, false, Some(0), None), &moof(0));
+        assert!(!s.stopped, "the first init fits");
+        send_big_init(&mut s, b'B');
+        assert!(s.stopped, "no room for the new part file");
+        let track = &s.tracks[&1];
+        assert_eq!((track.dupes, track.skipped), (0, 1));
+    }
+
+    /// The same for a switch back: nothing is appended to the earlier part.
+    #[test]
+    fn overflow_of_a_switch_back_init_is_not_written() {
+        let mut s = session("overflowback");
+        send_big_init(&mut s, b'A');
+        write(&mut s, &seg(1, false, Some(0), None), &moof(0));
+        write(&mut s, &seg(1, true, None, None), &init_with_traks(1));
+        write(&mut s, &seg(1, false, Some(1000), None), &moof(1000));
+        let before = written(&s, 1);
+        send_big_init(&mut s, b'A');
+        assert_eq!(written(&s, 1), before, "nothing appended to part 0");
+        write(&mut s, &seg(1, false, Some(2000), None), &moof(2000));
+        assert_eq!(
+            init_rows_after_media(&s.dir, 0),
+            0,
+            "{:?}",
+            index_rows(&s.dir)
+        );
+        assert_eq!(s.tracks[&1].part, 0, "back in part 0");
+    }
+
     #[test]
     fn sequence_mode_dedupes_by_tfdt_and_duration() {
         let mut s = session("seqmode");
@@ -3496,10 +3932,113 @@ mod tests {
         write(&mut s, &seg(1, false, Some(0), None), b"CIPHER");
         assert_eq!(index_lines(&s.dir), 0);
         assert_eq!(fs::read(s.dir.join("sb1.p0.bin")).expect("part").len(), 0);
-        // A clear init afterwards is captured again.
-        write(&mut s, &seg(1, true, None, None), b"CLEARINIT");
+        // A clear (complete) init afterwards is captured again.
+        write(&mut s, &seg(1, true, None, None), &init_with_traks(1));
         write(&mut s, &seg(1, false, Some(0), None), b"MEDIA");
         assert_eq!(index_lines(&s.dir), 2);
+    }
+
+    /// The first chunk of an init after a refusal looks clear, but its
+    /// continuation (with `encv`) never arrives: the connection ends. The
+    /// refusal must hold, on this connection and the next one, whose media
+    /// (moofs without `senc`, `WebM` clusters) carries no marker.
+    #[test]
+    fn an_incomplete_init_after_a_refusal_keeps_it() {
+        let shared = refusals();
+        let mut enc = mp4_box(*b"ftyp", b"iso6");
+        enc.extend(mp4_box(*b"moov", b"..encv.."));
+        // ftyp plus a moov whose size runs past the chunk: no marker yet.
+        let mut cut = mp4_box(*b"ftyp", b"iso6");
+        cut.extend_from_slice(&4096u32.to_be_bytes());
+        cut.extend_from_slice(b"moov");
+        cut.extend(mp4_box(*b"mvhd", &[0; 16]));
+
+        let mut first = session_with("cutlift-a", "tab-1", &shared);
+        write(&mut first, &seg(1, true, None, None), &enc);
+        write(&mut first, &seg(1, true, None, None), &cut);
+        assert!(shared.contains("tab-1", 1), "not lifted by a first chunk");
+        first.finish();
+        assert_eq!(index_lines(&first.dir), 0, "the cut init is not written");
+        assert!(first.tracks[&1].refused);
+        drop(first);
+
+        let mut again = session_with("cutlift-b", "tab-1", &shared);
+        for t in 0..3u32 {
+            let h = seg(1, false, Some(u64::from(t) * 1000), None);
+            write(&mut again, &h, &moof(t * 1000));
+        }
+        let mut w = seg(1, false, Some(5000), None);
+        w.kind = "webm".into();
+        write(&mut again, &w, b"\x1f\x43\xb6\x75cluster");
+        assert_eq!(index_lines(&again.dir), 0, "no row after the reconnect");
+        assert_eq!(written(&again, 1), 0, "no bytes after the reconnect");
+    }
+
+    /// The same within one connection: media after an incomplete init that
+    /// followed a refusal stays refused.
+    #[test]
+    fn media_after_an_incomplete_init_after_a_refusal_is_refused() {
+        let shared = refusals();
+        let mut enc = mp4_box(*b"ftyp", b"iso6");
+        enc.extend(mp4_box(*b"moov", b"..encv.."));
+        let mut s = session_with("cutlift-same", "tab-1", &shared);
+        write(&mut s, &seg(1, true, None, None), &enc);
+        write(&mut s, &seg(1, true, None, None), b"\0\0\0\x08ftyp");
+        for t in 0..3u32 {
+            let h = seg(1, false, Some(u64::from(t) * 1000), None);
+            write(&mut s, &h, &moof(t * 1000));
+        }
+        assert_eq!(index_lines(&s.dir), 0);
+        assert!(s.tracks[&1].refused);
+        assert!(shared.contains("tab-1", 1));
+        // A complete clear init still lifts it.
+        write(&mut s, &seg(1, true, None, None), &init_with_traks(1));
+        write(&mut s, &seg(1, false, Some(9000), None), &moof(9000));
+        assert_eq!(index_lines(&s.dir), 2);
+        assert!(!shared.contains("tab-1", 1));
+    }
+
+    /// The three `WebM` encryption IDs in three appends, one of them cut in
+    /// two: no chunk shows all three, the whole init does.
+    #[test]
+    fn webm_markers_split_across_chunks_are_refused() {
+        let shared = refusals();
+        let webm = |is_init: bool, tfdt: Option<u64>| {
+            let mut h = seg(1, is_init, tfdt, None);
+            h.kind = "webm".into();
+            h.mime = "video/webm".into();
+            h
+        };
+        let init = [
+            &[0x1a, 0x45, 0xdf, 0xa3, 0x80][..],
+            &[
+                0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ],
+            &[0x15, 0x49, 0xa9, 0x66, 0x80],
+            &[
+                0x16, 0x54, 0xae, 0x6b, 0x86, 0x6d, 0x80, 0x50, 0x35, 0x47, 0xe2,
+            ],
+        ]
+        .concat();
+        // Cut inside 0x6d80, between 0x5035 and 0x47e2.
+        let (a, rest) = init.split_at(init.len() - 5);
+        let (b, c) = rest.split_at(3);
+        let mut s = session_with("webmsplit", "tab-1", &shared);
+        write(&mut s, &webm(true, None), a);
+        let mut cont = webm(false, None);
+        cont.init_cont = true;
+        write(&mut s, &cont, b);
+        write(&mut s, &cont, c);
+        for t in 0..3 {
+            write(
+                &mut s,
+                &webm(false, Some(t * 1000)),
+                b"\x1f\x43\xb6\x75cluster",
+            );
+        }
+        assert_eq!(index_lines(&s.dir), 0, "nothing written");
+        assert!(s.tracks[&1].refused);
+        assert!(shared.contains("tab-1", 1), "remembered for a reconnect");
     }
 
     /// A reconnect opens a fresh session that never sees the (encrypted)
@@ -4191,6 +4730,211 @@ mod tests {
         assert_eq!(tfdt_at(1), 480_000, "audio: 10 s at 48 kHz");
     }
 
+    /// The largest part of a `SourceBuffer` has a cut init: the smaller one
+    /// that decodes is muxed instead of none.
+    #[test]
+    fn a_smaller_part_is_used_when_the_largest_cannot_be_muxed() {
+        let dir = temp_dir("fallback");
+        let init = init_with_traks(1);
+        let mut good = init.clone();
+        good.extend(moof(0));
+        fs::write(dir.join("sb1.p0.bin"), &good).expect("write");
+        let cut = init_with_traks(0);
+        let mut big = cut.clone();
+        big.extend(vec![0u8; 4096]);
+        fs::write(dir.join("sb1.p1.bin"), &big).expect("write");
+        let mut rows = vec![
+            row(0, init.len() as u64, true, None, None),
+            row(init.len() as u64, 32, false, Some(0), None),
+            row(0, cut.len() as u64, true, None, None),
+            row(cut.len() as u64, 4096, false, Some(1000), None),
+        ];
+        rows[2].part = 1;
+        rows[3].part = 1;
+        let plan = mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)).expect("plan");
+        assert_eq!(plan.inputs.len(), 1, "{plan:?}");
+        assert!(
+            plan.inputs[0].path.ends_with("sb1.p0.bin"),
+            "the smaller part: {plan:?}"
+        );
+    }
+
+    /// Writes `init` and `media` as sb1.p`part`.bin and returns its rows.
+    /// Media is (bytes, len, tfdt); bytes `None` is a row past the end of the
+    /// file (a truncated part).
+    fn write_part_rows(
+        dir: &Path,
+        part: u32,
+        init: &[u8],
+        media: &[(Option<&[u8]>, u64, u64)],
+    ) -> Vec<IndexRow> {
+        let mut raw = init.to_vec();
+        let mut rows = vec![row(0, init.len() as u64, true, None, None)];
+        for &(bytes, len, tfdt) in media {
+            let offset = match bytes {
+                Some(b) => {
+                    raw.extend_from_slice(b);
+                    raw.len() - b.len()
+                }
+                None => raw.len() + (1 << 20),
+            };
+            rows.push(row(offset as u64, len, false, Some(tfdt), None));
+        }
+        fs::write(dir.join(format!("sb1.p{part}.bin")), raw).expect("write");
+        for r in &mut rows {
+            r.part = part;
+        }
+        rows
+    }
+
+    /// A fallback part that cannot be read (an index row past the end of its
+    /// file) is left out like one that does not decode: the next one is
+    /// tried, the mux goes on, and no partial sorted copy stays behind.
+    #[test]
+    fn an_unreadable_fallback_part_is_skipped() {
+        let dir = temp_dir("fallbackio");
+        let (good, cut) = (init_with_traks(1), init_with_traks(0));
+        let m1 = moof(1000);
+        let mut rows = write_part_rows(&dir, 1, &cut, &[(Some(&[0u8; 64]), 64, 0)]);
+        rows[1].len = 20_000;
+        rows.extend(write_part_rows(
+            &dir,
+            0,
+            &good,
+            &[(Some(&m1), m1.len() as u64, 1000), (None, 10_000, 0)],
+        ));
+        rows.extend(write_part_rows(&dir, 2, &good, &[(Some(&moof(0)), 32, 0)]));
+        let plan = mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)).expect("plan");
+        assert_eq!(plan.inputs.len(), 1, "{plan:?}");
+        assert!(plan.inputs[0].path.ends_with("sb1.p2.bin"), "{plan:?}");
+        assert!(!dir.join("sb1.p0.sorted.bin").exists(), "partial copy left");
+    }
+
+    /// A fallback that only fails once the others are laid out again (a
+    /// truncated row the raw file served unread at the first lift) is left
+    /// out there too, and the lift then follows the parts actually muxed.
+    #[test]
+    fn a_fallback_failing_in_the_relayout_is_skipped_and_moves_nothing() {
+        let dir = temp_dir("relayoutio");
+        let cut = init_with_traks(0);
+        let largest = |dir: &Path, tso: Option<f64>| {
+            let mut r = write_part_rows(dir, 1, &cut, &[(Some(&[0u8; 64]), 64, 0)]);
+            r[1].len = 20_000;
+            r[1].tso = tso;
+            r
+        };
+        // sb2: the largest part has a cut init; the fallback needs no move
+        // at the first lift (10 s against its -10 s offset), so its raw file
+        // serves and its truncated row goes unread, but it sets a lift of
+        // 8 s for the second layout.
+        let m2 = moof(2000);
+        let mut rows = largest(&dir, None);
+        rows.extend(write_part_rows(
+            &dir,
+            0,
+            &init_with_traks(1),
+            &[(Some(&m2), m2.len() as u64, 2000), (None, 10_000, 3000)],
+        ));
+        for r in &mut rows {
+            r.sb = 2;
+            if r.part == 0 && !r.is_init {
+                r.tso = Some(-10.0);
+            }
+        }
+        for part in 0..2 {
+            fs::rename(
+                dir.join(format!("sb1.p{part}.bin")),
+                dir.join(format!("sb2.p{part}.bin")),
+            )
+            .expect("rename");
+        }
+        // sb1: the largest part (cut init) sets the first lift of 10 s.
+        rows.extend(largest(&dir, Some(-10.0)));
+        rows.extend(write_part_rows(
+            &dir,
+            0,
+            &init_with_traks(1),
+            &[(Some(&moof(0)), 32, 0)],
+        ));
+        let plan = mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)).expect("plan");
+        assert_eq!(plan.inputs.len(), 1, "sb2 left out: {plan:?}");
+        assert!(
+            plan.inputs[0].path.ends_with("sb1.p0.bin"),
+            "sb1 not moved by the parts left out: {plan:?}"
+        );
+    }
+
+    /// The cheap checks on the init come before the sort: a part with a cut
+    /// init is skipped without reading (or copying) its media, so a
+    /// truncated media row does not fail the mux either.
+    #[test]
+    fn a_cut_init_is_rejected_before_the_sort() {
+        let dir = temp_dir("cheapfirst");
+        let m1 = moof(1000);
+        let rows = write_part_rows(
+            &dir,
+            0,
+            &init_with_traks(0),
+            &[(Some(&m1), m1.len() as u64, 1000), (None, 10_000, 0)],
+        );
+        assert!(
+            matches!(
+                mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)),
+                Err(SinkError::Capture(_))
+            ),
+            "skipped, not an I/O error"
+        );
+        assert!(!dir.join("sb1.p0.sorted.bin").exists());
+    }
+
+    /// At most `MAX_FALLBACK_PARTS` parts are tried after the largest one.
+    #[test]
+    fn fallback_parts_are_capped() {
+        let dir = temp_dir("fallbackcap");
+        let cut = init_with_traks(0);
+        let mut rows = write_part_rows(&dir, 0, &init_with_traks(1), &[(Some(&moof(0)), 32, 0)]);
+        let last = u32::try_from(MAX_FALLBACK_PARTS).expect("small") + 1;
+        for part in 1..=last {
+            let mut r = write_part_rows(&dir, part, &cut, &[(Some(&[0u8; 64]), 64, 0)]);
+            // Larger than part 0, the lower part number the larger.
+            r[1].len = 10_000 - u64::from(part);
+            rows.extend(r);
+        }
+        assert!(
+            matches!(
+                mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)),
+                Err(SinkError::Capture(_))
+            ),
+            "part 0 is beyond the cap"
+        );
+        rows.retain(|r| r.part != last);
+        let plan = mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)).expect("plan");
+        assert!(plan.inputs[0].path.ends_with("sb1.p0.bin"), "{plan:?}");
+    }
+
+    /// A part rejected after its sort (it does not start like media) leaves
+    /// no sorted copy behind.
+    #[test]
+    fn a_rejected_part_leaves_no_sorted_copy() {
+        let dir = temp_dir("rejectsorted");
+        // A WebM "init" too short to check before the sort.
+        let mut rows = write_part_rows(
+            &dir,
+            0,
+            b"XYZ",
+            &[(Some(b"CLUSTER1"), 8, 1000), (Some(b"CLUSTER0"), 8, 0)],
+        );
+        for r in &mut rows {
+            r.kind = "webm".into();
+            r.mime = "video/webm".into();
+        }
+        assert!(matches!(
+            mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)),
+            Err(SinkError::Capture(_))
+        ));
+        assert!(!dir.join("sb1.p0.sorted.bin").exists());
+    }
+
     #[test]
     fn a_part_with_a_cut_init_is_left_out() {
         let dir = temp_dir("cutinit");
@@ -4341,10 +5085,38 @@ mod tests {
                 "--timeout-secs".to_owned(),
                 "0".to_owned(),
             ],
+            vec![
+                "dir".to_owned(),
+                "--out".to_owned(),
+                "--timeout-secs".to_owned(),
+                "5".to_owned(),
+            ],
         ] {
             let err = run_mux(&args, &Tools::default()).unwrap_err();
             assert_eq!(err.exit_code(), 2, "{err}");
         }
+    }
+
+    /// An empty token would let any local process in; a flag value that is
+    /// the next flag is a slip. Both stop `serve` before it binds.
+    #[test]
+    fn serve_usage_errors_exit_with_2_before_binding() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        for args in [
+            a(&["--token", ""]),
+            a(&["--token", " \t"]),
+            a(&["--token", "--port", "1"]),
+            a(&["--token"]),
+            a(&["--token", "t", "--port"]),
+            a(&["--token", "t", "--out", "--port", "1"]),
+            a(&["--port", "1"]),
+        ] {
+            let err = serve_config(&args).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{args:?}: {err}");
+        }
+        let ok = serve_config(&a(&["--port", "0", "--token", "secret"])).expect("valid");
+        assert_eq!((ok.token.as_slice(), ok.port), (&b"secret"[..], 0));
+        assert_eq!(ok.out, PathBuf::from("captures"));
     }
 
     #[test]
