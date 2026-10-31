@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "The main window may call the app's own commands only; no plugin permissions.",
+  "windows": ["main"],
+  "permissions": [
+    "allow-snapshot",
+    "allow-get-settings",
+    "allow-save-settings",
+    "allow-regenerate-token",
+    "allow-start-sink",
+    "allow-stop-sink",
+    "allow-mux-capture",
+    "allow-open-result",
+    "allow-open-folder",
+    "allow-delete-capture"
+  ]
+}

@@ -1,0 +1,351 @@
+//! The sink as a child process, and `streamtap-sink mux` jobs. Nothing is
+//! started through a shell, and on Windows no console window opens.
+
+use std::collections::VecDeque;
+use std::env;
+use std::ffi::OsStr;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use serde::Serialize;
+
+/// Name of the sink executable next to this one.
+#[cfg(windows)]
+const SINK_EXE: &str = "streamtap-sink.exe";
+#[cfg(not(windows))]
+const SINK_EXE: &str = "streamtap-sink";
+#[cfg(windows)]
+const FFMPEG_EXE: &str = "ffmpeg.exe";
+#[cfg(not(windows))]
+const FFMPEG_EXE: &str = "ffmpeg";
+
+/// Lines of sink output kept for the UI.
+pub(crate) const LOG_LINES: usize = 200;
+const LOG_LINE_CHARS: usize = 500;
+/// Longest line read in one piece; the rest of a longer one is a new line.
+const MAX_READ_LINE: u64 = 16 * 1024;
+/// Mux stderr kept (the end of it, where the cause is).
+pub(crate) const MUX_TAIL_BYTES: usize = 4096;
+
+/// `CREATE_NO_WINDOW`: no console window for a child of a GUI process.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// A `Command` that opens no console window on Windows.
+pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
+    #[allow(unused_mut, reason = "mutated on Windows only")]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Where the sink executable is: next to this exe (installed), else the
+/// `release` and `debug` directories of the cargo target dir (development).
+pub(crate) fn find_sink() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let mut candidates = vec![dir.join(SINK_EXE)];
+    if let Some(target) = dir.parent() {
+        candidates.push(target.join("release").join(SINK_EXE));
+        candidates.push(target.join("debug").join(SINK_EXE));
+    }
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release")
+            .join(SINK_EXE),
+    );
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// `ffmpeg` on `PATH` (the sink looks there too).
+pub(crate) fn find_ffmpeg() -> Option<PathBuf> {
+    find_in_path(env::var_os("PATH")?.as_os_str(), FFMPEG_EXE)
+}
+
+fn find_in_path(path: &OsStr, file: &str) -> Option<PathBuf> {
+    env::split_paths(path)
+        .map(|d| d.join(file))
+        .find(|p| p.is_file())
+}
+
+/// Arguments of `streamtap-sink serve`. The token is on the command line
+/// because the sink has no other input yet (documented limit of the sink).
+pub(crate) fn serve_args(port: u16, token: &str, out: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "serve".into(),
+        "--token".into(),
+        token.into(),
+        "--port".into(),
+        port.to_string().into(),
+        "--out".into(),
+        out.as_os_str().to_owned(),
+    ]
+}
+
+/// Reads `r` line by line (lossy UTF-8, long lines cut) until it ends, so a
+/// child never blocks on a full pipe.
+pub(crate) fn for_each_line(r: impl Read, mut f: impl FnMut(&str)) {
+    let mut r = BufReader::new(r);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.by_ref().take(MAX_READ_LINE).read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&buf);
+                f(text.trim_end_matches(['\r', '\n']));
+            }
+        }
+    }
+}
+
+/// A log line made safe to keep and show: the token never appears in it,
+/// control characters are dropped and the length is bounded.
+pub(crate) fn clean_line(line: &str, token: &str) -> String {
+    let line = if token.is_empty() {
+        line.to_owned()
+    } else {
+        line.replace(token, "<token>")
+    };
+    line.chars()
+        .filter(|c| !c.is_control())
+        .take(LOG_LINE_CHARS)
+        .collect()
+}
+
+pub(crate) fn push_log(log: &mut VecDeque<String>, line: String) {
+    if log.len() >= LOG_LINES {
+        log.pop_front();
+    }
+    log.push_back(line);
+}
+
+/// The capture directory name from a sink line that reports a DRM refusal:
+/// `<dir>: sbN carries encrypted media (DRM); ...` or
+/// `<dir>: sbN was refused as DRM before this reconnect; ...`.
+pub(crate) fn drm_capture_of(line: &str) -> Option<String> {
+    let (dir, rest) = line.split_once(": sb")?;
+    let reported =
+        rest.contains("carries encrypted media (DRM)") || rest.contains("refused as DRM");
+    if !reported {
+        return None;
+    }
+    // The sink prints the directory with the platform's separator.
+    let name = dir.rsplit(['/', '\\']).next()?;
+    crate::paths::validate_id(name).ok().map(str::to_owned)
+}
+
+/// What a `streamtap-sink mux` exit code means (README, "Exit codes").
+pub(crate) fn mux_exit_meaning(code: Option<i32>) -> &'static str {
+    match code {
+        Some(0) => "ok",
+        Some(1) => "a file or socket operation failed",
+        Some(2) => "usage error (the app passed bad arguments)",
+        Some(3) => "the capture holds nothing to mux",
+        Some(4) => "ffmpeg is missing or cannot be started; install ffmpeg and put it on PATH",
+        Some(5) => "a tool timed out or wrote too much output",
+        Some(6) => "ffmpeg failed",
+        Some(_) => "unexpected exit code",
+        None => "the sink was stopped by a signal",
+    }
+}
+
+/// The last `max` bytes of `text`, cut at a character boundary.
+pub(crate) fn tail(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub(crate) enum MuxState {
+    Running,
+    Ok,
+    Failed {
+        code: Option<i32>,
+        meaning: String,
+        stderr_tail: String,
+    },
+}
+
+/// Runs `sink mux <dir>` to its end; stdout is discarded, the end of stderr
+/// is kept. The caller runs this on its own thread.
+pub(crate) fn run_mux(sink: &Path, dir: &Path) -> MuxState {
+    let mut child = match command(sink)
+        .arg("mux")
+        .arg(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return MuxState::Failed {
+                code: None,
+                meaning: "the sink could not be started".into(),
+                stderr_tail: e.to_string(),
+            }
+        }
+    };
+    let mut stderr_text = String::new();
+    if let Some(err) = child.stderr.take() {
+        for_each_line(err, |l| {
+            stderr_text.push_str(&clean_line(l, ""));
+            stderr_text.push('\n');
+            // Bound the memory: keep about twice the tail.
+            if stderr_text.len() > MUX_TAIL_BYTES * 2 {
+                let keep = tail(&stderr_text, MUX_TAIL_BYTES).to_owned();
+                stderr_text = keep;
+            }
+        });
+    }
+    match child.wait() {
+        Ok(status) if status.success() => MuxState::Ok,
+        Ok(status) => MuxState::Failed {
+            code: status.code(),
+            meaning: mux_exit_meaning(status.code()).into(),
+            stderr_tail: tail(&stderr_text, MUX_TAIL_BYTES).to_owned(),
+        },
+        Err(e) => MuxState::Failed {
+            code: None,
+            meaning: "waiting for the sink failed".into(),
+            stderr_tail: e.to_string(),
+        },
+    }
+}
+
+/// Opens a file or folder with the system's default handler. The program is
+/// started directly with the path as its only argument (no shell).
+pub(crate) fn open_path(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let program = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let program = "xdg-open";
+    command(program)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drm_lines_name_their_capture() {
+        let a = r"E:\cap\1730000000_abcd1234: sb1 carries encrypted media (DRM); not capturing this track";
+        assert_eq!(drm_capture_of(a).as_deref(), Some("1730000000_abcd1234"));
+        let b = "/home/u/captures/1730000000_abcd1234-2: sb3 was refused as DRM before this reconnect; not capturing it";
+        assert_eq!(drm_capture_of(b).as_deref(), Some("1730000000_abcd1234-2"));
+        assert_eq!(drm_capture_of("1_x: sb1 init not written"), None);
+        assert_eq!(drm_capture_of("listening on ws://127.0.0.1:1"), None);
+        // Only the last path component counts, and it must be a plain id; the
+        let evil = r"..\..\x: sb1 carries encrypted media (DRM)";
+        assert_eq!(drm_capture_of(evil).as_deref(), Some("x"));
+        // caller resolves it against the captures directory anyway.
+        let evil2 = "C:: sb1 carries encrypted media (DRM)";
+        assert_eq!(drm_capture_of(evil2), None);
+    }
+
+    #[test]
+    fn every_exit_code_has_a_meaning() {
+        for c in 0..=6 {
+            assert_ne!(mux_exit_meaning(Some(c)), "unexpected exit code", "{c}");
+        }
+        assert_eq!(mux_exit_meaning(Some(7)), "unexpected exit code");
+        assert!(mux_exit_meaning(Some(4)).contains("ffmpeg"));
+        assert!(mux_exit_meaning(None).contains("signal"));
+    }
+
+    #[test]
+    fn the_token_never_reaches_the_log() {
+        let line = "echo secret-token-123 and again secret-token-123\u{7}";
+        let cleaned = clean_line(line, "secret-token-123");
+        assert!(!cleaned.contains("secret-token-123"));
+        assert!(!cleaned.contains('\u{7}'));
+        assert_eq!(clean_line(&"x".repeat(2000), "t").len(), LOG_LINE_CHARS);
+    }
+
+    #[test]
+    fn the_log_is_a_ring() {
+        let mut log = VecDeque::new();
+        for i in 0..LOG_LINES + 5 {
+            push_log(&mut log, i.to_string());
+        }
+        assert_eq!(log.len(), LOG_LINES);
+        assert_eq!(log.front().map(String::as_str), Some("5"));
+    }
+
+    #[test]
+    fn lines_survive_invalid_utf8_and_long_input() {
+        let mut got = Vec::new();
+        let mut data = b"one\r\ntw\xffo\n".to_vec();
+        data.extend(std::iter::repeat_n(
+            b'a',
+            usize::try_from(MAX_READ_LINE).unwrap() + 10,
+        ));
+        data.extend_from_slice(b"\nlast");
+        for_each_line(&data[..], |l| got.push(l.to_owned()));
+        assert_eq!(got[0], "one");
+        assert!(got[1].starts_with("tw") && got[1].ends_with('o'));
+        assert!(
+            got.len() >= 4,
+            "a long line is split, reading goes on: {}",
+            got.len()
+        );
+        assert_eq!(got.last().map(String::as_str), Some("last"));
+    }
+
+    #[test]
+    fn tail_cuts_on_a_char_boundary() {
+        assert_eq!(tail("abcdef", 3), "def");
+        assert_eq!(tail("abc", 10), "abc");
+        let s = "a\u{e4}\u{e4}\u{e4}"; // 1 + 3*2 bytes
+        assert_eq!(tail(s, 3), "\u{e4}");
+    }
+
+    #[test]
+    fn serve_args_carry_token_port_and_dir() {
+        let a = serve_args(17650, "tok", Path::new("/c"));
+        let s: Vec<String> = a.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            s,
+            ["serve", "--token", "tok", "--port", "17650", "--out", "/c"]
+        );
+    }
+
+    #[test]
+    fn mux_of_a_missing_sink_fails_cleanly() {
+        let state = run_mux(Path::new("does-not-exist-streamtap-sink"), Path::new("x"));
+        assert!(matches!(state, MuxState::Failed { code: None, .. }));
+    }
+
+    #[test]
+    fn path_search_finds_a_file_in_a_listed_directory() {
+        let dir = std::env::temp_dir().join(format!("streamtap-app-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tool.bin"), b"").unwrap();
+        let path = env::join_paths([Path::new("/nonexistent-dir"), dir.as_path()]).unwrap();
+        assert_eq!(find_in_path(&path, "tool.bin"), Some(dir.join("tool.bin")));
+        assert_eq!(find_in_path(&path, "other.bin"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

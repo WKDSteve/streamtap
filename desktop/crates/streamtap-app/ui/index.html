@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>streamtap</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#captures">Skip to captures</a>
+
+<header class="bar">
+  <h1>streamtap</h1>
+  <div id="sink-status" class="status" role="status" aria-live="polite">
+    <span id="sink-dot" class="dot dot-stopped" aria-hidden="true"></span>
+    <span id="sink-text">Sink: loading</span>
+  </div>
+  <div class="bar-actions">
+    <button id="sink-toggle" type="button" class="primary" disabled>Start</button>
+    <button id="settings-toggle" type="button" aria-expanded="false" aria-controls="settings">Settings</button>
+  </div>
+</header>
+
+<main>
+  <div id="notices" class="notices"></div>
+
+  <section id="settings" class="panel" aria-labelledby="settings-h" hidden>
+    <h2 id="settings-h">Settings</h2>
+    <p id="settings-lock" class="hint" hidden>Stop the sink to change port, captures folder or token.</p>
+    <form id="settings-form" autocomplete="off">
+      <div class="field">
+        <label for="port">Port</label>
+        <input id="port" name="port" type="number" min="1024" max="65535" inputmode="numeric" required>
+      </div>
+      <div class="field wide">
+        <label for="dir">Captures folder</label>
+        <input id="dir" name="dir" type="text" spellcheck="false" required>
+      </div>
+      <div class="field wide">
+        <label for="token">Token</label>
+        <div class="row">
+          <input id="token" name="token" type="password" readonly spellcheck="false" autocomplete="off">
+          <button id="token-show" type="button" aria-pressed="false">Show</button>
+          <button id="token-copy" type="button">Copy</button>
+          <button id="token-new" type="button">New token</button>
+        </div>
+        <p class="hint">Paste port and token into the streamtap extension popup, then reload the video page.</p>
+      </div>
+      <div class="row">
+        <button id="settings-save" type="submit" class="primary">Save</button>
+      </div>
+    </form>
+    <dl class="facts">
+      <dt>ffmpeg</dt><dd id="fact-ffmpeg">-</dd>
+      <dt>Sink program</dt><dd id="fact-sink">-</dd>
+    </dl>
+  </section>
+
+  <section id="captures" class="captures" aria-labelledby="captures-h" tabindex="-1">
+    <h2 id="captures-h">Captures <span id="captures-count" class="count"></span></h2>
+    <div id="empty" class="empty" hidden></div>
+    <ul id="list" class="list"></ul>
+  </section>
+
+  <details id="log-box" class="panel">
+    <summary>Sink output</summary>
+    <pre id="log" tabindex="0" aria-label="Sink output"></pre>
+  </details>
+</main>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<dialog id="confirm" aria-labelledby="confirm-h">
+  <form method="dialog">
+    <h2 id="confirm-h">Delete capture?</h2>
+    <p id="confirm-text"></p>
+    <div class="row end">
+      <button value="cancel" id="confirm-cancel" type="submit">Cancel</button>
+      <button value="ok" id="confirm-ok" type="submit" class="danger">Delete</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
