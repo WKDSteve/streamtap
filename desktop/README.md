@@ -77,7 +77,10 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   it): an init+index range of a single-file stream (`ftyp moov sidx`) stays
   one init. The init is
   decided right there, so the media part never counts as its continuation
-  (also without a `tfdt`).
+  (also without a `tfdt`). A media part without samples (the append ended
+  after its `styp`; at most 64 KiB) is not a row of its own: it goes in
+  front of the next media append of that SourceBuffer, which also takes the
+  append's `tsoSet`; an init in between drops it.
 - An init is decided once it is complete: its chunks (an init split across
   appends: chunks the extension flags `initCont`, or untimed chunks while the
   init has no complete `moov` / `Tracks` yet) are held, up to 4 MiB with
@@ -185,14 +188,20 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   would decode before 0 (B-frames at a set offset, a negative
   `timestampOffset`), every SourceBuffer is moved later by the same amount,
   which is said, so they stay aligned. Only the parts that are muxed count
-  for that amount; a part whose bytes cannot be moved (WebM, several tracks
-  without per-track timescales) is aligned as if they had been. The first append keeps its own time (the browser may start
+  for that amount (not one left out for a missing `moov`, bytes that do not
+  start like media, or one ffprobe cannot decode: then the parts are laid
+  out again without it, which is said); a part whose bytes cannot be moved (WebM,
+  several tracks without per-track timescales) is aligned as if they had
+  been. Index lines of duplicates (`mark`) never count as bytes, also not
+  when picking the main MediaSource. The first append keeps its own time (the browser may start
   it at 0; the alignment between SourceBuffers is relative anyway).
 - **Gaps:** ranges skipped by a forward seek are reported with their
   approximate length.
 - **Lost inits:** when the extension had to drop an init (its queue was
-  full), or a new connection cannot replay one (its kept copy made room for
-  another tab's), it takes nothing more of that SourceBuffer until the next
+  full), or a new connection cannot replay one (its kept copy was dropped to
+  stay within the kept-init budget, where the tab and frame keeping the most
+  lose first, or it could not be kept at all), it takes nothing more of that
+  SourceBuffer until the next
   init and sends `initlost`; the sink notes it in `events.jsonl` and `mux` says that
   the media of that SourceBuffer between the lost init and its next init is
   not captured.

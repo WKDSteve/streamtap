@@ -309,6 +309,9 @@ struct TrackState {
     /// The last timed chunk was a duplicate: the untimed chunks that follow
     /// it (its continuation) are duplicates too.
     skip_tail: bool,
+    /// Segment boxes without samples that ended an init+media append, and
+    /// whether that append came after a set offset (`has_samples`).
+    segment_head: Option<(Vec<u8>, bool)>,
     /// The current init segment is encrypted (EME/DRM): nothing is written
     /// until a clear init segment arrives.
     refused: bool,
@@ -451,21 +454,9 @@ fn init_prefix_len(kind: &str, payload: &[u8]) -> Option<usize> {
         }
         return None;
     }
-    // A box starts where the previous one ended (headers may be 8 or 16 bytes).
     // Only with a box after it that only a segment has (`SEGMENT_BOXES`): an
     // init+index range of a single-file stream (ftyp moov sidx) is all init.
-    // A last box cut off (a chunked fetch) counts by its type, as in the
-    // hook: (type, start) of every box, complete or not.
-    let complete = boxes_in(payload, 0, payload.len());
-    let mut starts: Vec<([u8; 4], usize)> = Vec::with_capacity(complete.len() + 1);
-    let mut at = 0;
-    for (k, _, end) in &complete {
-        starts.push((*k, at));
-        at = *end;
-    }
-    if let Some(t) = payload.get(at + 4..at + 8) {
-        starts.push(([t[0], t[1], t[2], t[3]], at));
-    }
+    let starts = box_starts(payload);
     let first_media = starts.iter().position(|(k, _)| MEDIA_BOXES.contains(&k))?;
     if !starts[first_media..]
         .iter()
@@ -476,6 +467,36 @@ fn init_prefix_len(kind: &str, payload: &[u8]) -> Option<usize> {
     let start = starts[first_media].1;
     (start > 0).then_some(start)
 }
+
+/// (type, start) of every top-level MP4 box, one after the other (headers
+/// may be 8 or 16 bytes). A last box cut off (a chunked fetch) counts by its
+/// type, as in the hook.
+fn box_starts(payload: &[u8]) -> Vec<([u8; 4], usize)> {
+    let complete = boxes_in(payload, 0, payload.len());
+    let mut starts: Vec<([u8; 4], usize)> = Vec::with_capacity(complete.len() + 1);
+    let mut at = 0;
+    for (k, _, end) in &complete {
+        starts.push((*k, at));
+        at = *end;
+    }
+    if let Some(t) = payload.get(at + 4..at + 8) {
+        starts.push(([t[0], t[1], t[2], t[3]], at));
+    }
+    starts
+}
+
+/// The media part of a split init+media append holds samples (a `moof` or
+/// `mdat`, a `WebM` Cluster), not only boxes in front of them (`styp`,
+/// `emsg`, `prft`, `sidx`), which an append can end with (a chunked fetch).
+fn has_samples(kind: &str, media: &[u8]) -> bool {
+    kind == "webm"
+        || box_starts(media)
+            .iter()
+            .any(|(k, _)| k == b"moof" || k == b"mdat")
+}
+
+/// Segment boxes without samples held for the next media append (bytes).
+const MAX_SEGMENT_HEAD: usize = 64 * 1024;
 
 /// The init bytes so far hold a complete `moov` (MP4) or `Tracks` (`WebM`):
 /// nothing more of this init is to come.
@@ -846,6 +867,7 @@ impl TrackState {
             pending_after_refusal: false,
             init_kind: String::new(),
             skip_tail: false,
+            segment_head: None,
             refused: false,
             parts_full: false,
             bytes: 0,
@@ -1183,28 +1205,67 @@ impl Session {
         Ok(true)
     }
 
+    /// An init with its first segment in one append (`init_prefix_len` is
+    /// `n`): two rows, so the init is decided (and deduped) on its own bytes.
+    fn write_init_and_media(
+        &mut self,
+        h: &SegmentHeader,
+        payload: &[u8],
+        n: usize,
+    ) -> io::Result<()> {
+        let (init, media) = payload.split_at(n);
+        let mut hi = h.clone();
+        hi.tfdt = None;
+        hi.dur = None;
+        self.write_segment(&hi, init)?;
+        // The init ends where the media starts: decide it now, so an untimed
+        // media part (a moof without tfdt) is not taken for its continuation.
+        self.flush_init(h.sb)?;
+        // Only the boxes in front of the samples (the append ended after its
+        // styp): they go with the next media append, which also takes the set
+        // offset, instead of a row of their own without samples or tfdt.
+        if !has_samples(&h.kind, media) && media.len() <= MAX_SEGMENT_HEAD {
+            if let Some(track) = self.tracks.get_mut(&h.sb) {
+                track.segment_head = Some((media.to_vec(), h.tso_set));
+            }
+            return Ok(());
+        }
+        let mut hm = h.clone();
+        hm.is_init = false;
+        hm.init_cont = false;
+        self.write_segment(&hm, media)
+    }
+
+    /// The held segment head (`write_init_and_media`) in front of this media
+    /// append, which also takes its set offset; an init in between drops it.
+    fn join_segment_head(
+        &mut self,
+        h: &SegmentHeader,
+        payload: &[u8],
+    ) -> Option<(SegmentHeader, Vec<u8>)> {
+        let (mut joined, tso_set) = self.tracks.get_mut(&h.sb)?.segment_head.take()?;
+        if h.is_init || h.init_cont {
+            return None;
+        }
+        joined.extend_from_slice(payload);
+        let mut hj = h.clone();
+        hj.tso_set |= tso_set;
+        Some((hj, joined))
+    }
+
     fn write_segment(&mut self, h: &SegmentHeader, payload: &[u8]) -> io::Result<()> {
         if self.stopped || payload.is_empty() {
             return Ok(());
         }
-        // An init with its first segment in one append: two rows, so the init
-        // is decided (and deduped) on its own bytes.
-        if h.is_init {
-            if let Some(n) = init_prefix_len(&h.kind, payload) {
-                let (init, media) = payload.split_at(n);
-                let mut hi = h.clone();
-                hi.tfdt = None;
-                hi.dur = None;
-                self.write_segment(&hi, init)?;
-                // The init ends where the media starts: decide it now, so an
-                // untimed media part (a moof without tfdt) is not taken for
-                // its continuation.
-                self.flush_init(h.sb)?;
-                let mut hm = h.clone();
-                hm.is_init = false;
-                hm.init_cont = false;
-                return self.write_segment(&hm, media);
-            }
+        if let Some(n) = h
+            .is_init
+            .then(|| init_prefix_len(&h.kind, payload))
+            .flatten()
+        {
+            return self.write_init_and_media(h, payload, n);
+        }
+        if let Some((hj, joined)) = self.join_segment_head(h, payload) {
+            return self.write_segment(&hj, &joined);
         }
         let dir = self.dir.clone();
         if !self.ensure_track(h.sb)? {
@@ -1760,23 +1821,11 @@ fn seq_leads(dir: &Path, sb: u32, rows: &[&IndexRow]) -> SeqMoves {
     leads
 }
 
-/// The sequence-mode layout of every `SourceBuffer` (`seq_layout`), and the
-/// lift (nanoseconds) for all of them. A frame placed by its offset may need
-/// a decode time before 0 (B-frames: at a set offset the browser puts the
-/// presentation time there; a negative `timestampOffset`), which an MP4
-/// cannot hold: then every `SourceBuffer` moves later by the same amount, so
-/// their alignment stays. Only the `chosen` (`SourceBuffer`, part) pairs, the
-/// ones muxed, count for the lift: a part left out (another rendition, a
-/// forged one) moves nothing.
-fn seq_layouts(
-    dir: &Path,
-    rows: &[IndexRow],
-    chosen: &[(u32, u32)],
-) -> (HashMap<u32, SeqMoves>, i64) {
-    const NS: i128 = 1_000_000_000;
+/// The sequence-mode layout (`seq_layout`) of the `SourceBuffer` of every
+/// `chosen` (`SourceBuffer`, part) pair.
+fn seq_layouts(dir: &Path, rows: &[IndexRow], chosen: &[(u32, u32)]) -> HashMap<u32, SeqMoves> {
     let mut layouts = HashMap::new();
-    let mut earliest: i128 = 0;
-    for &(id, part) in chosen {
+    for &(id, _) in chosen {
         let sb_rows: Vec<&IndexRow> = rows.iter().filter(|r| r.sb == id).collect();
         let leads = seq_leads(dir, id, &sb_rows);
         let (moves, jumps) = seq_layout(&sb_rows, &leads);
@@ -1785,30 +1834,38 @@ fn seq_layouts(
                 "mux: sb{id}: sequence mode: {jumps} discontinuity(ies) without a timestampOffset set; placed right after the previous append, as the browser does"
             );
         }
-        for r in sb_rows
-            .iter()
-            .filter(|r| r.part == part && !r.is_init && !r.mark)
-        {
-            let (Some(t), Some(ts)) = (r.tfdt, r.timescale.filter(|t| *t > 0)) else {
-                continue;
-            };
-            let m = if r.seq_mode {
-                moves.get(&(r.part, r.offset)).copied().unwrap_or(0)
-            } else {
-                shift_ticks(r.tso, Some(ts))
-            };
-            earliest = earliest.min((i128::from(t) + i128::from(m)) * NS / i128::from(ts));
-        }
         layouts.insert(id, moves);
     }
-    let lift = i64::try_from((-earliest).clamp(0, i128::from(i64::MAX))).expect("clamped");
-    if lift > 0 {
-        eprintln!(
-            "mux: the earliest frame would decode {:.3} s before 0; every SourceBuffer is moved later by that",
-            Duration::from_nanos(lift.unsigned_abs()).as_secs_f64()
-        );
+    layouts
+}
+
+/// The lift (nanoseconds) for all `SourceBuffer`s. A frame placed by its
+/// offset may need a decode time before 0 (B-frames: at a set offset the
+/// browser puts the presentation time there; a negative `timestampOffset`),
+/// which an MP4 cannot hold: then every `SourceBuffer` moves later by the
+/// same amount, so their alignment stays. Only the `muxed` (`SourceBuffer`,
+/// part) pairs count: a part left out (another rendition, a forged or
+/// undecodable one) moves nothing.
+fn seq_lift(rows: &[IndexRow], layouts: &HashMap<u32, SeqMoves>, muxed: &[(u32, u32)]) -> i64 {
+    const NS: i128 = 1_000_000_000;
+    let no_moves = SeqMoves::new();
+    let mut earliest: i128 = 0;
+    for r in rows.iter().filter(|r| !r.is_init && !r.mark) {
+        if !muxed.contains(&(r.sb, r.part)) {
+            continue;
+        }
+        let (Some(t), Some(ts)) = (r.tfdt, r.timescale.filter(|t| *t > 0)) else {
+            continue;
+        };
+        let m = if r.seq_mode {
+            let moves = layouts.get(&r.sb).unwrap_or(&no_moves);
+            moves.get(&(r.part, r.offset)).copied().unwrap_or(0)
+        } else {
+            shift_ticks(r.tso, Some(ts))
+        };
+        earliest = earliest.min((i128::from(t) + i128::from(m)) * NS / i128::from(ts));
     }
-    (layouts, lift)
+    i64::try_from((-earliest).clamp(0, i128::from(i64::MAX))).expect("clamped")
 }
 
 /// `ns` nanoseconds as ticks of `ts`, rounded up (0 without a timescale).
@@ -2070,7 +2127,7 @@ fn warn_arrival_order(sb: u32, part: u32, media: &[&IndexRow]) {
 
 /// Writes `sbN.pM.sorted.bin` from `rows` in that order, shifting each
 /// media segment's tfdt by `shift_for`. Also returns whether the first media
-/// segment got its shift (or needed none).
+/// segment with a tfdt got its shift (or needed none).
 fn write_sorted(
     dir: &Path,
     (sb, part): (u32, u32),
@@ -2090,7 +2147,8 @@ fn write_sorted(
         if !moved {
             unshifted += 1;
         }
-        if !r.is_init && first_moved.is_none() {
+        // A row without tfdt (a cut piece) has nothing to move.
+        if !r.is_init && r.tfdt.is_some() && first_moved.is_none() {
             first_moved = Some(moved);
         }
         dst.write_all(&buf)?;
@@ -2213,7 +2271,9 @@ fn version_line(text: &str) -> String {
 /// session; keep the one with the most bytes and name the others.
 fn keep_main_media_source(rows: &mut Vec<IndexRow>) {
     let mut per_ms: HashMap<Option<u32>, u64> = HashMap::new();
-    for r in rows.iter() {
+    // A mark repeats bytes stored once: counting it would let a looping
+    // teaser outweigh the video.
+    for r in rows.iter().filter(|r| !r.mark) {
         *per_ms.entry(r.ms).or_default() += r.len;
     }
     let Some((&chosen, _)) = per_ms
@@ -2306,6 +2366,73 @@ fn pick_parts(stored: &[&IndexRow]) -> Vec<(u32, u32)> {
     chosen
 }
 
+/// The ffmpeg input of one chosen (`SourceBuffer`, part) in timeline order,
+/// moved by `lift`; `None` when it cannot be muxed (said why).
+fn part_input(
+    dir: &Path,
+    stored: &[&IndexRow],
+    layouts: &HashMap<u32, SeqMoves>,
+    (id, part): (u32, u32),
+    lift: i64,
+    prober: &mut Prober<'_>,
+) -> Result<Option<MuxInput>, SinkError> {
+    let no_moves = SeqMoves::new();
+    let seq_moves = layouts.get(&id).unwrap_or(&no_moves);
+    let part_rows: Vec<&IndexRow> = stored
+        .iter()
+        .copied()
+        .filter(|r| r.sb == id && r.part == part)
+        .collect();
+    let kind = part_rows
+        .iter()
+        .find(|r| r.is_init)
+        .map_or("", |r| r.kind.as_str());
+    let (path, start, traks, lifted) =
+        ordered_part(dir, id, part, &part_rows, Some(seq_moves), lift).map_err(|e| {
+            SinkError::io(format!("sb{id}.p{part}: cannot reorder segments"), None, e)
+        })?;
+    // An MP4 init without a complete moov (cut short) cannot be decoded, and
+    // ffmpeg would fail the whole mux with it.
+    if kind == "mp4" && traks == 0 {
+        eprintln!("mux: sb{id}.p{part}: its init has no complete moov; skipped");
+        return Ok(None);
+    }
+    let Some(format) = input_format(kind, &path) else {
+        eprintln!(
+            "mux: sb{id}.p{part} does not start like {} media; skipped",
+            if kind.is_empty() {
+                "known".to_owned()
+            } else {
+                printable(kind, 16)
+            }
+        );
+        return Ok(None);
+    };
+    // The first presentation time as ffmpeg sees it (B-frame composition
+    // offsets and edit lists included): that is what ffmpeg subtracts. A part
+    // ffprobe cannot read is left out instead of failing the mux. Without
+    // ffprobe (or when it fails to run) the part is kept with the capture's
+    // own start, and that is said (ENG-13).
+    let start = match prober.probe(format, &path, &format!("sb{id}.p{part}")) {
+        Some(Probe::Undecodable) => {
+            eprintln!("mux: sb{id}.p{part} cannot be decoded; skipped");
+            return Ok(None);
+        }
+        // A part whose bytes could not take the lift is aligned as if they
+        // had.
+        Some(Probe::Start(s)) if !lifted => {
+            Some(s + Duration::from_nanos(lift.unsigned_abs()).as_secs_f64())
+        }
+        Some(Probe::Start(s)) => Some(s),
+        Some(Probe::Unknown) | None => start,
+    };
+    Ok(Some(MuxInput {
+        path,
+        format,
+        start,
+    }))
+}
+
 /// The ffmpeg inputs: per `SourceBuffer` the chosen part in timeline order.
 fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, SinkError> {
     // Marks only hold a duplicate's place in the sequence-mode layout; they
@@ -2320,63 +2447,33 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
         warnings: Vec::new(),
     };
     let chosen = pick_parts(&stored);
-    let (layouts, lift) = seq_layouts(dir, rows, &chosen);
-    let lift_secs = Duration::from_nanos(lift.unsigned_abs()).as_secs_f64();
+    let layouts = seq_layouts(dir, rows, &chosen);
+    let mut lift = seq_lift(rows, &layouts, &chosen);
     let mut inputs = Vec::new();
-    for (id, part) in chosen {
-        let no_moves = SeqMoves::new();
-        let seq_moves = layouts.get(&id).unwrap_or(&no_moves);
-        let part_rows: Vec<&IndexRow> = stored
-            .iter()
-            .copied()
-            .filter(|r| r.sb == id && r.part == part)
-            .collect();
-        let kind = part_rows
-            .iter()
-            .find(|r| r.is_init)
-            .map_or("", |r| r.kind.as_str());
-        let (path, start, traks, lifted) =
-            ordered_part(dir, id, part, &part_rows, Some(seq_moves), lift).map_err(|e| {
-                SinkError::io(format!("sb{id}.p{part}: cannot reorder segments"), None, e)
-            })?;
-        // An MP4 init without a complete moov (cut short) cannot be decoded,
-        // and ffmpeg would fail the whole mux with it.
-        if kind == "mp4" && traks == 0 {
-            eprintln!("mux: sb{id}.p{part}: its init has no complete moov; skipped");
-            continue;
+    let mut muxed = Vec::new();
+    for &p in &chosen {
+        if let Some(input) = part_input(dir, &stored, &layouts, p, lift, &mut prober)? {
+            inputs.push(input);
+            muxed.push(p);
         }
-        let Some(format) = input_format(kind, &path) else {
-            eprintln!(
-                "mux: sb{id}.p{part} does not start like {} media; skipped",
-                if kind.is_empty() {
-                    "known".to_owned()
-                } else {
-                    printable(kind, 16)
-                }
-            );
-            continue;
-        };
-        // The first presentation time as ffmpeg sees it (B-frame composition
-        // offsets and edit lists included): that is what ffmpeg subtracts.
-        // A part ffprobe cannot read is left out instead of failing the mux.
-        // Without ffprobe (or when it fails to run) the part is kept with the
-        // capture's own start, and that is said (ENG-13).
-        let verdict = prober.probe(format, &path, &format!("sb{id}.p{part}"));
-        let start = match verdict {
-            Some(Probe::Undecodable) => {
-                eprintln!("mux: sb{id}.p{part} cannot be decoded; skipped");
-                continue;
-            }
-            // A part whose bytes could not take the lift is aligned as if
-            // they had.
-            Some(Probe::Start(s)) => Some(if lifted { s } else { s + lift_secs }),
-            Some(Probe::Unknown) | None => start,
-        };
-        inputs.push(MuxInput {
-            path,
-            format,
-            start,
-        });
+    }
+    // A part left out above must not move the others: once more without it.
+    let muxed_lift = seq_lift(rows, &layouts, &muxed);
+    if muxed_lift != lift {
+        eprintln!(
+            "mux: a part left out set how far to move the others; laid out again without it (this replaces the lines above)"
+        );
+        lift = muxed_lift;
+        inputs.clear();
+        for &p in &muxed {
+            inputs.extend(part_input(dir, &stored, &layouts, p, lift, &mut prober)?);
+        }
+    }
+    if lift > 0 {
+        eprintln!(
+            "mux: the earliest frame would decode {:.3} s before 0; every SourceBuffer is moved later by that",
+            Duration::from_nanos(lift.unsigned_abs()).as_secs_f64()
+        );
     }
     if inputs.is_empty() {
         return Err(SinkError::Capture("nothing decodable to mux".into()));
@@ -3473,16 +3570,108 @@ mod tests {
     /// one with a negative offset) moves nothing.
     #[test]
     fn lift_counts_only_the_chosen_parts() {
-        let dir = temp_dir("liftchosen");
         let mut low = row(0, 1, false, Some(0), Some(-5.0));
         low.part = 0;
         let mut high = row(0, 1, false, Some(0), None);
         high.part = 1;
         let rows = vec![low, high];
-        let (_, lift) = seq_layouts(&dir, &rows, &[(1, 1)]);
+        let lift = seq_lift(&rows, &HashMap::new(), &[(1, 1)]);
         assert_eq!(lift, 0, "part 0 is not muxed");
-        let (_, lift) = seq_layouts(&dir, &rows, &[(1, 0)]);
+        let lift = seq_lift(&rows, &HashMap::new(), &[(1, 0)]);
         assert_eq!(lift, 5_000_000_000, "part 0 muxed: lifted by 5 s");
+    }
+
+    /// A chosen part that mux then leaves out (here: no complete moov) does
+    /// not move the others either.
+    #[test]
+    fn a_skipped_part_does_not_lift_the_others() {
+        let dir = temp_dir("liftskipped");
+        let init = init_with_traks(1);
+        let mut good = init.clone();
+        good.extend(moof(2000));
+        fs::write(dir.join("sb1.p0.bin"), &good).expect("write");
+        let broken = init_with_traks(0);
+        let mut bad = broken.clone();
+        bad.extend(moof(0));
+        fs::write(dir.join("sb2.p0.bin"), &bad).expect("write");
+        let mut rows = vec![
+            row(0, init.len() as u64, true, None, None),
+            row(init.len() as u64, 32, false, Some(2000), None),
+            row(0, broken.len() as u64, true, None, None),
+            row(broken.len() as u64, 32, false, Some(0), Some(-5.0)),
+        ];
+        rows[2].sb = 2;
+        rows[3].sb = 2;
+        let plan = mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)).expect("plan");
+        assert_eq!(plan.inputs.len(), 1, "sb2 left out: {plan:?}");
+        let bytes = fs::read(&plan.inputs[0].path).expect("read");
+        assert_eq!(tfdt_of(&bytes[init.len()..]), 2000, "sb1 not moved");
+    }
+
+    /// A mark repeats bytes stored once: a looping teaser does not outweigh
+    /// the main video.
+    #[test]
+    fn marks_do_not_count_for_the_media_source_pick() {
+        let mut rows = vec![row(0, 100, false, Some(0), None)];
+        let mut teaser = row(0, 10, false, Some(0), None);
+        teaser.ms = Some(2);
+        teaser.sb = 3;
+        for _ in 0..20 {
+            let mut m = row(0, 10, false, Some(0), None);
+            m.ms = Some(2);
+            m.sb = 3;
+            m.mark = true;
+            rows.push(m);
+        }
+        rows.push(teaser);
+        keep_main_media_source(&mut rows);
+        assert!(rows.iter().all(|r| r.ms == Some(1)), "the video is kept");
+    }
+
+    /// An init+media append that ends after its styp: the styp goes with the
+    /// next append (no row without samples), and so does the set offset.
+    #[test]
+    fn a_lone_styp_goes_with_the_next_append() {
+        let mut s = session("stypnext");
+        let init = init_with_traks(1);
+        let styp = mp4_box(*b"styp", b"msdh");
+        let mut first = init.clone();
+        first.extend_from_slice(&styp);
+        let mut h = seg(1, true, None, Some(4.0));
+        h.seq_mode = true;
+        h.tso_set = true;
+        write(&mut s, &h, &first);
+        let mut m = seg(1, false, Some(0), Some(4.0));
+        m.seq_mode = true;
+        write(&mut s, &m, &moof(0));
+        let rows = index_rows(&s.dir);
+        assert_eq!(rows.len(), 2, "init and one media row: {rows:?}");
+        assert_eq!(rows[1]["tso_set"], true, "the media takes the set offset");
+        let mut want = init;
+        want.extend_from_slice(&styp);
+        want.extend(moof(0));
+        assert_eq!(fs::read(s.dir.join("sb1.p0.bin")).expect("part"), want);
+    }
+
+    /// The lift is in the bytes when the first segment with a tfdt moved; a
+    /// piece without one in front of it (nothing to move) does not count.
+    #[test]
+    fn an_untimed_first_piece_does_not_hide_the_lift() {
+        let dir = temp_dir("liftuntimed");
+        let init = init_with_traks(1);
+        let rows = write_part(
+            &dir,
+            &[
+                (&init, true, None, None),
+                (b"piece", false, None, None),
+                (&moof(0), false, Some(0), None),
+            ],
+        );
+        let refs: Vec<&IndexRow> = rows.iter().collect();
+        let lifted = ordered_part(&dir, 1, 0, &refs, Some(&SeqMoves::new()), 1_000_000_000)
+            .expect("ordered")
+            .3;
+        assert!(lifted, "the moof moved");
     }
 
     /// A part whose bytes cannot take the lift (no tfdt to rewrite: `WebM`)
