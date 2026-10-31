@@ -508,7 +508,11 @@ against the real bridge.
 Limits: a browser or profile is identified by the random id the extension
 generated, which the extension itself claims (any process of your user that can
 talk to the loopback bridge could claim another; you still approve every new
-one, and such a process could read `config.json` anyway). The hand run in a real
+one, and such a process could read `config.json` anyway). Such a process can also
+fill the bridge's 16 connection slots or the approval prompts (a nuisance, not a way
+to the token). Revoking does not change the sink token: a browser that was away
+keeps its stored copy until it connects next and is told the approval is gone, so
+set a new token in Settings when a revoked browser must be cut off at once. The hand run in a real
 Chrome is still to do (see the task); Firefox is out of scope.
 
 Limits: a hard kill of the app leaves a stale `out.part.mp4` in a capture

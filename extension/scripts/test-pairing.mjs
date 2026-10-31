@@ -208,6 +208,29 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   check(a && a.host === "video.example", "only the host is reported, not path, query or fragment");
   check(a && !/[\u0000-\u001f\u202e]/.test(a.title) && a.title.length <= 200 && a.title.startsWith("Ti tle with controls"), `titles are cleaned and bounded (got ${JSON.stringify(a && a.title.slice(0, 40))})`);
   check(a && a.active === true && tabs.find((t) => t.id === 7).active === false, "the visible tab of the window is marked");
+  {
+    // JSON.stringify writes a lone surrogate as an escape that the host's parser refuses; that would end the link.
+    const lone = /\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f][0-9a-f]{2})|(?<!\\ud[89ab][0-9a-f]{2})\\ud[c-f][0-9a-f]{2}/i;
+    const w2 = makeWorld({
+      media: [
+        { id: 1, url: "https://a.example/", title: "pa\ud83dge", drm: false },
+        { id: 2, url: "https://b.example/", title: "\udc00 low first", drm: false },
+        { id: 3, url: "https://c.example/", title: "x".repeat(199) + "\u{1F600}tail", drm: false },
+        { id: 4, url: "https://d.example/", title: "x".repeat(199) + "\ud83d", drm: false },
+        { id: 5, url: "https://e.example/", title: "fine \u{1F600} pair", drm: false },
+      ],
+    });
+    w2.start();
+    await flush();
+    await approve(w2);
+    await w2.fire();
+    const sent = tabsSent(w2).at(-1);
+    const json = JSON.stringify(sent);
+    check(sent && sent.tabs.length === 5 && !lone.test(json), `no title leaves with a lone surrogate (${json.match(lone)})`);
+    check(sent.tabs[0].title === "pa�ge" && sent.tabs[1].title === "� low first", "a lone surrogate becomes U+FFFD");
+    check(Array.from(sent.tabs[2].title).length === 200 && sent.tabs[2].title.endsWith("\u{1F600}"), "the cut is made on code points, an emoji at the border is kept whole");
+    check(sent.tabs[4].title === "fine \u{1F600} pair", "a valid pair is untouched");
+  }
   check(a && /^data:image\/png;base64,/.test(a.favicon), "the favicon comes as a small PNG data URL");
   check(tabs.find((t) => t.id === 6).host === "" && tabs.find((t) => t.id === 7).host === "other.example", "non-web URLs have no host; the port is not part of it");
   check(tabs.find((t) => t.id === 7).drm === true, "the DRM flag is reported");
@@ -302,7 +325,8 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   await flush();
   const ask = (frame) => w.run(`npTapState(5, ${JSON.stringify(frame)})`);
   check((await ask({ frameId: 0, url: "https://video.example/another/page?x=1" })).on === true, "the same origin keeps the choice (another page of the site)");
-  check((await ask({ frameId: 3, url: "https://ads.example/frame" })).on === true, "a frame below the top is not what the choice is judged by");
+  check((await ask({ frameId: 3, url: "https://ads.example/frame", tabUrl: "https://video.example/p" })).on === true, "a frame of another origin below the chosen page is tapped (players live in frames)");
+  check((await ask({ frameId: 3, url: "https://ads.example/frame" })).on === true, "without a tab URL a frame below the top cannot be judged and keeps the answer");
   check((await ask({ frameId: 0, url: "https://video.example/reloaded" })).on === true && w.session.data.tapTabs.join() === "5", "a reload of the chosen page keeps the choice");
   w.sentToTabs.length = 0;
   check((await ask({ frameId: 0, url: "https://bank.example/login" })).on === false, "a top frame on another origin is not tapped");
@@ -313,6 +337,18 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   check(w.sentToTabs.some(([id, m]) => id === 5 && m.kind === "vc-tap" && m.on === false), "the tab's content scripts are told");
   await w.fire();
   check(tabsSent(w).at(-1).tabs[0].tapping === false, "the app's list shows the tab as no longer captured");
+  // A frame of the new page can ask before the top frame does: it is judged by the tab's top document.
+  {
+    const y = makeWorld({ media: [{ id: 5, url: "https://video.example/", title: "v", drm: false }] });
+    y.start();
+    await flush();
+    await approve(y);
+    y.port().emit({ v: 1, t: "tap", tab: 5, on: true });
+    await flush();
+    const frame = { frameId: 7, url: "https://player.example/embed", tabUrl: "https://bank.example/account" };
+    check((await y.run(`npTapState(5, ${JSON.stringify(frame)})`)).on === false, "a frame asking first on a new origin is not tapped");
+    check((await y.run("npTapState(5)")).on === false && y.session.data.tapTabs.length === 0, "and its question ended the choice for the whole tab");
+  }
   // The scheme and the port are part of the origin.
   for (const other of ["http://video.example/", "https://video.example:8443/"]) {
     const x = makeWorld({ media: [{ id: 5, url: "https://video.example/", title: "v", drm: false }] });

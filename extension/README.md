@@ -57,8 +57,8 @@ The concept and the DRM primer live in the nvim-config vault under
    port and token itself; the popup shows `app pairing: paired`.
 4. The app lists the tabs that hold a video; **Capture** one. That tab is reloaded once and
    from then on tapped; the other tabs are not (mode `selected`). **Stop** ends it.
-   The choice belongs to the site the tab showed (scheme, host, port): when the tab's top frame is
-   on another origin later, the choice ends and the app shows the tab as not captured.
+   The choice belongs to the site the tab showed (scheme, host, port): when the tab's top document
+   is on another origin later (every frame of the tab is judged by it), the choice ends and the app shows the tab as not captured.
 
 Notes: a browser paired this way taps only the tabs you chose; entering port and token in the
 popup (**save**) returns to the old behaviour (every tab). Tabs are listed from what the

@@ -49,12 +49,22 @@ const np = {
 };
 
 // A string the page influences, as one line of plain text of bounded length.
+// A lone surrogate (a page can set one as its title, and a cut inside an emoji
+// makes one too) is written to JSON as an escape such as "\ud83d" that the
+// host's parser refuses, which ends the whole link. They become U+FFFD, and
+// the cut counts code points, so it never lands inside a pair.
+const NP_LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
 const npClean = (v, max) =>
-  String(v ?? "")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, max);
+  Array.from(
+    String(v ?? "")
+      .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]+/g, " ")
+      .replace(NP_LONE_SURROGATE, "\ufffd")
+      .replace(/\s+/g, " ")
+      .trim()
+  )
+    .slice(0, max)
+    .join("")
+    .trim();
 
 // The origin (scheme, host, port) of a web page, or "" for anything else.
 const npOriginOf = (url) => {
@@ -179,14 +189,18 @@ const npSetTap = async (tabId, on) => {
 };
 
 // What a content script asks when it starts: is this tab tapped? The user
-// chose a tab showing one site: when the top frame of that tab is on another
-// origin now (the user or a redirect navigated away), the choice ends here,
-// instead of silently copying whatever the next site plays. `frame` is the
-// asking frame (frameId, url) as the browser reports it.
+// chose a tab showing one site: when that tab is on another origin now (the
+// user or a redirect navigated away), the choice ends here, instead of
+// silently copying whatever the next site plays. `frame` is the asking frame
+// as the browser reports it: frameId, url, and tabUrl (the URL of the tab's
+// top document). Every frame is judged by the top document, because a frame
+// of the new page can ask before the top frame does and must not get the old
+// choice's answer. Without a tabUrl only the top frame can be judged.
 const npTapState = async (tabId, frame) => {
   await np.ready;
   if (!Number.isInteger(tabId) || !np.selected.has(tabId)) return { on: false };
-  if (frame && frame.frameId === 0 && npOriginOf(frame.url) !== np.origins.get(tabId)) {
+  const top = frame && (frame.frameId === 0 ? frame.url : frame.tabUrl);
+  if (typeof top === "string" && npOriginOf(top) !== np.origins.get(tabId)) {
     const next = new Set(np.selected);
     next.delete(tabId);
     await npSetSelected(next, []);

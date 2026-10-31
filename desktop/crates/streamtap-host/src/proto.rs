@@ -524,6 +524,24 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_surrogate_escape_is_refused_so_the_extension_must_never_send_one() {
+        // JSON.stringify writes a lone surrogate of a page's title as such an
+        // escape. It is not valid text, the parser refuses the whole message
+        // and the host ends the link (extension/src/native-pairing.js
+        // replaces them before sending; its tests pin that side).
+        for title in [r"pa\ud83dge", r"\udc00 low", r"cut\ud83d"] {
+            let msg = tab("h", None).replace(r"T\u0007itle", title);
+            assert!(ExtMsg::parse(msg.as_bytes()).is_err(), "{title}");
+        }
+        // A complete pair, written as two escapes, is fine.
+        let pair = tab("h", None).replace(r"T\u0007itle", r"smile 😀");
+        let ExtMsg::Tabs { tabs, .. } = ExtMsg::parse(pair.as_bytes()).unwrap() else {
+            panic!("tabs")
+        };
+        assert_eq!(tabs[0].title, "smile \u{1F600}");
+    }
+
+    #[test]
     fn favicons_must_be_small_images_that_match_their_type() {
         let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
         assert!(ExtMsg::parse(tab("h", Some(png)).as_bytes()).is_ok());
