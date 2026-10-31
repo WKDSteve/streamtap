@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::jobs::KillOnClose;
+use crate::secret::Token;
 
 /// Name of the sink executable next to this one.
 #[cfg(windows)]
@@ -108,18 +109,26 @@ fn find_in_path(path: &OsStr, file: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Arguments of `streamtap-sink serve`. The token is on the command line
-/// because the sink has no other input yet (documented limit of the sink).
-pub(crate) fn serve_args(port: u16, token: &str, out: &Path) -> Vec<std::ffi::OsString> {
+/// Arguments of `streamtap-sink serve`. The token is not among them: every
+/// process of the user can read a command line, so the sink reads the token
+/// from its stdin instead (`--token-stdin`, see [`hand_over_token`]).
+pub(crate) fn serve_args(port: u16, out: &Path) -> Vec<std::ffi::OsString> {
     vec![
         "serve".into(),
-        "--token".into(),
-        token.into(),
+        "--token-stdin".into(),
         "--port".into(),
         port.to_string().into(),
         "--out".into(),
         out.as_os_str().to_owned(),
     ]
+}
+
+/// Writes the token and a line break to the sink's stdin (its only use) and
+/// closes it by dropping `stdin`.
+pub(crate) fn hand_over_token(mut stdin: impl Write, token: &Token) -> std::io::Result<()> {
+    stdin.write_all(token.expose().as_bytes())?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()
 }
 
 /// Reads `r` line by line (lossy UTF-8, long lines cut) until it ends, so a
@@ -532,14 +541,21 @@ pub(crate) mod tests {
         assert_eq!(tail(s, 3), "\u{e4}");
     }
 
+    /// The command line carries no token (other processes can read it); the
+    /// sink is told to read it from stdin, where it arrives as one line.
     #[test]
-    fn serve_args_carry_token_port_and_dir() {
-        let a = serve_args(17650, "tok", Path::new("/c"));
+    fn serve_args_carry_port_and_dir_and_the_token_goes_to_stdin() {
+        let a = serve_args(17650, Path::new("/c"));
         let s: Vec<String> = a.iter().map(|x| x.to_string_lossy().into_owned()).collect();
         assert_eq!(
             s,
-            ["serve", "--token", "tok", "--port", "17650", "--out", "/c"]
+            ["serve", "--token-stdin", "--port", "17650", "--out", "/c"]
         );
+        assert!(!s.iter().any(|x| x == "--token"));
+        let token = Token::from("0123456789abcdef0123");
+        let mut stdin = Vec::new();
+        hand_over_token(&mut stdin, &token).unwrap();
+        assert_eq!(stdin, b"0123456789abcdef0123\n");
     }
 
     #[test]

@@ -16,7 +16,6 @@
 //! the message schema; the UI shows them as text only.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -31,6 +30,7 @@ use streamtap_host::proto::{
 };
 
 use crate::pairings::{Approval, Store};
+use crate::secret::Token;
 
 /// Hosts connected at once (one per browser profile, with room to spare).
 const MAX_CONNECTIONS: usize = 16;
@@ -42,16 +42,10 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The sink's port and token, handed to approved browsers only.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Credentials {
     port: u16,
-    token: String,
-}
-
-impl fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Credentials(port {}, token hidden)", self.port)
-    }
+    token: Token,
 }
 
 struct Conn {
@@ -145,12 +139,12 @@ fn now_secs() -> u64 {
 }
 
 impl Hub {
-    pub(crate) fn new(store: Store, port: u16, token: &str) -> Self {
+    pub(crate) fn new(store: Store, port: u16, token: &Token) -> Self {
         Self(Mutex::new(Inner {
             store,
             creds: Credentials {
                 port,
-                token: token.to_string(),
+                token: token.clone(),
             },
             conns: BTreeMap::new(),
             next_id: 1,
@@ -246,7 +240,7 @@ impl Hub {
         if known {
             conn.approved = true;
             conn.push(&HostMsg::state(Pairing::Approved));
-            conn.push(&HostMsg::credentials(creds.port, &creds.token));
+            conn.push(&HostMsg::credentials(creds.port, creds.token.expose()));
         } else {
             conn.push(&HostMsg::state(Pairing::Pending));
         }
@@ -286,7 +280,7 @@ impl Hub {
         if let Some(c) = g.conns.get_mut(&id) {
             c.approved = true;
             c.push(&HostMsg::state(Pairing::Approved));
-            c.push(&HostMsg::credentials(creds.port, &creds.token));
+            c.push(&HostMsg::credentials(creds.port, creds.token.expose()));
         }
         Ok(())
     }
@@ -329,14 +323,14 @@ impl Hub {
     }
 
     /// The sink's settings changed: approved browsers get the new ones.
-    pub(crate) fn set_credentials(&self, port: u16, token: &str) {
+    pub(crate) fn set_credentials(&self, port: u16, token: &Token) {
         let mut g = self.lock();
         g.creds = Credentials {
             port,
-            token: token.to_string(),
+            token: token.clone(),
         };
         for c in g.conns.values_mut().filter(|c| c.approved) {
-            c.push(&HostMsg::credentials(port, token));
+            c.push(&HostMsg::credentials(port, token.expose()));
         }
     }
 
@@ -422,10 +416,10 @@ impl Server {
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        let key: Arc<str> = Arc::from(crate::config::random_token());
+        let key = Arc::new(Token::generate());
         let file = dir.join(BRIDGE_FILE);
         let tmp = file.with_extension("json.tmp");
-        let text = serde_json::json!({ "port": port, "key": &*key }).to_string();
+        let text = serde_json::json!({ "port": port, "key": key.expose() }).to_string();
         std::fs::write(&tmp, text)
             .and_then(|()| std::fs::rename(&tmp, &file))
             .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
@@ -448,18 +442,6 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// Compares two keys in time that depends on their length only.
-fn same_key(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let diff = a
-        .iter()
-        .zip(b)
-        .fold(0u8, |acc, (x, y)| std::hint::black_box(acc | (x ^ y)));
-    diff == 0
 }
 
 /// Reads the key line: at most `MAX_BRIDGE_KEY` bytes and until `deadline`
@@ -495,13 +477,13 @@ fn read_key(lines: &mut BufReader<TcpStream>, deadline: Instant) -> Option<Vec<u
     }
 }
 
-fn serve_connection(hub: &Hub, stream: TcpStream, key: &str) {
+fn serve_connection(hub: &Hub, stream: TcpStream, key: &Token) {
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     // The key comes first, within a short time in total and a small bound;
     // without it the connection gets no slot and no prompt.
     let deadline = Instant::now() + KEY_TIMEOUT;
     let mut lines = BufReader::new(stream);
-    let keyed = read_key(&mut lines, deadline).is_some_and(|k| same_key(&k, key.as_bytes()));
+    let keyed = read_key(&mut lines, deadline).is_some_and(|k| key.matches(&k));
     let stream = lines.get_ref();
     if !keyed {
         let _ = stream.shutdown(Shutdown::Both);
@@ -601,7 +583,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::load(&dir.join("pairings.json"));
-        (Hub::new(store, 17650, SECRET), dir)
+        (Hub::new(store, 17650, &SECRET.into()), dir)
     }
 
     fn connect(h: &Hub) -> (u64, Wire) {
@@ -704,7 +686,11 @@ mod tests {
         hello(&h, id, "profile-aaaa");
         h.decide(id, true).unwrap();
         // A new hub over the same file: the app was restarted.
-        let h2 = Hub::new(Store::load(&dir.join("pairings.json")), 17651, SECRET);
+        let h2 = Hub::new(
+            Store::load(&dir.join("pairings.json")),
+            17651,
+            &SECRET.into(),
+        );
         let (id, w) = connect(&h2);
         hello(&h2, id, "profile-aaaa");
         assert_eq!(w.sent()[0], HostMsg::state(Pairing::Approved));
@@ -746,7 +732,7 @@ mod tests {
         h.decide(b, true).unwrap();
         h.revoke("profile-aaaa").unwrap();
         let before = wa.sent().len();
-        h.set_credentials(17650, "fedcba9876543210fedcba9876543210");
+        h.set_credentials(17650, &"fedcba9876543210fedcba9876543210".into());
         assert_eq!(wa.sent().len(), before, "the revoked browser gets nothing");
         assert_eq!(*wa.sent().last().unwrap(), HostMsg::state(Pairing::Revoked));
         assert_eq!(
@@ -778,7 +764,7 @@ mod tests {
         h.decide(a, true).unwrap();
         let (b, wb) = connect(&h);
         hello(&h, b, "profile-bbbb");
-        h.set_credentials(17999, "fedcba9876543210fedcba9876543210");
+        h.set_credentials(17999, &"fedcba9876543210fedcba9876543210".into());
         let last = wa.sent().pop().unwrap();
         assert!(matches!(last, HostMsg::Credentials { port: 17999, .. }));
         assert!(!wb.has_credentials(), "a pending browser gets nothing");
@@ -844,14 +830,6 @@ mod tests {
             .ok()
             .flatten()
             .map(|l| HostMsg::parse(&l).unwrap())
-    }
-
-    #[test]
-    fn keys_compare_by_content_and_length() {
-        assert!(same_key(b"abcd", b"abcd"));
-        assert!(!same_key(b"abcd", b"abce"));
-        assert!(!same_key(b"abcd", b"abc"));
-        assert!(!same_key(b"", b"a"));
     }
 
     /// Without the key from `bridge.json` a connection gets no slot and no

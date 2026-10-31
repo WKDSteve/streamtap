@@ -13,7 +13,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, BufRead, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,7 +69,7 @@ fn main() {
         _ => (
             "streamtap-sink",
             Err(SinkError::Usage(format!(
-                "usage:\n  streamtap-sink serve --token <token> [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}]"
+                "usage:\n  streamtap-sink serve (--token-stdin | --token <token>) [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}]"
             ))),
         ),
     };
@@ -100,10 +100,36 @@ fn flag<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, SinkError
 // serve
 // ---------------------------------------------------------------------------
 
+/// Longest token line `--token-stdin` reads (without its line break).
+const MAX_TOKEN_LINE: usize = 4096;
+
+/// The shared token. It has no `PartialEq` (compare with [`Secret::matches`],
+/// in constant time) and its `Debug` does not print it (SRV-11).
+#[derive(Clone)]
+struct Secret(Vec<u8>);
+
+impl Secret {
+    /// Compares `other` with the token in time that depends on the lengths only.
+    fn matches(&self, other: &[u8]) -> bool {
+        constant_time_eq(other, &self.0)
+    }
+
+    #[cfg(test)]
+    fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(hidden)")
+    }
+}
+
 /// `serve`'s settings, checked before anything is created or bound.
 #[derive(Debug)]
 struct ServeConfig {
-    token: Vec<u8>,
+    token: Secret,
     port: u16,
     out: PathBuf,
     origin: String,
@@ -111,18 +137,60 @@ struct ServeConfig {
     total_max: u64,
 }
 
-fn serve_config(args: &[String]) -> Result<ServeConfig, SinkError> {
-    let Some(token) = flag(args, "--token")? else {
-        return Err(SinkError::Usage(
-            "--token is required (the extension must send the same value)".into(),
-        ));
-    };
-    // An empty token (an unset variable in `--token "$VAR"`) would let any
-    // local process in with an empty hello, while the extension never
-    // connects without one.
-    if token.trim().is_empty() {
-        return Err(SinkError::Usage("--token must not be empty".into()));
+/// Reads the token for `--token-stdin`: the first line of `r`, at most
+/// `MAX_TOKEN_LINE` bytes, LF or CRLF removed. A last line without a line
+/// break counts when it is not empty. Anything after the first line is ignored.
+fn read_token_line(r: impl Read) -> Result<String, SinkError> {
+    // Room for the CRLF after the longest token.
+    let limit = u64::try_from(MAX_TOKEN_LINE).map_or(u64::MAX, |n| n + 2);
+    let mut line = Vec::new();
+    io::BufReader::new(r.take(limit))
+        .read_until(b'\n', &mut line)
+        .map_err(|e| SinkError::io("cannot read the token from stdin", None, e))?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
     }
+    if line.len() > MAX_TOKEN_LINE {
+        return Err(SinkError::Usage(format!(
+            "--token-stdin: the token line is longer than {MAX_TOKEN_LINE} bytes"
+        )));
+    }
+    String::from_utf8(line)
+        .map_err(|_| SinkError::Usage("--token-stdin: the token is not UTF-8".into()))
+}
+
+/// The token from `--token <value>` or, with `--token-stdin`, from the first
+/// line of `stdin` (which is read only then). Exactly one of the two.
+fn serve_token(args: &[String], stdin: impl Read) -> Result<Secret, SinkError> {
+    let from_stdin = args.iter().any(|a| a == "--token-stdin");
+    let token = match (flag(args, "--token")?, from_stdin) {
+        (Some(_), true) => {
+            return Err(SinkError::Usage(
+                "--token and --token-stdin exclude each other".into(),
+            ))
+        }
+        (Some(t), false) => t.to_owned(),
+        (None, true) => read_token_line(stdin)?,
+        (None, false) => {
+            return Err(SinkError::Usage(
+                "--token-stdin or --token is required (the extension must send the same value)"
+                    .into(),
+            ))
+        }
+    };
+    // An empty token (an unset variable in `--token "$VAR"`, a closed
+    // stdin) would let any local process in with an empty hello, while the
+    // extension never connects without one.
+    if token.trim().is_empty() {
+        return Err(SinkError::Usage("the token must not be empty".into()));
+    }
+    Ok(Secret(token.into_bytes()))
+}
+
+fn serve_config(args: &[String], stdin: impl Read) -> Result<ServeConfig, SinkError> {
     let port = match flag(args, "--port")?.map(str::parse::<u16>) {
         None => DEFAULT_PORT,
         Some(Ok(p)) => p,
@@ -139,17 +207,22 @@ fn serve_config(args: &[String]) -> Result<ServeConfig, SinkError> {
             "{name} must be a whole number from 1 to 4096"
         ))),
     };
+    let per_session = gib("--max-session-gib", DEFAULT_MAX_SESSION_GIB)?;
+    let total_max = gib("--max-total-gib", DEFAULT_MAX_TOTAL_GIB)?;
+    // Last: a bad flag ends the sink before it waits for stdin.
+    let token = serve_token(args, stdin)?;
     Ok(ServeConfig {
-        token: token.as_bytes().to_vec(),
+        token,
         port,
         out,
         origin,
-        per_session: gib("--max-session-gib", DEFAULT_MAX_SESSION_GIB)?,
-        total_max: gib("--max-total-gib", DEFAULT_MAX_TOTAL_GIB)?,
+        per_session,
+        total_max,
     })
 }
 
 fn run_serve(args: &[String]) -> Result<(), SinkError> {
+    // stdin is read here (`--token-stdin`) and never again.
     let ServeConfig {
         token,
         port,
@@ -157,7 +230,7 @@ fn run_serve(args: &[String]) -> Result<(), SinkError> {
         origin,
         per_session,
         total_max,
-    } = serve_config(args)?;
+    } = serve_config(args, io::stdin().lock())?;
     let budget = Arc::new(Budget {
         per_session,
         total_max,
@@ -808,7 +881,7 @@ fn next_binary(
 #[allow(clippy::result_large_err)]
 fn handle_connection(
     stream: TcpStream,
-    token: &[u8],
+    token: &Secret,
     origin: &str,
     out: &Path,
     budget: &Arc<Budget>,
@@ -868,7 +941,7 @@ fn handle_connection(
                 },
                 None,
             ) => {
-                if !constant_time_eq(t.as_bytes(), token) {
+                if !token.matches(t.as_bytes()) {
                     eprintln!("{peer}: wrong token, closing");
                     break;
                 }
@@ -5196,13 +5269,113 @@ mod tests {
             a(&["--token", "t", "--port"]),
             a(&["--token", "t", "--out", "--port", "1"]),
             a(&["--port", "1"]),
+            a(&["--token-stdin", "--port", "x"]),
+            a(&["--token", "t", "--token-stdin"]),
+            a(&["--token-stdin", "--token", "t"]),
         ] {
-            let err = serve_config(&args).unwrap_err();
+            let err = serve_config(&args, NoStdin).unwrap_err();
             assert_eq!(err.exit_code(), 2, "{args:?}: {err}");
         }
-        let ok = serve_config(&a(&["--port", "0", "--token", "secret"])).expect("valid");
-        assert_eq!((ok.token.as_slice(), ok.port), (&b"secret"[..], 0));
+        let ok = serve_config(&a(&["--port", "0", "--token", "secret"]), NoStdin).expect("valid");
+        assert_eq!((ok.token.expose(), ok.port), (&b"secret"[..], 0));
         assert_eq!(ok.out, PathBuf::from("captures"));
+    }
+
+    /// A stdin that must not be read: `serve` reads it only for
+    /// `--token-stdin`, and only after every other flag was checked.
+    struct NoStdin;
+
+    impl Read for NoStdin {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("stdin was read");
+        }
+    }
+
+    fn token_from_stdin(input: &[u8]) -> Result<Secret, SinkError> {
+        serve_config(
+            &[
+                "--token-stdin".to_owned(),
+                "--port".to_owned(),
+                "0".to_owned(),
+            ],
+            input,
+        )
+        .map(|c| c.token)
+    }
+
+    #[test]
+    fn token_stdin_takes_the_first_line_without_its_line_break() {
+        for (input, want) in [
+            (&b"secret\n"[..], &b"secret"[..]),
+            (b"secret\r\n", b"secret"),
+            (b"secret", b"secret"),
+            (b"secret\nsecond line\n", b"secret"),
+            (b" sp ace \n", b" sp ace "),
+        ] {
+            let token = token_from_stdin(input).expect("valid");
+            assert_eq!(token.expose(), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn token_stdin_refuses_an_empty_a_blank_and_a_non_utf8_line() {
+        for input in [
+            &b""[..],
+            b"\n",
+            b"\r\n",
+            b" \t\r\n",
+            b"\nsecret\n",
+            b"\xff\xfe\n",
+        ] {
+            let err = token_from_stdin(input).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{input:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn token_stdin_reads_at_most_4_kib() {
+        let longest = "t".repeat(MAX_TOKEN_LINE);
+        for tail in ["\n", "\r\n", ""] {
+            let token = token_from_stdin(format!("{longest}{tail}").as_bytes()).expect("fits");
+            assert_eq!(token.expose().len(), MAX_TOKEN_LINE, "{tail:?}");
+        }
+        for input in [
+            format!("{longest}t\n"),
+            format!("{longest}t"),
+            "t".repeat(100_000),
+        ] {
+            let err = token_from_stdin(input.as_bytes()).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{} bytes: {err}", input.len());
+        }
+    }
+
+    #[test]
+    fn a_failing_stdin_is_an_io_error() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("pipe broken"))
+            }
+        }
+        let args = ["--token-stdin".to_owned()];
+        assert_eq!(serve_config(&args, Broken).unwrap_err().exit_code(), 1);
+    }
+
+    #[test]
+    fn the_token_is_compared_by_content_and_never_printed() {
+        let config = token_from_stdin(b"hunter2-secret\n").unwrap();
+        assert!(config.matches(b"hunter2-secret"));
+        assert!(!config.matches(b"hunter2-secreT"));
+        assert!(!config.matches(b"hunter2-secre"));
+        assert!(!config.matches(b""));
+        let full = serve_config(
+            &["--token".to_owned(), "hunter2-secret".to_owned()],
+            NoStdin,
+        )
+        .unwrap();
+        let shown = format!("{full:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("hidden"), "{shown}");
     }
 
     #[test]

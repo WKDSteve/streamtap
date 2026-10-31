@@ -22,9 +22,15 @@ as `warn` (clean, tests included), rustfmt with Unix newlines.
 ## Run
 
 ```
-target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captures]
+target/release/streamtap-sink serve (--token-stdin | --token <secret>)
+    [--port 17650] [--out captures]
     [--allow-origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia]
     [--max-session-gib 16] [--max-total-gib 64]
+```
+
+```
+# by hand, without the token on the command line (PowerShell):
+'<secret>' | target/release/streamtap-sink serve --token-stdin
 ```
 
 - Binds **127.0.0.1 only**; there is no flag to bind anything else.
@@ -32,11 +38,25 @@ target/release/streamtap-sink serve --token <secret> [--port 17650] [--out captu
   the streamtap extension, whose id the manifest `key` fixes). A web page,
   another extension or a client without `Origin` gets `403` before anything
   is written.
-- `--token` is required and must not be empty or blank (an unset variable
-  in `--token "$VAR"` would let any local process in). The extension sends
-  the same value in its first message (`hello`); a wrong token closes the
-  socket before anything is written. Set it in the extension popup (port +
-  token). A flag without a value, or followed by another flag
+- A token is required, from exactly one of two places (both: usage error,
+  exit 2):
+  - `--token-stdin` (what the app uses): the sink reads the first line of
+    its stdin before it binds, at most 4 KiB, with the LF or CRLF removed; a
+    last line without a line break counts when it is not empty. Anything after
+    the first line is ignored, and stdin is not used again. Every other flag
+    is checked first, so a bad flag ends the sink without waiting for stdin.
+  - `--token <secret>`, for a quick manual run. **Warning:** a command line is
+    readable by every other process of your user (Task Manager, `wmic`,
+    `Get-CimInstance Win32_Process`), so the token is not secret from them
+    while the sink runs. Prefer `--token-stdin`.
+
+  The token must not be empty or blank (an unset variable in
+  `--token "$VAR"`, an empty or closed stdin would let any local process in;
+  exit 2), a longer line or one that is not UTF-8 is a usage error as well. The
+  extension sends the same value in its first message (`hello`); a wrong token
+  closes the socket before anything is written. The sink holds the token in a
+  type without `PartialEq` whose `Debug` prints no value and compares it in
+  constant time. A flag without a value, or followed by another flag
   (`--token --port 1`), is a usage error (exit 2) before anything is bound.
 - Every connection becomes one capture directory
   `captures/<unix-seconds>_<session-prefix>[-n]/` (a suffix when the name is
@@ -326,9 +346,9 @@ empty environment, byte limits, exit status and stderr checked), error enum
 with one exit code per class, a missing ffprobe is reported, LICENSE.
 Not yet (spike): `deny.toml` / `cargo audit` in CI, Windows CI runner, security
 tests as raw TCP bytes against the running server,
-read and handshake timeouts, the token on the command line (visible to other
-processes; pairing replaces it), the core/sink/testkit split, the Tauri
-shell and UI. The security tests, CI and the split come first, before new
+read and handshake timeouts, the core/sink/testkit split, the Tauri
+shell and UI. (The token on the command line is gone for the app: it uses
+`--token-stdin`; `--token` stays for manual runs, see above.) The security tests, CI and the split come first, before new
 features.
 
 # desktop: streamtap-app
@@ -414,10 +434,15 @@ Security:
   window (`CREATE_NO_WINDOW`). Open result / Open folder start `explorer.exe`
   with the path as one argument. The sink binds 127.0.0.1 only (its own rule).
 - The token is random per install (std `RandomState`, seeded by the OS, mixed
-  with time and pid), is never logged (sink output is scrubbed of it) and is
-  passed to the sink on its command line, like for a hand-started sink: other
-  local processes of the same user can read it there. That limit stays until
-  the sink takes it another way (pairing).
+  with time and pid) and is never logged (sink output is scrubbed of it). The
+  app starts the sink as `serve --token-stdin --port <p> --out <dir>`, writes
+  the token and a line break into the child's stdin and closes it, at every
+  start and at the restart after a revoke; nothing token-related is on the
+  command line. A sink that cannot take it is ended and the start fails.
+- In the app the token (and the browser bridge key) is a `Token` type without
+  `PartialEq`, whose `Debug` prints `Token(hidden)`; it is compared in constant
+  time only. `config.json` keeps the token as a plain string under `token`, as
+  before.
 
 - **Connection state:** the sink writes `"state":"open"` and its own `sink_pid`
   into `session.json` when a connection starts and rewrites it atomically with
@@ -536,7 +561,7 @@ to it), 32 tabs, titles cut to 200 characters with control and direction-overrid
 characters removed, hosts only host-name characters, icons only small
 `data:image/...;base64,` URLs whose bytes begin like the claimed type. A frame that
 declares more than the limit is refused before anything is read. The token is
-never printed (`Debug` is written by hand; the tests check it).
+never printed (the `Token` type's `Debug` hides it; the tests check it).
 
 Tests: schema and framing (unit), the host against a fake app on a real socket
 (the key comes first), the bridge key (silent, wrong, missing and oversized keys get

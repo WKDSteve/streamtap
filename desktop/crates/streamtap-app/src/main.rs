@@ -13,6 +13,7 @@ mod jobs;
 mod pairings;
 mod paths;
 mod registration;
+mod secret;
 mod sink;
 
 use std::collections::{HashMap, VecDeque};
@@ -346,7 +347,7 @@ async fn regenerate_token(state: State<'_, AppState>) -> CmdResult<Settings> {
     let mut g = state.lock();
     require_stopped(&mut g)?;
     let new = Settings {
-        token: config::random_token(),
+        token: secret::Token::generate(),
         ..g.settings.clone()
     };
     apply_settings(&mut g, new)?;
@@ -377,12 +378,24 @@ fn launch_sink_locked(shared: &AppState, g: &mut Inner, exe: &Path) -> CmdResult
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let mut child = sink::command(exe)
-        .args(sink::serve_args(g.settings.port, &token, &root))
-        .stdin(Stdio::null())
+        .args(sink::serve_args(g.settings.port, &root))
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot start the sink: {e}"))?;
+    // The token goes to stdin, never into the command line; stdin is closed
+    // right after it (dropped). A sink that cannot take it is ended.
+    let handed_over = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("no stdin pipe"))
+        .and_then(|stdin| sink::hand_over_token(stdin, &token));
+    if let Err(e) = handed_over {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("cannot hand the token to the sink: {e}"));
+    }
     g.log.clear();
     g.log_gen += 1;
     let generation = g.log_gen;
@@ -414,10 +427,10 @@ fn launch_sink_locked(shared: &AppState, g: &mut Inner, exe: &Path) -> CmdResult
         let (token, root) = (token.clone(), root.clone());
         std::thread::spawn(move || match pipe {
             Pipe::Out(p) => sink::for_each_line(p, |l| {
-                on_sink_line(&shared, l, &token, &root, generation);
+                on_sink_line(&shared, l, token.expose(), &root, generation);
             }),
             Pipe::Err(p) => sink::for_each_line(p, |l| {
-                on_sink_line(&shared, l, &token, &root, generation);
+                on_sink_line(&shared, l, token.expose(), &root, generation);
             }),
         });
     }
@@ -573,7 +586,7 @@ fn revoke_browser(shared: &AppState, instance: &str, sink_exe: Option<PathBuf>) 
     let hub = Arc::clone(&g.hub);
     hub.revoke(instance)?;
     let new = Settings {
-        token: config::random_token(),
+        token: secret::Token::generate(),
         ..g.settings.clone()
     };
     apply_settings(&mut g, new)
@@ -727,7 +740,10 @@ mod tests {
                 apply_ui_prefs(&mut g, lang, theme).is_err(),
                 "{lang}/{theme}"
             );
-            assert_eq!(g.settings, before, "a refused value changes nothing");
+            assert!(
+                g.settings.same_as(&before),
+                "a refused value changes nothing"
+            );
         }
         assert!(!dir.join("config.json").exists());
         apply_ui_prefs(&mut g, "de", "dark").unwrap();
@@ -735,12 +751,12 @@ mod tests {
             (g.settings.language, g.settings.theme),
             (Language::De, Theme::Dark)
         );
-        assert_eq!(
-            g.settings.token, before.token,
+        assert!(
+            g.settings.token.matches(before.token.expose().as_bytes()),
             "only the preferences change"
         );
         let stored = config::load_or_create(&dir.join("config.json"), &dir).unwrap();
-        assert_eq!(stored, g.settings);
+        assert!(stored.same_as(&g.settings));
         drop(g);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -808,14 +824,14 @@ mod tests {
     #[test]
     fn revoking_a_browser_rotates_the_token_for_everyone_else() {
         let (st, dir) = state("revoke-rotate");
-        let old = st.lock().settings.token.clone();
+        let old = st.lock().settings.token.expose().to_owned();
         let hub = Arc::clone(&st.lock().hub);
         let revoked = paired(&hub, "profile-a");
         let kept = paired(&hub, "profile-b");
         assert_eq!(revoked.tokens(), std::slice::from_ref(&old));
 
         revoke_browser(&st, "profile-a", None).unwrap();
-        let new = st.lock().settings.token.clone();
+        let new = st.lock().settings.token.expose().to_owned();
         assert_ne!(new, old, "a new token");
         assert_eq!(new.len(), 64);
         assert_eq!(
@@ -825,7 +841,7 @@ mod tests {
         );
         assert_eq!(kept.tokens(), [old, new.clone()], "the others get it");
         let stored = config::load_or_create(&dir.join("config.json"), &dir).unwrap();
-        assert_eq!(stored.token, new, "the new token is saved");
+        assert_eq!(stored.token.expose(), new, "the new token is saved");
         assert!(!st.lock().sink_running(), "a stopped sink stays stopped");
         assert!(hub
             .view()
@@ -1090,7 +1106,10 @@ mod tests {
         revoke_browser(&st, "profile-a", Some(sink.clone())).unwrap();
         let (new_pid, token) = {
             let g = st.lock();
-            (g.sink_run().map(|r| r.pid), g.settings.token.clone())
+            (
+                g.sink_run().map(|r| r.pid),
+                g.settings.token.expose().to_owned(),
+            )
         };
         assert!(new_pid.is_some_and(|p| p != old_pid), "the sink restarted");
         assert_eq!(kept.tokens().last(), Some(&token));
@@ -1242,7 +1261,7 @@ mod tests {
         assert_eq!(next_frame(&rx)["pairing"], "approved");
         let creds = next_frame(&rx);
         assert_eq!(creds["t"], "credentials");
-        assert_eq!(creds["token"], token.as_str());
+        assert_eq!(creds["token"], token.expose());
         assert_eq!(creds["port"], st.lock().settings.port);
 
         let tabs = serde_json::json!({"t": "tabs", "v": 1, "tabs": [

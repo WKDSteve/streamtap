@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::secret::Token;
+
 /// The extension popup's default port.
 pub(crate) const DEFAULT_PORT: u16 = 17650;
 const MIN_PORT: u16 = 1024;
@@ -20,10 +22,11 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MIN_TOKEN_LEN: usize = 16;
 const MAX_TOKEN_LEN: usize = 256;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// No `PartialEq`: the token has none (see [`Token`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Settings {
     pub(crate) port: u16,
-    pub(crate) token: String,
+    pub(crate) token: Token,
     pub(crate) captures_dir: PathBuf,
     /// UI language; missing in configs written before it existed.
     #[serde(default, deserialize_with = "lenient")]
@@ -121,7 +124,7 @@ impl Settings {
     pub(crate) fn defaults(data_dir: &Path) -> Self {
         Self {
             port: DEFAULT_PORT,
-            token: random_token(),
+            token: Token::generate(),
             captures_dir: data_dir.join("captures"),
             language: Language::default(),
             theme: Theme::default(),
@@ -133,16 +136,18 @@ impl Settings {
         if self.port < MIN_PORT {
             return Err(format!("port must be {MIN_PORT} or higher"));
         }
-        if self.token.len() < MIN_TOKEN_LEN
-            || self.token.len() > MAX_TOKEN_LEN
-            || !self.token.chars().all(|c| c.is_ascii_graphic())
+        let token = self.token.expose();
+        if token.len() < MIN_TOKEN_LEN
+            || token.len() > MAX_TOKEN_LEN
+            || !token.chars().all(|c| c.is_ascii_graphic())
         {
             return Err(format!(
                 "token must be {MIN_TOKEN_LEN} to {MAX_TOKEN_LEN} visible ASCII characters"
             ));
         }
-        // A token that starts with `--` would be read as a flag by the sink.
-        if self.token.starts_with('-') {
+        // The app hands the token over on stdin; a token that starts with `-`
+        // would still be read as a flag by `serve --token <token>` (manual use).
+        if token.starts_with('-') {
             return Err("token must not start with '-'".into());
         }
         if !self.captures_dir.is_absolute() {
@@ -155,6 +160,17 @@ impl Settings {
             return Err("captures directory must not start with '-'".into());
         }
         Ok(())
+    }
+
+    /// Field by field, the token in constant time (tests only: the app never
+    /// needs to compare whole settings).
+    #[cfg(test)]
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.port == other.port
+            && self.token.matches(other.token.expose().as_bytes())
+            && self.captures_dir == other.captures_dir
+            && self.language == other.language
+            && self.theme == other.theme
     }
 }
 
@@ -251,7 +267,7 @@ mod tests {
         let path = dir.join("config.json");
         let first = load_or_create(&path, &dir).unwrap();
         let second = load_or_create(&path, &dir).unwrap();
-        assert_eq!(first, second, "the token must survive a restart");
+        assert!(first.same_as(&second), "the token must survive a restart");
         fs::write(&path, b"{ not json").unwrap();
         assert!(
             load_or_create(&path, &dir).is_err(),
@@ -273,7 +289,19 @@ mod tests {
         let s: Settings = serde_json::from_str(old).unwrap();
         assert_eq!(s.language, Language::System);
         assert_eq!(s.theme, Theme::System);
-        assert_eq!(s.token, "0123456789abcdef0123");
+        assert_eq!(s.token.expose(), "0123456789abcdef0123");
+    }
+
+    /// The token type changes nothing in `config.json`: an old file loads,
+    /// and a saved one has the token as a plain string under the same key.
+    #[test]
+    fn the_config_file_format_is_unchanged_by_the_token_type() {
+        let old = r#"{"port":17650,"token":"0123456789abcdef0123","captures_dir":"C:/x/captures","language":"de","theme":"dark"}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        let back: serde_json::Value = serde_json::to_value(&s).unwrap();
+        let want: serde_json::Value = serde_json::from_str(old).unwrap();
+        assert_eq!(back, want);
+        assert!(!format!("{s:?}").contains("0123456789abcdef0123"));
     }
 
     #[test]
@@ -285,7 +313,7 @@ mod tests {
         assert_eq!(json["language"], "de");
         assert_eq!(json["theme"], "dark");
         let back: Settings = serde_json::from_value(json).unwrap();
-        assert_eq!(back, s);
+        assert!(back.same_as(&s));
         let s: Settings = serde_json::from_str(&with_prefs(r#""en""#, r#""light""#)).unwrap();
         assert_eq!((s.language, s.theme), (Language::En, Theme::Light));
     }
@@ -302,7 +330,7 @@ mod tests {
             assert_eq!(s.language, Language::System, "{lang}");
             assert_eq!(s.theme, Theme::System, "{theme}");
             assert_eq!(s.port, 17651);
-            assert_eq!(s.token, "0123456789abcdef0123");
+            assert_eq!(s.token.expose(), "0123456789abcdef0123");
         }
     }
 
@@ -332,7 +360,7 @@ mod tests {
         s.language = Language::En;
         s.theme = Theme::Light;
         save(&path, &s).unwrap();
-        assert_eq!(load_or_create(&path, &dir).unwrap(), s);
+        assert!(load_or_create(&path, &dir).unwrap().same_as(&s));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

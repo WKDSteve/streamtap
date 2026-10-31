@@ -39,7 +39,8 @@ to `oggpddakdbffbjhkjmcakidgmhpgakia` on every machine, so the origin is
 5. Click the extension icon for the per-tab summary (SourceBuffers, init /
    media segment counts, bytes, covered time range).
 6. To capture, either pair with the desktop app (below) or: start
-   `streamtap-sink serve --token <secret>` (see `../desktop/README.md`), enter
+   `streamtap-sink serve --token-stdin` with the token on stdin (or
+   `--token <secret>`, visible to other processes; see `../desktop/README.md`), enter
    port and token in the popup, **save**, reload the video page. The popup's sink line shows connected / sent / dropped.
    After the video ended (or you close the tab) run
    `streamtap-sink mux captures/<dir>` and open the MP4 in mpv.
