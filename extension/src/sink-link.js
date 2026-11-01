@@ -22,6 +22,8 @@ const SINK_MAX_KEPT_TOTAL = 64 * 1024 * 1024; // kept init bytes of all links (p
 const SINK_MAX_LINKS = 16; // tapping ports of the whole worker
 const SINK_MAX_BACKLOG = 128 * 1024 * 1024; // data: URL chars received, not yet decoded
 const SINK_STABLE_MS = 5000; // a socket open this long resets the backoff
+const SINK_RETRY_MIN_MS = 1000; // first reconnect delay, and the one a stable socket restarts at
+const SINK_RETRY_MAX_MS = 10000; // the backoff doubles up to this
 const SINK_MAX_SB = 32; // distinct SourceBuffer ids per link (background.js MAX_SB_PER_MS)
 const sinkEnc = new TextEncoder();
 
@@ -254,6 +256,14 @@ const linkRelease = (link) => {
   }
 };
 
+// The reconnect policy in one place: the next attempt is due after the current delay, which then doubles up to
+// the cap. A socket that stayed open (`stable`) starts the backoff over first.
+const scheduleRetry = (link, stable) => {
+  if (stable) link.retryDelay = SINK_RETRY_MIN_MS;
+  link.nextRetryAt = Date.now() + link.retryDelay;
+  link.retryDelay = Math.min(link.retryDelay * 2, SINK_RETRY_MAX_MS);
+};
+
 const linkConnect = async (link) => {
   // A gone link is never admitted again (overflow), so it opens no new
   // socket; its late items reach linkSend before its cleanup runs.
@@ -273,8 +283,7 @@ const linkConnect = async (link) => {
   if (!ws) {
     // Not configured (metadata-only mode) or refused.
     linkDropPending(link);
-    link.nextRetryAt = Date.now() + link.retryDelay;
-    link.retryDelay = Math.min(link.retryDelay * 2, 10000);
+    scheduleRetry(link, false);
     linkRelease(link);
     return;
   }
@@ -348,9 +357,7 @@ const linkConnect = async (link) => {
     linkRelease(link);
     // A sink that closes right after the hello (wrong token, refused) must
     // not be hammered: only a socket that stayed open resets the backoff.
-    if (openedAt && Date.now() - openedAt >= SINK_STABLE_MS) link.retryDelay = 1000;
-    link.nextRetryAt = Date.now() + link.retryDelay;
-    link.retryDelay = Math.min(link.retryDelay * 2, 10000);
+    scheduleRetry(link, Boolean(openedAt) && Date.now() - openedAt >= SINK_STABLE_MS);
   };
   ws.onerror = () => {
     // onclose follows.
@@ -462,7 +469,7 @@ chrome.runtime.onConnect.addListener((port) => {
     sentBytes: 0,
     dropped: 0,
     nextRetryAt: 0,
-    retryDelay: 1000,
+    retryDelay: SINK_RETRY_MIN_MS,
   };
   if (!sinkLinks.has(tabId)) sinkLinks.set(tabId, new Map());
   sinkLinks.get(tabId).set(portId, link);

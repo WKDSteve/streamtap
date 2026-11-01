@@ -505,6 +505,42 @@ const check = (ok, what) => {
     const got = await labels(ws);
     check(got === "H A" && ws.readyState === 3, `mock-drain: a socket opened after the cleanup sends its queue and closes (got ${got}, state ${ws.readyState})`);
   }
+
+  // mock-backoff: the retry policy on a link's own state (no socket needed). The retry is due after the
+  // current delay; the delay then doubles from 1 s up to the 10 s cap; a socket that stayed open (stable)
+  // starts over at 1 s.
+  {
+    const policy = JSON.parse(
+      vm.runInContext(
+        `(() => {
+          const link = { nextRetryAt: 0, retryDelay: 1000 };
+          const rows = [];
+          for (let i = 0; i < 6; i++) {
+            const used = link.retryDelay;
+            const before = Date.now();
+            scheduleRetry(link, false);
+            rows.push({ used, waited: link.nextRetryAt - before, next: link.retryDelay });
+          }
+          link.retryDelay = 8000;
+          scheduleRetry(link, true);
+          return JSON.stringify({ rows, stable: { waited: link.nextRetryAt - Date.now(), next: link.retryDelay } });
+        })()`,
+        ctx,
+      ),
+    );
+    check(
+      policy.rows.map((r) => r.next).join(",") === "2000,4000,8000,10000,10000,10000",
+      `mock-backoff: the delay doubles up to the 10 s cap (got ${policy.rows.map((r) => r.next).join(",")})`,
+    );
+    check(
+      policy.rows.every((r) => r.waited >= r.used - 5 && r.waited <= r.used + 500),
+      "mock-backoff: the retry is due after the delay that was current",
+    );
+    check(
+      policy.stable.next === 2000 && policy.stable.waited <= 1500,
+      `mock-backoff: a stable socket restarts at 1 s (waits ${policy.stable.waited} ms, next ${policy.stable.next})`,
+    );
+  }
 }
 if (!live) {
   console.log("live scenarios skipped (no sink given)");
