@@ -352,6 +352,12 @@ check(appends().at(-2).bytes === 5 && appends().at(-2).tsoSet === false, "a shor
 check(last().tsoSet === false, "so does the rest of a cut styp");
 sb12b.appendBuffer(ab(cut3.subarray(16)));
 check(last().tsoSet === true, "the moof+mdat append that follows carries it");
+// A piece cut right after the size of the moof starts with its fourcc.
+sb12b.timestampOffset = 16;
+const cut4 = media(360000);
+sb12b.appendBuffer(ab(Buffer.concat([box("styp", Buffer.from("msdh")), cut4.subarray(0, 4)])));
+sb12b.appendBuffer(ab(cut4.subarray(4)));
+check(last().tsoSet === true, "a piece that starts with the moof fourcc takes the set offset");
 
 // The head of a new split init does not carry the previous init's timescale.
 sb8.appendBuffer(ab(clear8.subarray(0, 20)));

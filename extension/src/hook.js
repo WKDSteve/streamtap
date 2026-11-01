@@ -424,7 +424,7 @@
   const carriesSamples = (u8, kind, parsed) => {
     if (kind === "webm") return true;
     if (parsed && parsed.tfdt !== null) return true;
-    for (let i = 4; i + 4 <= u8.byteLength; i++) {
+    for (let i = 0; i + 4 <= u8.byteLength; i++) {
       const c = u8[i];
       if ((c === 0x6d && u8[i + 1] === 0x6f && u8[i + 2] === 0x6f && u8[i + 3] === 0x66) ||
           (c === 0x6d && u8[i + 1] === 0x64 && u8[i + 2] === 0x61 && u8[i + 3] === 0x74)) return true;
