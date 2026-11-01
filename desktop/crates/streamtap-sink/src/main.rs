@@ -433,9 +433,9 @@ struct TrackState {
     pending_done: bool,
     /// The pending init came right after an encrypted stretch.
     pending_after_refusal: bool,
-    /// Container of the last init ("mp4", "webm"): continuation chunks have
+    /// Container of the last init: continuation chunks have
     /// no kind of their own.
-    init_kind: String,
+    init_kind: Container,
     /// The last timed chunk was a duplicate: the untimed chunks that follow
     /// it (its continuation) are duplicates too.
     skip_tail: bool,
@@ -547,6 +547,48 @@ const PIFF_SAMPLE_ENCRYPTION: [u8; 16] = [
     0xa2, 0x39, 0x4f, 0x52, 0x5a, 0x9b, 0x4f, 0x14, 0xa2, 0x44, 0x6c, 0x42, 0x7c, 0x64, 0x8d, 0xf4,
 ];
 
+/// The container of a stream's segments, parsed once from the wire `kind`
+/// string so no later code compares strings. `Other` is any kind this sink does
+/// not know: it takes the MP4 code paths, as the string comparisons always did
+/// (everything that was not `"webm"`), and matches no input format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Container {
+    Mp4,
+    Webm,
+    #[default]
+    Other,
+}
+
+impl Container {
+    fn from_kind(kind: &str) -> Self {
+        match kind {
+            "mp4" => Self::Mp4,
+            "webm" => Self::Webm,
+            _ => Self::Other,
+        }
+    }
+
+    fn is_webm(self) -> bool {
+        self == Self::Webm
+    }
+
+    /// The ffmpeg input format of a part starting with `head`, `None` when the
+    /// bytes do not look like this container (so the part is not muxed).
+    fn head_format(self, head: [u8; 8]) -> Option<&'static str> {
+        match self {
+            Self::Mp4 if matches!(&head[4..8], b"ftyp" | b"moov" | b"styp") => Some("mp4"),
+            Self::Webm if head[..4] == [0x1a, 0x45, 0xdf, 0xa3] => Some("matroska"),
+            _ => None,
+        }
+    }
+}
+
+impl SegmentHeader {
+    fn container(&self) -> Container {
+        Container::from_kind(&self.kind)
+    }
+}
+
 /// True when a segment carries protected media. Init bytes (an init or a
 /// continuation of one, `init_part`; `init_kind` is the init's container) are
 /// scanned for the markers: `encv`/`enca`/`tenc`/`pssh` (MP4), or the
@@ -555,8 +597,13 @@ const PIFF_SAMPLE_ENCRYPTION: [u8; 16] = [
 /// PIFF sample encryption in a `moof`, or `saiz`/`saio` there (CENC media may
 /// carry its IVs as auxiliary info without a `senc`; clear media has no
 /// auxiliary info in practice). Random bytes in media never count.
-fn payload_encrypted(h: &SegmentHeader, payload: &[u8], init_part: bool, init_kind: &str) -> bool {
-    let webm = h.kind == "webm" || (init_part && !h.is_init && init_kind == "webm");
+fn payload_encrypted(
+    h: &SegmentHeader,
+    payload: &[u8],
+    init_part: bool,
+    init_kind: Container,
+) -> bool {
+    let webm = h.container().is_webm() || (init_part && !h.is_init && init_kind.is_webm());
     if h.is_init || init_part {
         return if webm {
             webm_encrypted(payload)
@@ -612,8 +659,8 @@ const SEGMENT_BOXES: [&[u8; 4]; 5] = [b"styp", b"emsg", b"prft", b"moof", b"mdat
 /// Per-segment boxes in front of the `moof` (a `sidx` differs per segment)
 /// must not count as init bytes, or every combined append would look like a
 /// new init. `None` when there is no media in it.
-fn init_prefix_len(kind: &str, payload: &[u8]) -> Option<usize> {
-    if kind == "webm" {
+fn init_prefix_len(kind: Container, payload: &[u8]) -> Option<usize> {
+    if kind.is_webm() {
         let mut off = 0;
         while off < payload.len() {
             let (id, il) = read_vint(payload, off, true)?;
@@ -665,8 +712,8 @@ fn box_starts(payload: &[u8]) -> Vec<([u8; 4], usize)> {
 /// The media part of a split init+media append holds samples (a `moof` or
 /// `mdat`, a `WebM` Cluster), not only boxes in front of them (`styp`,
 /// `emsg`, `prft`, `sidx`), which an append can end with (a chunked fetch).
-fn has_samples(kind: &str, media: &[u8]) -> bool {
-    kind == "webm"
+fn has_samples(kind: Container, media: &[u8]) -> bool {
+    kind.is_webm()
         || box_starts(media)
             .iter()
             .any(|(k, _)| k == b"moof" || k == b"mdat")
@@ -699,7 +746,7 @@ struct SegmentHead {
 /// The init bytes so far hold a complete `moov` (MP4) or `Tracks` (`WebM`):
 /// nothing more of this init is to come.
 #[cfg(test)]
-fn init_complete(kind: &str, bytes: &[u8]) -> bool {
+fn init_complete(kind: Container, bytes: &[u8]) -> bool {
     init_scan(kind, bytes, 0).0
 }
 
@@ -707,9 +754,9 @@ fn init_complete(kind: &str, bytes: &[u8]) -> bool {
 /// `from`, the start of the first box or element not yet complete. Returns
 /// whether it was found and where the next scan resumes, so bytes arriving
 /// in many chunks are each walked once.
-fn init_scan(kind: &str, bytes: &[u8], from: usize) -> (bool, usize) {
+fn init_scan(kind: Container, bytes: &[u8], from: usize) -> (bool, usize) {
     let mut off = from;
-    if kind == "webm" {
+    if kind.is_webm() {
         while off < bytes.len() {
             let Some((id, il)) = read_vint(bytes, off, true) else {
                 return (false, off);
@@ -1064,7 +1111,7 @@ impl TrackState {
             pending_scan: 0,
             pending_done: false,
             pending_after_refusal: false,
-            init_kind: String::new(),
+            init_kind: Container::Other,
             skip_tail: false,
             segment_head: None,
             refused: false,
@@ -1081,7 +1128,7 @@ impl TrackState {
         self.pending.push((h.clone(), payload.len()));
         self.pending_whole.extend_from_slice(payload);
         if !self.pending_done {
-            let (done, next) = init_scan(&self.init_kind, &self.pending_whole, self.pending_scan);
+            let (done, next) = init_scan(self.init_kind, &self.pending_whole, self.pending_scan);
             self.pending_done = done;
             self.pending_scan = next;
         }
@@ -1417,7 +1464,7 @@ impl Session {
         // Each chunk was scanned on its own; markers split across chunks (a
         // WebM ID cut in two, its three IDs in three appends) only show in
         // the whole init.
-        let flagged = if track.init_kind == "webm" {
+        let flagged = if track.init_kind.is_webm() {
             webm_encrypted(&whole)
         } else {
             looks_encrypted(&whole)
@@ -1548,7 +1595,7 @@ impl Session {
         self.flush_init(h.sb)?;
         // Only the boxes in front of the samples (the append ended after its
         // styp): held for the next media append.
-        if !has_samples(&h.kind, media) && self.hold_segment_head(h, media) {
+        if !has_samples(h.container(), media) && self.hold_segment_head(h, media) {
             return Ok(());
         }
         let mut hm = h.clone();
@@ -1606,7 +1653,7 @@ impl Session {
         }
         if let Some(n) = h
             .is_init
-            .then(|| init_prefix_len(&h.kind, payload))
+            .then(|| init_prefix_len(h.container(), payload))
             .flatten()
         {
             return self.write_init_and_media(h, payload, n);
@@ -1633,7 +1680,7 @@ impl Session {
             && h.tfdt.is_none()
             && (h.init_cont || (!track.pending.is_empty() && !track.pending_done));
 
-        if payload_encrypted(h, payload, continuation, &track.init_kind) {
+        if payload_encrypted(h, payload, continuation, track.init_kind) {
             if !track.refused {
                 eprintln!(
                     "{}: sb{} carries encrypted media (DRM); not capturing this track",
@@ -1659,7 +1706,7 @@ impl Session {
             // lifted once that init is complete and clear (`flush_init`):
             // its first chunk alone says nothing about the rest.
             track.pending_after_refusal = std::mem::take(&mut track.refused);
-            track.init_kind.clone_from(&h.kind);
+            track.init_kind = h.container();
             track.push_pending(h, payload);
             if track.pending_cost() > MAX_PENDING_INIT {
                 self.flush_init(h.sb)?;
@@ -2734,19 +2781,10 @@ fn keep_main_media_source(rows: &mut Vec<IndexRow>) {
 /// one: the bytes come from the page, and ffmpeg's format probing would
 /// otherwise follow whatever they claim to be (an MPD or a playlist pulls in
 /// other files).
-fn input_format(kind: &str, path: &Path) -> Option<&'static str> {
+fn input_format(kind: Container, path: &Path) -> Option<&'static str> {
     let mut head = [0u8; 8];
     File::open(path).ok()?.read_exact(&mut head).ok()?;
-    head_format(kind, head)
-}
-
-/// `input_format` of a part whose first 8 bytes are `head`.
-fn head_format(kind: &str, head: [u8; 8]) -> Option<&'static str> {
-    match kind {
-        "mp4" if matches!(&head[4..8], b"ftyp" | b"moov" | b"styp") => Some("mp4"),
-        "webm" if head[..4] == [0x1a, 0x45, 0xdf, 0xa3] => Some("matroska"),
-        _ => None,
-    }
+    kind.head_format(head)
 }
 
 /// What `mux_inputs` hands to ffmpeg, plus what the caller must tell the
@@ -2829,6 +2867,7 @@ fn part_input(
         .iter()
         .find(|r| r.is_init)
         .map_or("", |r| r.kind.as_str());
+    let container = Container::from_kind(kind);
     let not_media = || {
         eprintln!(
             "mux: sb{id}.p{part} does not start like {} media; skipped",
@@ -2848,12 +2887,12 @@ fn part_input(
     let init = read_init(&raw, &part_rows).map_err(cannot_reorder)?;
     // An MP4 init without a complete moov (cut short) cannot be decoded, and
     // ffmpeg would fail the whole mux with it.
-    if kind == "mp4" && trak_count(&init) == 0 {
+    if container == Container::Mp4 && trak_count(&init) == 0 {
         eprintln!("mux: sb{id}.p{part}: its init has no complete moov; skipped");
         return Ok(None);
     }
     if let Some(head) = init.first_chunk::<8>() {
-        if head_format(kind, *head).is_none() {
+        if container.head_format(*head).is_none() {
             not_media();
             return Ok(None);
         }
@@ -2866,7 +2905,7 @@ fn part_input(
                 return Err(cannot_reorder(e));
             }
         };
-    let Some(format) = input_format(kind, &path) else {
+    let Some(format) = input_format(container, &path) else {
         not_media();
         discard_sorted(&sorted);
         return Ok(None);
@@ -3425,19 +3464,25 @@ mod tests {
         assert!(!looks_encrypted(b"\0\0\0\x10moov....avc1...."));
         let mut h = seg(1, false, Some(0), None);
         let senc = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"senc", b"")));
-        assert!(payload_encrypted(&h, &senc, false, "mp4"), "senc in a moof");
-        assert!(!payload_encrypted(&h, &moof(0), false, "mp4"), "clear moof");
+        assert!(
+            payload_encrypted(&h, &senc, false, Container::Mp4),
+            "senc in a moof"
+        );
+        assert!(
+            !payload_encrypted(&h, &moof(0), false, Container::Mp4),
+            "clear moof"
+        );
         for aux in [*b"saiz", *b"saio"] {
             let cenc = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(aux, b"")));
             assert!(
-                payload_encrypted(&h, &cenc, false, "mp4"),
+                payload_encrypted(&h, &cenc, false, Container::Mp4),
                 "auxiliary info without senc"
             );
         }
         let mut moov = mp4_box(*b"ftyp", b"iso6");
         moov.extend(mp4_box(*b"moov", b"..encv.."));
         assert!(
-            payload_encrypted(&h, &moov, false, "mp4"),
+            payload_encrypted(&h, &moov, false, Container::Mp4),
             "moov in a chunk not flagged as init"
         );
         h.kind = "webm".into();
@@ -3446,13 +3491,13 @@ mod tests {
             &h,
             &[0x16, 0x54, 0x6d, 0x80, 0x50, 0x35, 0x47, 0xe2],
             false,
-            "webm"
+            Container::Webm
         ));
         assert!(!payload_encrypted(
             &h,
             &[0x16, 0x54, 0xae, 0x6b],
             false,
-            "mp4"
+            Container::Mp4
         ));
     }
 
@@ -3735,6 +3780,38 @@ mod tests {
     }
 
     #[test]
+    fn container_is_parsed_once_from_the_wire_kind() {
+        assert_eq!(Container::from_kind("mp4"), Container::Mp4);
+        assert_eq!(Container::from_kind("webm"), Container::Webm);
+        // Anything else is `Other`: MP4 code paths, but no input format.
+        for other in ["", "MP4", "ogg", "mp4 "] {
+            assert_eq!(Container::from_kind(other), Container::Other, "{other:?}");
+        }
+        assert_eq!(Container::default(), Container::Other);
+        assert!(
+            Container::Webm.is_webm() && !Container::Mp4.is_webm() && !Container::Other.is_webm()
+        );
+
+        let mp4_head = *b"\0\0\0\x18ftyp";
+        let webm_head = [0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0];
+        assert_eq!(Container::Mp4.head_format(mp4_head), Some("mp4"));
+        assert_eq!(Container::Webm.head_format(webm_head), Some("matroska"));
+        assert_eq!(
+            Container::Mp4.head_format(webm_head),
+            None,
+            "kind and magic must agree"
+        );
+        assert_eq!(Container::Webm.head_format(mp4_head), None);
+        assert_eq!(Container::Other.head_format(mp4_head), None);
+
+        let mut h = seg(0, true, None, None);
+        h.kind = "webm".into();
+        assert_eq!(h.container(), Container::Webm);
+        h.kind = "mp4".into();
+        assert_eq!(h.container(), Container::Mp4);
+    }
+
+    #[test]
     fn mux_inputs_refuses_parts_that_are_not_media() {
         let dir = temp_dir("magic");
         let mpd = b"<?xml version=\"1.0\"?><MPD/>";
@@ -3748,13 +3825,16 @@ mod tests {
             ),
             "an MPD is not an mp4 part"
         );
-        assert_eq!(input_format("mp4", &dir.join("sb1.p0.bin")), None);
+        assert_eq!(input_format(Container::Mp4, &dir.join("sb1.p0.bin")), None);
 
         let init = init_with_traks(1);
         fs::write(dir.join("sb1.p0.bin"), &init).expect("write");
-        assert_eq!(input_format("mp4", &dir.join("sb1.p0.bin")), Some("mp4"));
         assert_eq!(
-            input_format("webm", &dir.join("sb1.p0.bin")),
+            input_format(Container::Mp4, &dir.join("sb1.p0.bin")),
+            Some("mp4")
+        );
+        assert_eq!(
+            input_format(Container::Webm, &dir.join("sb1.p0.bin")),
             None,
             "kind and magic must agree"
         );
@@ -4366,7 +4446,7 @@ mod tests {
             &seg(1, false, Some(0), None),
             &piff,
             false,
-            "mp4"
+            Container::Mp4
         ));
     }
 
@@ -4782,11 +4862,19 @@ mod tests {
         for kind in [*b"styp", *b"emsg", *b"prft"] {
             let mut p = init.clone();
             p.extend(mp4_box(kind, b"msdh"));
-            assert_eq!(init_prefix_len("mp4", &p), Some(init.len()), "{kind:?}");
+            assert_eq!(
+                init_prefix_len(Container::Mp4, &p),
+                Some(init.len()),
+                "{kind:?}"
+            );
         }
         let mut p = init.clone();
         p.extend(mp4_box(*b"sidx", b"index"));
-        assert_eq!(init_prefix_len("mp4", &p), None, "single-file index");
+        assert_eq!(
+            init_prefix_len(Container::Mp4, &p),
+            None,
+            "single-file index"
+        );
     }
 
     #[test]
@@ -4831,14 +4919,14 @@ mod tests {
         let init = init_with_traks(1);
         let mut combined = init.clone();
         combined.extend(moof(0));
-        assert_eq!(init_prefix_len("mp4", &combined), Some(init.len()));
-        assert_eq!(init_prefix_len("mp4", &init), None);
+        assert_eq!(init_prefix_len(Container::Mp4, &combined), Some(init.len()));
+        assert_eq!(init_prefix_len(Container::Mp4, &init), None);
         // EBML header, Segment (unknown size) > Info, Cluster.
         let webm = [
             0x1a, 0x45, 0xdf, 0xa3, 0x81, 0x00, 0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff, 0x15, 0x49, 0xa9, 0x66, 0x80, 0x1f, 0x43, 0xb6, 0x75, 0x80,
         ];
-        assert_eq!(init_prefix_len("webm", &webm), Some(23));
+        assert_eq!(init_prefix_len(Container::Webm, &webm), Some(23));
     }
 
     #[test]
@@ -5539,13 +5627,13 @@ built with gcc"),
         append.extend(mp4_box(*b"styp", b"msdh"));
         append.extend(mp4_box(*b"sidx", b"1234"));
         append.extend(moof(0));
-        assert_eq!(init_prefix_len("mp4", &append), Some(init.len()));
+        assert_eq!(init_prefix_len(Container::Mp4, &append), Some(init.len()));
         let mut free = init.clone();
         free.extend(mp4_box(*b"free", b"x"));
         let mut with_free = free.clone();
         with_free.extend(moof(0));
         assert_eq!(
-            init_prefix_len("mp4", &with_free),
+            init_prefix_len(Container::Mp4, &with_free),
             Some(free.len()),
             "a free box after moov stays init"
         );
@@ -5599,9 +5687,9 @@ built with gcc"),
     #[test]
     fn init_complete_needs_moov_or_tracks() {
         let init = init_with_traks(1);
-        assert!(init_complete("mp4", &init));
-        assert!(!init_complete("mp4", &init[..init.len() - 1]));
-        assert!(!init_complete("mp4", &mp4_box(*b"ftyp", b"iso6")));
+        assert!(init_complete(Container::Mp4, &init));
+        assert!(!init_complete(Container::Mp4, &init[..init.len() - 1]));
+        assert!(!init_complete(Container::Mp4, &mp4_box(*b"ftyp", b"iso6")));
         // EBML header, Segment (unknown size), Info, Tracks.
         let ebml = [0x1a, 0x45, 0xdf, 0xa3, 0x80];
         let segment = [
@@ -5610,9 +5698,9 @@ built with gcc"),
         let info = [0x15, 0x49, 0xa9, 0x66, 0x80];
         let tracks = [0x16, 0x54, 0xae, 0x6b, 0x80];
         let mut head = [&ebml[..], &segment, &info].concat();
-        assert!(!init_complete("webm", &head));
+        assert!(!init_complete(Container::Webm, &head));
         head.extend_from_slice(&tracks);
-        assert!(init_complete("webm", &head));
+        assert!(init_complete(Container::Webm, &head));
     }
 
     #[test]
@@ -5750,16 +5838,16 @@ built with gcc"),
         // SegmentBase: ftyp moov sidx with no moof is all init.
         let mut v = init_with_traks(1);
         v.extend(mp4_box(*b"sidx", b"1234"));
-        assert_eq!(init_prefix_len("mp4", &v), None);
+        assert_eq!(init_prefix_len(Container::Mp4, &v), None);
     }
 
     #[test]
     fn init_scan_resumes_where_it_stopped() {
         let init = init_with_traks(1);
-        let (done, at) = init_scan("mp4", &init[..20], 0);
+        let (done, at) = init_scan(Container::Mp4, &init[..20], 0);
         assert!(!done);
         assert_eq!(at, 12, "after the complete ftyp");
-        assert!(init_scan("mp4", &init, at).0);
+        assert!(init_scan(Container::Mp4, &init, at).0);
     }
 
     #[test]
@@ -5790,7 +5878,7 @@ built with gcc"),
         let mut v = init.clone();
         v.extend(mp4_box(*b"styp", b"msdh"));
         v.extend(&moof(0)[..12]); // header says 40 bytes, 12 arrived
-        assert_eq!(init_prefix_len("mp4", &v), Some(init.len()));
+        assert_eq!(init_prefix_len(Container::Mp4, &v), Some(init.len()));
     }
 
     #[test]
