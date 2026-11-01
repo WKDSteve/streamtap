@@ -131,6 +131,9 @@
   const MAX_QUEUED_BYTES = 64 * 1024 * 1024; // all payloads waiting in this frame
   const MAX_INIT_BYTES = 1024 * 1024; // init segments kept for a new port
   const MAX_KEPT_INITS = 16;
+  // sb noted in `unkept` per link. A page can forge init records with ever new sb ids (each pushes the oldest kept
+  // init in); unbounded, every new port would get one `lost` per entry and the sink one `initlost` frame each.
+  const MAX_UNKEPT = 64;
   const MAX_LINKS = 8; // MediaSources tapped at the same time in this frame
 
   const links = new Map(); // ms key -> link
@@ -229,6 +232,12 @@
   // too large to keep also drops the old one, so the old quality's init is
   // never replayed in front of the new quality's media; it is noted in
   // `unkept`.
+  const noteUnkept = (link, sb) => {
+    link.unkept.delete(sb);
+    link.unkept.add(sb);
+    while (link.unkept.size > MAX_UNKEPT) link.unkept.delete(link.unkept.values().next().value);
+  };
+
   const keepInit = (link, header, payload) => {
     if (header.initCont) {
       const chunks = link.inits.get(header.sb);
@@ -236,13 +245,13 @@
       const kept = chunks.reduce((n, c) => n + c.payload.byteLength, 0);
       if (kept + payload.byteLength > MAX_INIT_BYTES) {
         link.inits.delete(header.sb);
-        link.unkept.add(header.sb);
+        noteUnkept(link, header.sb);
       } else chunks.push({ header, payload });
       return;
     }
     if (!header.isInit) return;
     link.inits.delete(header.sb);
-    link.unkept.add(header.sb);
+    noteUnkept(link, header.sb);
     // An init+media append (video.js VHS) keeps only its init part.
     let init = { header, payload };
     if (header.initLen && header.initLen < payload.byteLength) {
@@ -257,7 +266,7 @@
     while (link.inits.size > MAX_KEPT_INITS) {
       const oldest = link.inits.keys().next().value;
       link.inits.delete(oldest);
-      link.unkept.add(oldest);
+      noteUnkept(link, oldest);
     }
   };
 
@@ -268,7 +277,7 @@
   // media waits for its next init.
   const initLost = (link, sb) => {
     link.inits.delete(sb);
-    link.unkept.add(sb);
+    noteUnkept(link, sb);
     link.lost.add(sb);
     if (!link.port) return;
     try {

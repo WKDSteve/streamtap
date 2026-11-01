@@ -277,5 +277,16 @@ const sbOf = (tabId, frameUrl, msId, sbId) =>
   check(c.mime.includes("avc1") && d.mime.includes("vp09"), "registry: changetype of a pre-hook SourceBuffer (msId null) as well");
 }
 
+{
+  // Forged init records with ever new sb ids: every init beyond the 16 kept pushes the oldest into `unkept`, which
+  // used to grow without a bound (each new port then got one `lost` per entry).
+  const { links } = window.__vcLink;
+  for (let sb = 1; sb <= 300; sb++) rec(30, sb, { isInit: true }, 50);
+  await sleep(150);
+  const link = links.get("30");
+  check(link && link.unkept.size <= 64, `forged inits: unkept stays bounded (got ${link && link.unkept.size})`);
+  check(link.inits.size <= 16, `forged inits: the kept inits stay bounded (got ${link.inits.size})`);
+}
+
 console.log(failures.length ? `FAILED: ${failures.length} check(s)` : "ok: all checks passed");
 process.exit(failures.length ? 1 : 0);
