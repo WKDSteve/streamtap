@@ -291,7 +291,7 @@ Headers:
 | `type` | fields | payload |
 |---|---|---|
 | `hello` | `token`, `session`, `url`, `title` | none; must be the first message |
-| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append that carried samples; an init, or boxes in front of samples, appended without samples do not use it up) | the segment bytes exactly as passed to `appendBuffer` |
+| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append that carried samples; an init, boxes in front of samples, a short head or a piece cut inside the head boxes, appended without samples do not use it up; the piece with the `moof`/`mdat` takes it) | the segment bytes exactly as passed to `appendBuffer` |
 | `event` | `name` (`endofstream`, `changetype`, `initlost`), `sb` | none |
 ## Test without a browser
 

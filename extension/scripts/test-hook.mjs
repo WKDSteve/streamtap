@@ -338,9 +338,20 @@ check(last().tsoSet === true, "the samples after them carry it");
 sb12b.timestampOffset = 8;
 const cutSeg = Buffer.concat([box("styp", Buffer.from("msdhmsdhmsdh")), media(90000)]);
 sb12b.appendBuffer(ab(cutSeg.subarray(0, 12)));
-check(last().tsoSet === true, "a cut styp piece starts the segment: it takes the set offset");
+check(last().tsoSet === false, "a cut styp piece without samples keeps the set offset");
 sb12b.appendBuffer(ab(cutSeg.subarray(12)));
-check(last().tsoSet === false, "the rest of the cut segment does not");
+check(last().tsoSet === true, "the piece that carries moof/mdat takes it");
+sb12b.appendBuffer(ab(media(180000)));
+check(last().tsoSet === false, "and it is used up");
+// A head under 8 bytes, posted on its own, keeps it too; the samples take it.
+sb12b.timestampOffset = 12;
+const cut3 = Buffer.concat([box("styp", Buffer.from("msdhmsdh")), media(270000)]);
+sb12b.appendBuffer(ab(cut3.subarray(0, 5)));
+sb12b.appendBuffer(ab(cut3.subarray(5, 16))); // the 5 bytes are held, then posted on their own
+check(appends().at(-2).bytes === 5 && appends().at(-2).tsoSet === false, "a short head leaves the set offset");
+check(last().tsoSet === false, "so does the rest of a cut styp");
+sb12b.appendBuffer(ab(cut3.subarray(16)));
+check(last().tsoSet === true, "the moof+mdat append that follows carries it");
 
 // The head of a new split init does not carry the previous init's timescale.
 sb8.appendBuffer(ab(clear8.subarray(0, 20)));

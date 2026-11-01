@@ -417,6 +417,21 @@
     return false;
   };
 
+  // The set offset is used up by the piece that carries the sample boxes:
+  // one that holds a moof or mdat fourcc (or parsed a tfdt). A short head, or
+  // a piece of the head boxes cut inside a styp, leaves it for the piece that
+  // follows, since the sink only reads it off a timed row.
+  const carriesSamples = (u8, kind, parsed) => {
+    if (kind === "webm") return true;
+    if (parsed && parsed.tfdt !== null) return true;
+    for (let i = 4; i + 4 <= u8.byteLength; i++) {
+      const c = u8[i];
+      if ((c === 0x6d && u8[i + 1] === 0x6f && u8[i + 2] === 0x6f && u8[i + 3] === 0x66) ||
+          (c === 0x6d && u8[i + 1] === 0x64 && u8[i + 2] === 0x61 && u8[i + 3] === 0x74)) return true;
+    }
+    return false;
+  };
+
   // An open init that holds only its head (MP4: no moov yet, it would not be
   // open otherwise; WebM: exactly the EBML header) continues with an append
   // that starts with the missing part (moov; Segment), not a new init.
@@ -651,7 +666,8 @@
     const media =
       (!isInit || initLen !== null) &&
       !initCont &&
-      hasSamples(initLen !== null ? u8.subarray(initLen) : u8, kind);
+      hasSamples(initLen !== null ? u8.subarray(initLen) : u8, kind) &&
+      carriesSamples(initLen !== null ? u8.subarray(initLen) : u8, kind, parsed);
     const tsoSet = media && !!info.tsoSet;
     if (media) info.tsoSet = false;
 
