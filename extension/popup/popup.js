@@ -3,43 +3,70 @@
 const out = document.getElementById("out");
 
 // Every value shown here comes from the page (window.postMessage can be forged by any page script),
-// so each one is escaped, numbers included.
-const esc = (s) =>
-  String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+// so the view is built from elements and textContent; no value is ever parsed as markup.
+const el = (tag, className, ...children) => {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  for (const c of children) node.append(c);
+  return node;
+};
+const text = (tag, className, value) => {
+  const node = el(tag, className);
+  node.textContent = String(value);
+  return node;
+};
 
 const fmtBytes = (v) => {
   const n = Number(v) || 0;
   return n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + " MiB" : n >= 1024 ? (n / 1024).toFixed(0) + " KiB" : n + " B";
 };
 
+const bufferRow = (s) => {
+  const range = s.firstSec === null ? "–" : `${s.firstSec}s – ${s.lastEndSec ?? s.lastSec}s`;
+  const mime = text("td", "mime", s.mime);
+  if (s.mimes.length) mime.append(el("br"), text("span", "muted", "was: " + s.mimes.join(" → ")));
+  return el(
+    "tr",
+    "",
+    text("td", "", s.sbId),
+    mime,
+    text("td", "", s.kind ?? "–"),
+    text("td", "", s.inits),
+    text("td", "", s.media),
+    text("td", "", fmtBytes(s.bytes)),
+    text("td", "", range)
+  );
+};
+
+const mediaSourceBox = (m) => {
+  const box = el("div", "ms", text("h2", "", `MediaSource #${m.msId}${m.ended ? " · ended" : ""}`));
+  const where = text("div", "muted", m.frameUrl);
+  if (m.blobUrl) where.append(el("br"), document.createTextNode(String(m.blobUrl)));
+  box.append(where);
+  if (m.sourceBuffers.length) {
+    const head = el("tr", "");
+    for (const h of ["#", "mime", "kind", "init", "media", "bytes", "range"]) head.append(text("th", "", h));
+    box.append(el("table", "", head, ...m.sourceBuffers.map(bufferRow)));
+  }
+  return box;
+};
+
 const render = (state) => {
   if (!state) {
-    out.innerHTML = '<span class="muted">No MSE activity seen in this tab yet. Play a video, then reopen.</span>';
+    out.replaceChildren(text("span", "muted", "No MSE activity seen in this tab yet. Play a video, then reopen."));
     return;
   }
-  let html = "";
+  const parts = [];
   if (state.drm.length) {
-    html += `<div class="drm">DRM (not captured): ${state.drm.map((d) => esc(d.keySystem) + (d.robustness.length ? " (" + esc(d.robustness.join(", ")) + ")" : "")).join("; ")}</div>`;
+    const keys = state.drm.map((d) => d.keySystem + (d.robustness.length ? " (" + d.robustness.join(", ") + ")" : ""));
+    parts.push(text("div", "drm", `DRM (not captured): ${keys.join("; ")}`));
   }
   if (!state.mediaSources.length) {
-    html += '<div class="muted">No MediaSource created yet.</div>';
+    parts.push(text("div", "muted", "No MediaSource created yet."));
   }
-  for (const m of state.mediaSources) {
-    html += `<div class="ms"><h2>MediaSource #${esc(m.msId)}${m.ended ? " · ended" : ""}</h2>`;
-    html += `<div class="muted">${esc(m.frameUrl)}${m.blobUrl ? "<br>" + esc(m.blobUrl) : ""}</div>`;
-    if (m.sourceBuffers.length) {
-      html += "<table><tr><th>#</th><th>mime</th><th>kind</th><th>init</th><th>media</th><th>bytes</th><th>range</th></tr>";
-      for (const s of m.sourceBuffers) {
-        const range =
-          s.firstSec === null ? "–" : `${esc(s.firstSec)}s – ${esc(s.lastEndSec ?? s.lastSec)}s`;
-        html += `<tr><td>${esc(s.sbId)}</td><td class="mime">${esc(s.mime)}${s.mimes.length ? '<br><span class="muted">was: ' + esc(s.mimes.join(" → ")) + "</span>" : ""}</td><td>${esc(s.kind ?? "–")}</td><td>${esc(s.inits)}</td><td>${esc(s.media)}</td><td>${fmtBytes(s.bytes)}</td><td>${range}</td></tr>`;
-      }
-      html += "</table>";
-    }
-    html += "</div>";
-  }
-  html += `<div class="muted">${esc(state.events)} events · ${esc(state.frames.length)} frame(s)</div>`;
-  out.innerHTML = html;
+  for (const m of state.mediaSources) parts.push(mediaSourceBox(m));
+  parts.push(text("div", "muted", `${state.events} events · ${state.frames.length} frame(s)`));
+  out.replaceChildren(...parts);
 };
 
 const fmtLink = (s) =>

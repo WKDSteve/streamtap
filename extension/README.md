@@ -151,8 +151,9 @@ Injected into a running ARD Mediathek page (hls.js → fMP4), 7 s after a seek:
 - Two things the real run taught the mux (see `../desktop/README.md`):
   hls.js starts at a low quality and switches after the first segment (new
   init segment → new part), and after seeks segments arrive out of order.
-- The popup escapes every value it shows: any page script can forge the
-  hook's `postMessage` records.
+- The popup builds its view from elements and `textContent`, never from markup: any
+  page script can forge the hook's `postMessage` records.
+  `node scripts/test-popup.mjs` checks it with a fake DOM.
 
 ## Known limitations of the spike
 
