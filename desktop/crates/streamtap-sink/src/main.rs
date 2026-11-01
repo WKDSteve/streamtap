@@ -2557,6 +2557,7 @@ fn ordered_part(
     let carries_lift =
         |first_moved: bool| lift_ns == 0 || (ts.is_some() && can_shift && first_moved);
     if init_first && !shifted && same_order {
+        discard_sorted(&dir.join(format!("sb{sb}.p{part}.sorted.bin"))); // an earlier round's
         return Ok((raw, start, raw_tracks, carries_lift(true)));
     }
 
@@ -2580,6 +2581,13 @@ fn ordered_part(
     Ok((sorted, start, raw_tracks, carries_lift(first_moved)))
 }
 
+/// Whether the part's init is `WebM`.
+fn is_webm(rows: &[&IndexRow]) -> bool {
+    rows.iter()
+        .find(|r| r.is_init)
+        .is_some_and(|r| Container::from_kind(&r.kind) == Container::Webm)
+}
+
 /// The same rows (not equal ones) in the same order.
 fn same_rows(a: &[&IndexRow], b: &[&IndexRow]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| std::ptr::eq(*x, *y))
@@ -2599,6 +2607,21 @@ fn warn_arrival_order(sb: u32, part: u32, media: &[&IndexRow]) {
         eprintln!(
             "mux: sb{sb}.p{part}: sequence mode without segment durations; keeping arrival order, a seek or a new period may jump back in time"
         );
+    }
+}
+
+/// Says that `unshifted` segments keep their own timestamps. `WebM` has no
+/// `tfdt` to rewrite: the part is aligned by its probed start instead, so
+/// nothing is said about a jump there.
+fn unmoved_notice((sb, part): (u32, u32), unshifted: usize, webm: bool) -> String {
+    if webm {
+        format!(
+            "mux: sb{sb}.p{part}: {unshifted} WebM segment(s) keep their own timestamps; the part is aligned by its probed start instead of a rewritten timestampOffset"
+        )
+    } else {
+        format!(
+            "mux: sb{sb}.p{part}: {unshifted} segment(s) could not be moved by their timestampOffset; the timeline may jump"
+        )
     }
 }
 
@@ -2632,9 +2655,7 @@ fn write_sorted(
     }
     dst.flush()?;
     if unshifted > 0 {
-        eprintln!(
-            "mux: sb{sb}.p{part}: {unshifted} segment(s) could not be moved by their timestampOffset; the timeline may jump"
-        );
+        eprintln!("{}", unmoved_notice((sb, part), unshifted, is_webm(rows)));
     }
     eprintln!(
         "mux: sb{sb}.p{part}: reordered{}, wrote {}",
@@ -3083,6 +3104,13 @@ struct Prober<'a> {
 }
 
 impl Prober<'_> {
+    /// Records a warning once: a relayout round probes the same part again.
+    fn warn(&mut self, msg: String) {
+        if !self.warnings.contains(&msg) {
+            self.warnings.push(msg);
+        }
+    }
+
     /// `None` when ffprobe could not tell (a warning is recorded).
     fn probe(&mut self, format: &str, path: &Path, name: &str) -> Option<Probe> {
         if self.missing {
@@ -3094,13 +3122,13 @@ impl Prober<'_> {
             // once and not tried again (ENG-13).
             Err(e @ (SinkError::ToolMissing { .. } | SinkError::ToolSpawn { .. })) => {
                 self.missing = true;
-                self.warnings.push(format!(
+                self.warn(format!(
                     "{e}. Without it the parts are not checked for decodability and are aligned by the capture's own timestamps (B-frame offsets and edit lists not counted)."
                 ));
                 None
             }
             Err(e) => {
-                self.warnings.push(format!(
+                self.warn(format!(
                     "{name}: {e}; aligned by the capture's own timestamps"
                 ));
                 None
@@ -3549,6 +3577,51 @@ mod tests {
         assert_eq!(tfdt_of(&got[4..]), 1000);
         assert_eq!(tfdt_of(&got[36..]), 2000);
         assert_eq!(start, Some(1.0), "first media at 1000 ticks of 1000/s");
+    }
+
+    /// A sorted copy left by an earlier layout round is removed when the raw
+    /// file serves now.
+    #[test]
+    fn ordered_part_removes_a_stale_sorted_copy_when_raw_serves() {
+        let dir = temp_dir("stale");
+        let (a, b) = (moof(1000), moof(2000));
+        let rows = write_part(
+            &dir,
+            &[
+                (b"INIT", true, None, None),
+                (&a, false, Some(1000), None),
+                (&b, false, Some(2000), None),
+            ],
+        );
+        let stale = dir.join("sb1.p0.sorted.bin");
+        fs::write(&stale, b"old").expect("stale");
+        let (_, path, _) = order(&dir, &rows);
+        assert!(path.ends_with("sb1.p0.bin"), "raw serves: {path:?}");
+        assert!(!stale.exists(), "stale copy left");
+    }
+
+    #[test]
+    fn the_unmoved_notice_does_not_warn_of_a_jump_for_webm() {
+        let webm = unmoved_notice((1, 0), 2, true);
+        assert!(
+            !webm.contains("may jump") && webm.contains("probed start"),
+            "{webm}"
+        );
+        assert!(unmoved_notice((1, 0), 2, false).contains("may jump"));
+    }
+
+    #[test]
+    fn a_prober_warning_is_kept_once() {
+        let tools = Tools::default();
+        let mut prober = Prober {
+            tools: &tools,
+            missing: false,
+            warnings: Vec::new(),
+        };
+        prober.warn("sb1.p0: x".into());
+        prober.warn("sb1.p0: x".into());
+        prober.warn("sb1.p1: x".into());
+        assert_eq!(prober.warnings.len(), 2);
     }
 
     #[test]
