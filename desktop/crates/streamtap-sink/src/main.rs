@@ -524,6 +524,9 @@ const MAX_PENDING_INIT: usize = 4 * 1024 * 1024;
 /// muxed (`mux_inputs`): each try may cost a sorted copy and an ffprobe run.
 const MAX_FALLBACK_PARTS: usize = 3;
 const PENDING_CHUNK_COST: usize = 512;
+/// Held init bytes of all tracks of one session together. Each track alone is
+/// capped by `MAX_PENDING_INIT`; without this, 32 tracks could hold 128 MiB.
+const MAX_PENDING_SESSION: usize = 16 * 1024 * 1024;
 /// Part files per `SourceBuffer` (one per distinct init).
 const MAX_PARTS_PER_TRACK: u32 = 64;
 /// Budget charged for each part file (its directory entry and cluster).
@@ -969,6 +972,13 @@ fn printable(s: &str, max: usize) -> String {
         .collect()
 }
 
+/// The log line for a client event. The name is chosen by the client (any
+/// holder of the token), so it goes through `printable` before it reaches the
+/// terminal.
+fn event_log_line(dir: &Path, name: &str, sb: Option<u32>) -> String {
+    format!("{}: event {} sb={sb:?}", dir.display(), printable(name, 32))
+}
+
 /// `timestampOffset` in whole milliseconds; non-finite values count as 0.
 fn tso_millis(tso: Option<f64>) -> i64 {
     let v = tso.filter(|v| v.is_finite()).unwrap_or(0.0) * 1000.0;
@@ -1173,7 +1183,7 @@ fn handle_connection(
                 }
             }
             (Header::Event { name, sb }, Some(s)) => {
-                println!("{}: event {name} sb={sb:?}", s.dir.display());
+                println!("{}", event_log_line(&s.dir, &name, sb));
                 if let ("initlost", Some(sb)) = (name.as_str(), sb) {
                     if let Err(e) = s.note_lost_init(sb) {
                         eprintln!("{}: write failed, closing: {e}", s.dir.display());
@@ -1795,6 +1805,31 @@ impl Session {
         Some((hj, Cow::Owned(joined)))
     }
 
+    /// Encrypted media on `sb` (DRM): the track is refused and nothing of it
+    /// is captured; the first time says so on the terminal.
+    fn refuse_encrypted(&mut self, sb: u32) {
+        let track = self.tracks.get_mut(&sb).expect("present");
+        if !track.refused {
+            eprintln!(
+                "{}: sb{sb} carries encrypted media (DRM); not capturing this track",
+                self.dir.display()
+            );
+        }
+        track.refused = true;
+        track.take_pending();
+        track.skipped += 1;
+        self.remember_refusal(sb, true);
+    }
+
+    /// Held init bytes of all tracks but `sb` (see `MAX_PENDING_SESSION`).
+    fn pending_cost_except(&self, sb: u32) -> usize {
+        self.tracks
+            .iter()
+            .filter(|(k, _)| **k != sb)
+            .map(|(_, t)| t.pending_cost())
+            .sum()
+    }
+
     fn write_segment(&mut self, h: &SegmentHeader, payload: &[u8]) -> io::Result<()> {
         if self.stopped || payload.is_empty() {
             return Ok(());
@@ -1820,6 +1855,7 @@ impl Session {
         if !self.ensure_track(h.sb)? {
             return Ok(());
         }
+        let others_pending = self.pending_cost_except(h.sb);
         let track = self.tracks.get_mut(&h.sb).expect("present");
         // An untimed chunk continues the init when the extension says so, or
         // while the pending init is still incomplete. After a complete init it
@@ -1829,17 +1865,7 @@ impl Session {
             && (h.init_cont || (!track.pending.is_empty() && !track.pending_done));
 
         if payload_encrypted(h, payload, continuation, track.init_kind) {
-            if !track.refused {
-                eprintln!(
-                    "{}: sb{} carries encrypted media (DRM); not capturing this track",
-                    dir.display(),
-                    h.sb
-                );
-            }
-            track.refused = true;
-            track.take_pending();
-            track.skipped += 1;
-            self.remember_refusal(h.sb, true);
+            self.refuse_encrypted(h.sb);
             return Ok(());
         }
         if track.refused && !h.is_init {
@@ -1856,13 +1882,16 @@ impl Session {
             track.pending_after_refusal = std::mem::take(&mut track.refused);
             track.init_kind = h.container();
             track.push_pending(h, payload);
-            if track.pending_cost() > MAX_PENDING_INIT {
+            if track.pending_cost() > MAX_PENDING_INIT
+                || others_pending + track.pending_cost() > MAX_PENDING_SESSION
+            {
                 self.flush_init(h.sb)?;
             }
             return Ok(());
         }
         if continuation && !track.pending.is_empty() {
-            if track.pending_cost() + payload.len() + PENDING_CHUNK_COST <= MAX_PENDING_INIT {
+            let cost = track.pending_cost() + payload.len() + PENDING_CHUNK_COST;
+            if cost <= MAX_PENDING_INIT && others_pending + cost <= MAX_PENDING_SESSION {
                 track.push_pending(h, payload);
                 return Ok(());
             }
@@ -6131,5 +6160,33 @@ built with gcc"),
         assert_eq!(rescale(1000, Some(1000), 90_000), 90_000);
         assert_eq!(rescale(-3, Some(2), 1), -2);
         assert_eq!(rescale(5, None, 1000), 0);
+    }
+
+    #[test]
+    fn an_event_name_with_escapes_is_defanged_and_cut() {
+        let name = format!("\x1b[2J\x1b]0;owned\x07{}", "a".repeat(100));
+        let line = event_log_line(Path::new("d"), &name, Some(1));
+        assert!(!line.contains('\x1b') && !line.contains('\x07'));
+        assert!(line.starts_with("d: event ?[2J?]0;owned?"));
+        assert!(line.len() < 60);
+    }
+
+    #[test]
+    fn open_inits_of_many_tracks_stay_under_the_session_cap() {
+        // Each track holds an unfinished init (a stub, then 1 MiB `initCont`
+        // chunks): alone below the track cap, together far over the session cap.
+        let mut s = session("pendsession");
+        let mut cont = seg(0, false, None, None);
+        cont.init_cont = true;
+        for sb in 0..12u32 {
+            write(&mut s, &seg(sb, true, None, None), b"IN");
+            cont.sb = sb;
+            for _ in 0..3 {
+                write(&mut s, &cont, &vec![7u8; 1 << 20]);
+            }
+        }
+        let total: usize = s.tracks.values().map(TrackState::pending_cost).sum();
+        assert!(total > 0, "the inits must still be pending");
+        assert!(total <= MAX_PENDING_SESSION, "{total}");
     }
 }
