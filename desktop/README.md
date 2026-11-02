@@ -208,12 +208,15 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
 - **Which MediaSource:** one MediaSource is one video. A preroll ad, the next
   video of a single-page app or a hover preview add more to the same
   session; `mux` takes the one with the most bytes and names the others.
-- **Which part:** per SourceBuffer the part with an init segment and the
-  most bytes. Adaptive players often start at a low quality and switch after
+- **Which part:** per SourceBuffer the best part with an init segment: first
+  those whose bytes fit the media time their segments claim (between 100 B/s
+  and 100 MB/s; padded or cut-off parts and inflated durations rank last),
+  then the most claimed media time (per track, tracks are not added up), then
+  the most bytes. Without durations only the bytes count. Adaptive players often start at a low quality and switch after
   the first segment, so part 0 can be a single segment. When that part
   cannot be muxed (its init is cut, it does not start like media, ffprobe
-  cannot decode it, or a fallback part cannot be read), the next one by
-  size is used, which is said; at most 3 after the largest, since each try
+  cannot decode it, or a fallback part cannot be read), the next one in
+  that order is used, which is said; at most 3 after the first, since each try
   may cost a sorted copy and an ffprobe run. The init is checked (complete
   `moov`, starts like media) before anything is sorted, and the sorted copy
   of a part that is left out is removed. A fallback part that fails only

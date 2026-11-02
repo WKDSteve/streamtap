@@ -3080,23 +3080,31 @@ struct Candidates {
     sb: u32,
     /// All its parts, with or without an init.
     total: usize,
-    /// (part, bytes, MIME) of the parts with an init segment, the most
-    /// bytes first.
+    /// (part, bytes, MIME) of the parts with an init segment, best first
+    /// (plausible, most claimed media time, most bytes).
     ranked: Vec<(u32, u64, String)>,
 }
 
 /// Per `SourceBuffer` the parts to try, best first. Adaptive players often
 /// start at a low quality and switch after the first segment, which starts
-/// a new part: the parts with an init segment, the most bytes first. The
-/// first one `part_input` can mux is used.
+/// a new part: the parts with an init segment, the most plausible first (see
+/// `PartStat`). The first one `part_input` can mux is used.
 fn pick_parts(stored: &[&IndexRow]) -> Vec<Candidates> {
-    let mut parts: HashMap<(u32, u32), (u64, bool, String)> = HashMap::new();
+    let mut parts: HashMap<(u32, u32), PartStat> = HashMap::new();
     for row in stored {
-        let e = parts
-            .entry((row.sb, row.part))
-            .or_insert((0, false, row.mime.clone()));
-        e.0 += row.len;
-        e.1 |= row.is_init;
+        let e = parts.entry((row.sb, row.part)).or_insert_with(|| PartStat {
+            mime: row.mime.clone(),
+            ..PartStat::default()
+        });
+        e.bytes += row.len;
+        e.has_init |= row.is_init;
+        if let (false, Some(dur), Some(ts)) = (row.is_init, row.dur, row.timescale) {
+            if ts > 0 {
+                let ms = u64::try_from(u128::from(dur) * 1000 / u128::from(ts)).unwrap_or(u64::MAX);
+                let t = e.ms_by_track.entry(row.track).or_insert(0);
+                *t = t.saturating_add(ms);
+            }
+        }
     }
     let mut ids: Vec<u32> = parts.keys().map(|(sb, _)| *sb).collect();
     ids.sort_unstable();
@@ -3104,15 +3112,26 @@ fn pick_parts(stored: &[&IndexRow]) -> Vec<Candidates> {
     let mut picked = Vec::new();
     for id in ids {
         let total = parts.keys().filter(|(sb, _)| *sb == id).count();
-        let mut ranked: Vec<(u32, u64, String)> = parts
+        let mut stats: Vec<(u32, &PartStat)> = parts
             .iter()
-            .filter(|((sb, _), (_, has_init, _))| *sb == id && *has_init)
-            .map(|((_, part), (bytes, _, mime))| (*part, *bytes, mime.clone()))
+            .filter(|((sb, _), st)| *sb == id && st.has_init)
+            .map(|((_, part), st)| (*part, st))
             .collect();
-        // The later part first at equal size.
-        ranked.sort_unstable_by_key(|(part, bytes, _)| {
-            (std::cmp::Reverse(*bytes), std::cmp::Reverse(*part))
+        // Plausible parts first, then the most media time, then the most
+        // bytes, the later part at equal size. Bytes alone can be padded or
+        // cut short by the page; the time the segments claim has to fit them.
+        stats.sort_unstable_by_key(|(part, st)| {
+            (
+                !st.plausible(),
+                std::cmp::Reverse(st.media_ms()),
+                std::cmp::Reverse(st.bytes),
+                std::cmp::Reverse(*part),
+            )
         });
+        let ranked: Vec<(u32, u64, String)> = stats
+            .iter()
+            .map(|(part, st)| (*part, st.bytes, st.mime.clone()))
+            .collect();
         if ranked.is_empty() {
             eprintln!("mux: sb{id} has no part with an init segment; skipped. Capture with the hook active from page load.");
             continue;
@@ -3124,6 +3143,39 @@ fn pick_parts(stored: &[&IndexRow]) -> Vec<Candidates> {
         });
     }
     picked
+}
+
+/// What `pick_parts` knows about one part.
+#[derive(Default)]
+struct PartStat {
+    bytes: u64,
+    has_init: bool,
+    mime: String,
+    /// Media time the segments claim (ms), per track: the tracks of a
+    /// `SourceBuffer` run in parallel, so they are not added up.
+    ms_by_track: HashMap<Option<u32>, u64>,
+}
+
+/// Bounds for bytes per second of claimed media time: below the lowest a
+/// real stream reaches (a few kbit/s audio) the time was inflated or the
+/// bytes cut off, above the highest (800 Mbit/s) the bytes were padded.
+const MIN_BYTES_PER_SEC: u64 = 100;
+const MAX_BYTES_PER_SEC: u64 = 100_000_000;
+
+impl PartStat {
+    fn media_ms(&self) -> u64 {
+        self.ms_by_track.values().copied().max().unwrap_or(0)
+    }
+
+    /// No claimed time (nothing to check) or one that fits the bytes.
+    fn plausible(&self) -> bool {
+        let ms = self.media_ms();
+        if ms == 0 {
+            return true;
+        }
+        let per_sec = u128::from(self.bytes) * 1000 / u128::from(ms);
+        (u128::from(MIN_BYTES_PER_SEC)..=u128::from(MAX_BYTES_PER_SEC)).contains(&per_sec)
+    }
 }
 
 /// The ffmpeg input of one chosen (`SourceBuffer`, part) in timeline order,
@@ -4184,6 +4236,87 @@ mod tests {
             shape,
             vec![(Some(2), vec![0, 9]), (Some(1), vec![5]), (None, vec![1])]
         );
+    }
+
+    /// A row of a part for the selection tests: `len` bytes claiming `dur_ms`.
+    fn claim(part: u32, len: u64, dur_ms: Option<u64>) -> IndexRow {
+        IndexRow {
+            part,
+            dur: dur_ms,
+            ..row(0, len, false, Some(0), None)
+        }
+    }
+
+    fn init_row(part: u32) -> IndexRow {
+        IndexRow {
+            part,
+            ..row(0, 10, true, None, None)
+        }
+    }
+
+    fn ranked_parts(rows: &[IndexRow]) -> Vec<u32> {
+        let refs: Vec<&IndexRow> = rows.iter().collect();
+        pick_parts(&refs)[0].ranked.iter().map(|r| r.0).collect()
+    }
+
+    /// Bytes alone do not decide: a padded part (many bytes, little time) and a
+    /// part whose claimed time the bytes cannot carry rank after a real one.
+    #[test]
+    fn the_part_selection_checks_bytes_against_time() {
+        let rows = [
+            init_row(0),
+            claim(0, 500_000, Some(10_000)), // 50 kB/s: plausible
+            init_row(1),
+            claim(1, 900_000_000, Some(1_000)), // padded: 900 MB/s
+            init_row(2),
+            claim(2, 1_000, Some(3_600_000)), // an hour in 1 kB: inflated time
+        ];
+        let ranked = ranked_parts(&rows);
+        assert_eq!(ranked[0], 0, "the real part first");
+        assert_eq!(ranked.len(), 3, "the others stay available as fallbacks");
+    }
+
+    /// Among plausible parts the one with more media time wins, even with
+    /// fewer bytes (a low quality that ran longer).
+    #[test]
+    fn the_part_selection_prefers_more_media_time() {
+        let rows = [
+            init_row(0),
+            claim(0, 4_000_000, Some(20_000)),
+            init_row(1),
+            claim(1, 1_000_000, Some(60_000)),
+        ];
+        assert_eq!(ranked_parts(&rows), vec![1, 0]);
+    }
+
+    /// Without durations nothing can be checked: the most bytes, as before.
+    #[test]
+    fn the_part_selection_falls_back_to_bytes() {
+        let rows = [
+            init_row(0),
+            claim(0, 1_000, None),
+            init_row(1),
+            claim(1, 9_000, None),
+        ];
+        assert_eq!(ranked_parts(&rows), vec![1, 0]);
+    }
+
+    /// The tracks of a `SourceBuffer` run in parallel: their times are not
+    /// added up.
+    #[test]
+    fn the_part_selection_does_not_add_up_tracks() {
+        let track = |part: u32, t: u32, len: u64, ms: u64| IndexRow {
+            track: Some(t),
+            ..claim(part, len, Some(ms))
+        };
+        let rows = [
+            init_row(0),
+            track(0, 1, 500_000, 10_000),
+            track(0, 2, 500_000, 10_000),
+            init_row(1),
+            track(1, 1, 700_000, 12_000),
+        ];
+        assert_eq!(ranked_parts(&rows), vec![1, 0], "12 s beats 10 s, not 20 s");
     }
 
     #[test]
