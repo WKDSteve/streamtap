@@ -858,6 +858,13 @@ const HEAD_BOXES: [&[u8; 4]; 5] = [b"styp", b"sidx", b"ssix", b"emsg", b"prft"];
 
 /// A media append made only of complete boxes that go in front of samples
 /// (a `styp` appended on its own).
+/// The payload opens like media, not like the rest of an init: a `moof`,
+/// `styp` or `mdat` box, or a `WebM` `Cluster`.
+fn opens_like_media(payload: &[u8]) -> bool {
+    matches!(payload.get(4..8), Some(b"moof" | b"styp" | b"mdat"))
+        || payload.starts_with(&[0x1f, 0x43, 0xb6, 0x75])
+}
+
 fn is_segment_head(payload: &[u8]) -> bool {
     let boxes = boxes_in(payload, 0, payload.len());
     boxes
@@ -1346,8 +1353,7 @@ impl TrackState {
     /// into a new part (or the first, still empty one).
     fn decide_init(&mut self, hash: u64, dir: &Path, sb: u32) -> io::Result<bool> {
         self.skip_tail = false;
-        let after_refusal = std::mem::take(&mut self.pending_after_refusal);
-        if self.init_hash == Some(hash) && !after_refusal {
+        if self.init_hash == Some(hash) {
             // Same init again (player re-appends after a seek).
             self.dupes += 1;
             return Ok(false);
@@ -1637,7 +1643,7 @@ impl Session {
             return Ok(false);
         }
         // Read before `take_pending` resets them.
-        let after_refusal = track.pending_after_refusal;
+        let after_refusal = std::mem::take(&mut track.pending_after_refusal);
         let done = track.pending_done;
         let (chunks, whole) = track.take_pending();
         // Each chunk was scanned on its own; markers split across chunks (a
@@ -1660,7 +1666,6 @@ impl Session {
                 );
             }
             track.refused = true;
-            track.pending_after_refusal = false;
             track.skipped += chunks.len() as u64;
             self.remember_refusal(sb, true);
             return Ok(false);
@@ -1883,7 +1888,10 @@ impl Session {
         // is media (a segment cut inside its moof), not init bytes.
         let continuation = !h.is_init
             && h.tfdt.is_none()
-            && (h.init_cont || (!track.pending.is_empty() && !track.pending_done));
+            && (h.init_cont
+                || (!track.pending.is_empty()
+                    && !track.pending_done
+                    && !opens_like_media(payload)));
 
         if payload_encrypted(h, payload, continuation, track.init_kind) {
             self.refuse_encrypted(h.sb);
@@ -6351,6 +6359,21 @@ built with gcc"),
         v.extend(mp4_box(*b"styp", b"msdh"));
         v.extend(&moof(0)[..12]); // header says 40 bytes, 12 arrived
         assert_eq!(init_prefix_len(Container::Mp4, &v), Some(init.len()));
+    }
+
+    /// A cut `moof` without `tfdt` in its own append, arriving while an init
+    /// is still incomplete, is media: it must not join the init (and its
+    /// hash, and the DRM scan of the init).
+    #[test]
+    fn an_untimed_moof_does_not_join_an_incomplete_init() {
+        let mut s = session("moofnotinit");
+        write(&mut s, &seg(1, true, None, None), b"IN");
+        let cut = moof(0)[..12].to_vec(); // header says 40 bytes, 12 arrived
+        write(&mut s, &seg(1, false, None, None), &cut);
+        let rows = index_rows(&s.dir);
+        assert_eq!(rows[0]["is_init"], true);
+        assert_eq!(rows[0]["len"], 2, "the init is just its own bytes");
+        assert_eq!(rows[1]["is_init"], false, "the cut moof is media");
     }
 
     #[test]
