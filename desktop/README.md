@@ -214,8 +214,9 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   may cost a sorted copy and an ffprobe run. The init is checked (complete
   `moov`, starts like media) before anything is sorted, and the sorted copy
   of a part that is left out is removed. A fallback part that fails only
-  when the parts are laid out again (see below) leaves its SourceBuffer out,
-  which is said; no further part of it is tried then. The other parts are
+  when the parts are laid out again (see below) is replaced by the next
+  candidate of its SourceBuffer (within the same limit of 3 fallbacks); only
+  when none is left, the SourceBuffer is left out, which is said. The other parts are
   named in a warning and left out (spike limit).
 - **Order:** the sink writes in arrival order. Unless the part already is
   init-first and in timeline order, `mux` writes `sbN.pM.sorted.bin`: the
