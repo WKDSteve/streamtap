@@ -3195,21 +3195,99 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
     let best: Vec<(u32, u32)> = picked.iter().map(|c| (c.sb, c.ranked[0].0)).collect();
     let layouts = seq_layouts(dir, rows, &best);
     let mut lift = seq_lift(rows, &layouts, &best);
+    let chooser = PartPicker {
+        dir,
+        stored: &stored,
+        layouts: &layouts,
+    };
     let mut inputs = Vec::new();
     let mut muxed = Vec::new();
     for c in &picked {
+        if let Some((i, input)) = chooser.select(c, 0, lift, &mut prober)? {
+            inputs.push(input);
+            muxed.push((c.sb, c.ranked[i].0));
+        }
+    }
+    // A part left out above must not move the others: once more without it.
+    // A part can fail only now (the new lift makes it read rows the raw file
+    // served before); the next candidate of its SourceBuffer is tried then,
+    // and the lift is worked out again until it holds for the parts actually
+    // muxed. Every round either ends or moves a SourceBuffer to a later
+    // candidate (or drops it), so this ends.
+    loop {
+        let muxed_lift = seq_lift(rows, &layouts, &muxed);
+        if muxed_lift == lift {
+            break;
+        }
+        eprintln!(
+            "mux: a part left out set how far to move the others; laid out again without it (this replaces the lines above)"
+        );
+        lift = muxed_lift;
+        inputs.clear();
+        let mut kept = Vec::new();
+        for &p in &muxed {
+            let c = picked.iter().find(|c| c.sb == p.0).expect("picked");
+            let at = c.ranked.iter().position(|r| r.0 == p.1).expect("ranked");
+            match chooser.select(c, at, lift, &mut prober) {
+                Ok(Some((i, input))) => {
+                    inputs.push(input);
+                    kept.push((p.0, c.ranked[i].0));
+                }
+                Ok(None) => eprintln!("mux: sb{} left out after the new layout", p.0),
+                Err(e) => return Err(e),
+            }
+        }
+        muxed = kept;
+    }
+    if lift > 0 {
+        eprintln!(
+            "mux: the earliest frame would decode {:.3} s before 0; every SourceBuffer is moved later by that",
+            Duration::from_nanos(lift.unsigned_abs()).as_secs_f64()
+        );
+    }
+    if inputs.is_empty() {
+        return Err(SinkError::Capture("nothing decodable to mux".into()));
+    }
+    Ok(MuxPlan {
+        inputs,
+        warnings: prober.warnings,
+    })
+}
+
+/// What `mux_inputs` needs to turn one part into an ffmpeg input.
+struct PartPicker<'a> {
+    dir: &'a Path,
+    stored: &'a [&'a IndexRow],
+    layouts: &'a HashMap<u32, SeqMoves>,
+}
+
+impl PartPicker<'_> {
+    /// The first part of `c` from candidate `from` on that can be muxed, with
+    /// its place in `c.ranked`. The largest part may not decode (a cut init,
+    /// garbled bytes): the next one by size then, rather than none of this
+    /// `SourceBuffer`. Only a few: each try may cost a sorted copy and an
+    /// ffprobe run. A fallback that cannot be read (a truncated part) is left
+    /// out like one that does not decode; the largest part's error still ends
+    /// the mux.
+    fn select(
+        &self,
+        c: &Candidates,
+        from: usize,
+        lift: i64,
+        prober: &mut Prober<'_>,
+    ) -> Result<Option<(usize, MuxInput)>, SinkError> {
         let sb = c.sb;
-        // The largest part may not decode (a cut init, garbled bytes): the
-        // next one by size then, rather than none of this SourceBuffer. Only
-        // a few: each try may cost a sorted copy and an ffprobe run.
         let tries = c.ranked.len().min(1 + MAX_FALLBACK_PARTS);
-        for (i, (part, bytes, mime)) in c.ranked.iter().take(tries).enumerate() {
-            let p = (sb, *part);
-            let outcome = match part_input(dir, &stored, &layouts, p, lift, &mut prober) {
+        for (i, (part, bytes, mime)) in c.ranked.iter().enumerate().take(tries).skip(from) {
+            let outcome = match part_input(
+                self.dir,
+                self.stored,
+                self.layouts,
+                (sb, *part),
+                lift,
+                prober,
+            ) {
                 Ok(v) => v,
-                // A fallback that cannot be read (a truncated part) is left
-                // out like one that does not decode; the largest part's
-                // error still ends the mux, as before.
                 Err(e) if i > 0 => {
                     eprintln!("mux: {e}; skipped");
                     None
@@ -3238,59 +3316,10 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
                     printable(mime, 120)
                 );
             }
-            inputs.push(input);
-            muxed.push(p);
-            break;
+            return Ok(Some((i, input)));
         }
+        Ok(None)
     }
-    // A part left out above must not move the others: once more without it.
-    // A part can fail only now (the new lift makes it read rows the raw file
-    // served before); it is left out like above, so the lift is worked out
-    // again until it holds for the parts actually muxed. Each further round
-    // has fewer parts, so this ends.
-    loop {
-        let muxed_lift = seq_lift(rows, &layouts, &muxed);
-        if muxed_lift == lift {
-            break;
-        }
-        eprintln!(
-            "mux: a part left out set how far to move the others; laid out again without it (this replaces the lines above)"
-        );
-        lift = muxed_lift;
-        inputs.clear();
-        let mut kept = Vec::new();
-        for &p in &muxed {
-            match part_input(dir, &stored, &layouts, p, lift, &mut prober) {
-                Ok(Some(input)) => {
-                    inputs.push(input);
-                    kept.push(p);
-                }
-                // Its SourceBuffer is then left out: no further part of it
-                // is tried at this point.
-                Ok(None) => eprintln!("mux: sb{} left out after the new layout", p.0),
-                // As above: a fallback is left out, the largest part's
-                // error ends the mux.
-                Err(e) if !best.contains(&p) => {
-                    eprintln!("mux: {e}; sb{} left out after the new layout", p.0);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        muxed = kept;
-    }
-    if lift > 0 {
-        eprintln!(
-            "mux: the earliest frame would decode {:.3} s before 0; every SourceBuffer is moved later by that",
-            Duration::from_nanos(lift.unsigned_abs()).as_secs_f64()
-        );
-    }
-    if inputs.is_empty() {
-        return Err(SinkError::Capture("nothing decodable to mux".into()));
-    }
-    Ok(MuxPlan {
-        inputs,
-        warnings: prober.warnings,
-    })
 }
 
 /// Runs ffprobe per part and collects what went wrong with ffprobe itself.
@@ -5452,6 +5481,72 @@ mod tests {
         assert!(
             plan.inputs[0].path.ends_with("sb1.p0.bin"),
             "sb1 not moved by the parts left out: {plan:?}"
+        );
+    }
+
+    /// The fallback that fails in the relayout does not take its `SourceBuffer`
+    /// down: the next candidate (small, clean) is tried with the new lift.
+    #[test]
+    fn a_relayout_failure_tries_the_next_candidate_of_the_sourcebuffer() {
+        let dir = temp_dir("relayoutnext");
+        let cut = init_with_traks(0);
+        let largest = |dir: &Path, tso: Option<f64>| {
+            let mut r = write_part_rows(dir, 1, &cut, &[(Some(&[0u8; 64]), 64, 0)]);
+            r[1].len = 20_000;
+            r[1].tso = tso;
+            r
+        };
+        let m2 = moof(2000);
+        let mut rows = largest(&dir, None);
+        rows.extend(write_part_rows(
+            &dir,
+            0,
+            &init_with_traks(1),
+            &[(Some(&m2), m2.len() as u64, 2000), (None, 10_000, 3000)],
+        ));
+        // A small, clean part of the same SourceBuffer, ranked last.
+        rows.extend(write_part_rows(
+            &dir,
+            2,
+            &init_with_traks(1),
+            &[(Some(&moof(0)), 32, 0)],
+        ));
+        for r in &mut rows {
+            r.sb = 2;
+            if r.part == 0 && !r.is_init {
+                r.tso = Some(-10.0);
+            }
+        }
+        for part in 0..3 {
+            fs::rename(
+                dir.join(format!("sb1.p{part}.bin")),
+                dir.join(format!("sb2.p{part}.bin")),
+            )
+            .expect("rename");
+        }
+        rows.extend(largest(&dir, Some(-10.0)));
+        rows.extend(write_part_rows(
+            &dir,
+            0,
+            &init_with_traks(1),
+            &[(Some(&moof(0)), 32, 0)],
+        ));
+        let plan = mux_inputs(&dir, &rows, &tools_without(Tool::Ffprobe)).expect("plan");
+        let names: Vec<_> = plan
+            .inputs
+            .iter()
+            .map(|i| {
+                i.path
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(names.contains(&"sb1.p0.bin".to_string()), "{names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with("sb2.p2")),
+            "sb2 muxed through its small part: {names:?}"
         );
     }
 
