@@ -99,7 +99,7 @@
   // Returns { boxes: [...top-level types], isInit, tfdt, timescale, samples, duration }
   const parseIsoBmff = (u8) => {
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-    const out = { boxes: [], isInit: false, tfdt: null, timescale: null, samples: 0, duration: 0, encrypted: false };
+    const out = { boxes: [], isInit: false, tfdt: null, track: null, timescale: null, samples: 0, duration: 0, encrypted: false };
 
     const walk = (start, end, depth) => {
       eachBox(u8, dv, start, end, (type, header, bodyStart, bodyEnd) => {
@@ -168,6 +168,9 @@
       out.encrypted = hasAnyFourcc(u8, out.moov[0], out.moov[1], ENCRYPTION_FOURCCS);
     }
     out.moovComplete = !!out.moov;
+    // The track whose tfdt and duration these are (the first traf's tfhd):
+    // an append may begin with another track than the one before it.
+    out.track = out._firstTrack ?? null;
     delete out._defaultDuration;
     delete out._track;
     delete out._firstTrack;
@@ -688,6 +691,7 @@
       initLen,
       boxes: parsed ? parsed.boxes : [],
       tfdt: parsed ? parsed.tfdt : null,
+      track: parsed ? parsed.track ?? null : null,
       timescale: ts,
       dur: parsed && parsed.duration ? parsed.duration : null,
       tso,

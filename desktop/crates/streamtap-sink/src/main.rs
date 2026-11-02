@@ -450,6 +450,10 @@ struct SegmentHeader {
     /// extension sends it as a decimal string (JS numbers lose precision).
     #[serde(default, deserialize_with = "de_opt_u64")]
     tfdt: Option<u64>,
+    /// Track ID (`tfhd`) of the first fragment: the track `tfdt` and `dur`
+    /// belong to. An append may begin with another track than the one before.
+    #[serde(default)]
+    track: Option<u32>,
     #[serde(default)]
     timescale: Option<u32>,
     /// Duration of the append's first track in `timescale` ticks, if known.
@@ -501,6 +505,8 @@ struct IndexLine<'a> {
     /// Init bytes: an init segment or the continuation of one.
     is_init: bool,
     tfdt: Option<u64>,
+    /// Track ID the `tfdt` belongs to (`SegmentHeader::track`).
+    track: Option<u32>,
     timescale: Option<u32>,
     dur: Option<u64>,
     tso: Option<f64>,
@@ -1605,6 +1611,7 @@ impl Session {
             len: payload.len(),
             is_init: as_init,
             tfdt: if as_init { None } else { h.tfdt },
+            track: if as_init { None } else { h.track },
             timescale: h.timescale,
             dur: if as_init { None } else { h.dur },
             tso: h.tso.filter(|v| v.is_finite()),
@@ -1993,6 +2000,7 @@ impl Session {
             len,
             is_init: false,
             tfdt: h.tfdt,
+            track: h.track,
             timescale: h.timescale,
             dur: h.dur,
             tso: h.tso.filter(|v| v.is_finite()),
@@ -2046,6 +2054,8 @@ struct IndexRow {
     len: u64,
     is_init: bool,
     tfdt: Option<u64>,
+    #[serde(default)]
+    track: Option<u32>,
     timescale: Option<u32>,
     #[serde(default)]
     dur: Option<u64>,
@@ -2594,6 +2604,47 @@ fn report_gaps(sb: u32, part: u32, segs: &[(i128, Option<u64>)], ts: u32) {
     }
 }
 
+/// The rows split by the track their `tfdt` belongs to, each group in the
+/// given order; groups in order of first appearance. Rows without a track ID
+/// (older captures, `WebM`) share one group.
+fn by_track(rows: Vec<&IndexRow>) -> Vec<(Option<u32>, Vec<&IndexRow>)> {
+    let mut groups: Vec<(Option<u32>, Vec<&IndexRow>)> = Vec::new();
+    for r in rows {
+        match groups.iter_mut().find(|(t, _)| *t == r.track) {
+            Some((_, g)) => g.push(r),
+            None => groups.push((r.track, vec![r])),
+        }
+    }
+    groups
+}
+
+/// Drops the segments earlier ones cover and reports gaps, per track: an
+/// append that begins with another track of the `SourceBuffer` carries that
+/// track's time and duration. `order` is sorted by start; the result is too.
+/// Returns the kept rows and the counts of covered and partial overlaps.
+fn cover_and_gaps<'a>(
+    order: Vec<&'a IndexRow>,
+    pts: &dyn Fn(&IndexRow) -> i128,
+    (sb, part): (u32, u32),
+    track_ts: &HashMap<u32, u32>,
+    ts: Option<u32>,
+) -> (Vec<&'a IndexRow>, usize, usize) {
+    let (mut covered, mut partial) = (0, 0);
+    let mut merged = Vec::with_capacity(order.len());
+    for (track, group) in by_track(order) {
+        let (kept, c, p) = drop_covered(group, pts);
+        (covered, partial) = (covered + c, partial + p);
+        let scale = track.and_then(|t| track_ts.get(&t).copied()).or(ts);
+        if let Some(scale) = scale {
+            let segs: Vec<(i128, Option<u64>)> = kept.iter().map(|r| (pts(r), r.dur)).collect();
+            report_gaps(sb, part, &segs, scale);
+        }
+        merged.extend(kept);
+    }
+    merged.sort_by_key(|r| (pts(r), std::cmp::Reverse(r.dur.unwrap_or(0))));
+    (merged, covered, partial)
+}
+
 /// Leaves out segments (sorted by start) that earlier ones fully cover, when
 /// every segment has a duration. Returns the kept ones and the counts of
 /// covered and partially overlapping segments.
@@ -2726,11 +2777,7 @@ fn ordered_part(
         // Longer first at the same start, so the shorter one is the covered one.
         order.sort_by_key(|r| (pts(r), std::cmp::Reverse(r.dur.unwrap_or(0))));
         let (covered, partial);
-        (order, covered, partial) = drop_covered(order, &pts);
-        if let Some(ts) = ts {
-            let segs: Vec<(i128, Option<u64>)> = order.iter().map(|r| (pts(r), r.dur)).collect();
-            report_gaps(sb, part, &segs, ts);
-        }
+        (order, covered, partial) = cover_and_gaps(order, &pts, (sb, part), &track_ts, ts);
         if covered > 0 || partial > 0 {
             eprintln!(
                 "mux: sb{sb}.p{part}: {covered} segment(s) fully covered by others left out, {partial} partial overlap(s) kept (frames may repeat there)"
@@ -3697,6 +3744,7 @@ mod tests {
             len,
             is_init,
             tfdt,
+            track: None,
             timescale: Some(1000),
             dur: None,
             tso,
@@ -4097,6 +4145,47 @@ mod tests {
         assert_eq!(got.len(), 4 + 32, "init + the full segment only");
     }
 
+    /// Segments of two tracks that cover the same time are not each other's
+    /// duplicates: the track ID of the first traf keeps them apart.
+    #[test]
+    fn coverage_is_per_track() {
+        let dir = temp_dir("pertrack");
+        let (a, b) = (moof(0), moof(0));
+        let mut rows = write_part(
+            &dir,
+            &[
+                (b"INIT", true, None, None),
+                (&a, false, Some(0), None),
+                (&b, false, Some(0), None),
+            ],
+        );
+        rows[1].dur = Some(1000);
+        rows[2].dur = Some(1000);
+        // Without a track ID the second one looks like a re-fetch.
+        assert_eq!(order(&dir, &rows).0.len(), 4 + 32, "same track: covered");
+        rows[1].track = Some(1);
+        rows[2].track = Some(2);
+        assert_eq!(order(&dir, &rows).0.len(), 4 + 64, "two tracks: both kept");
+    }
+
+    #[test]
+    fn by_track_keeps_order_inside_and_first_seen_between_groups() {
+        let mk = |track: Option<u32>, tfdt: u64| IndexRow {
+            track,
+            ..row(0, 1, false, Some(tfdt), None)
+        };
+        let rows = [mk(Some(2), 0), mk(Some(1), 5), mk(Some(2), 9), mk(None, 1)];
+        let groups = by_track(rows.iter().collect());
+        let shape: Vec<(Option<u32>, Vec<u64>)> = groups
+            .iter()
+            .map(|(t, g)| (*t, g.iter().filter_map(|r| r.tfdt).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(Some(2), vec![0, 9]), (Some(1), vec![5]), (None, vec![1])]
+        );
+    }
+
     #[test]
     fn gap_report_survives_huge_steps() {
         let untimed = |starts: &[i128]| -> Vec<(i128, Option<u64>)> {
@@ -4290,6 +4379,7 @@ mod tests {
             init_cont: false,
             kind: "mp4".into(),
             tfdt,
+            track: None,
             timescale: Some(1000),
             dur: None,
             tso,

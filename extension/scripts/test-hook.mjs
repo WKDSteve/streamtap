@@ -125,6 +125,11 @@ const twoTrafs = Buffer.concat([
 ]);
 sb.appendBuffer(ab(twoTrafs));
 check(last().tfdt === 1000, "the first traf's tfdt is kept");
+check(last().track === 1, "the first traf's track ID travels with it");
+sb.appendBuffer(
+  ab(Buffer.concat([box("moof", box("traf", tfhd(2), tfdt(7))), box("mdat", Buffer.from("x"))])),
+);
+check(last().tfdt === 7 && last().track === 2, "an append that begins with the other track says so");
 
 // Above 2^53 the tfdt goes as an exact decimal string.
 sb.appendBuffer(ab(media("18446744073709551615", 1)));

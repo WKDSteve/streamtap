@@ -88,6 +88,7 @@
     if (m.tfdt != null && !isTfdt(m.tfdt)) return null;
     if (m.timescale != null && !isId(m.timescale)) return null;
     if (m.dur != null && !isU64(m.dur)) return null;
+    if (m.track != null && !isId(m.track)) return null;
     if (m.tso != null && !isNum(m.tso)) return null;
     if (m.initLen != null && !(isU64(m.initLen) && m.initLen > 0)) return null;
     return {
@@ -101,6 +102,8 @@
       initLen: m.isInit === true && m.initLen != null ? m.initLen : null,
       kind: str(m.kind, 16),
       tfdt: m.tfdt ?? null,
+      // Track ID of the first traf: the track tfdt and dur belong to.
+      track: m.track ?? null,
       timescale: m.timescale ?? null,
       dur: m.dur ?? null,
       tso: m.tso ?? null,
@@ -256,7 +259,7 @@
     let init = { header, payload };
     if (header.initLen && header.initLen < payload.byteLength) {
       init = {
-        header: { ...header, tfdt: null, dur: null, initLen: null },
+        header: { ...header, tfdt: null, track: null, dur: null, initLen: null },
         payload: payload.slice(0, header.initLen),
       };
     }
@@ -309,7 +312,7 @@
       // is dropped like any media.
       stats.dropped++;
       payload = payload.slice(0, header.initLen);
-      header = { ...header, tfdt: null, dur: null, initLen: null };
+      header = { ...header, tfdt: null, track: null, dur: null, initLen: null };
       size = payload.byteLength;
     } else if (!room(size, initBytes)) {
       stats.dropped++;

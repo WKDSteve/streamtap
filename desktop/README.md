@@ -69,7 +69,7 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
   see "Connection state" below), `sbN.pM.bin` (one file
   per SourceBuffer `N` and init-segment part `M`) and `index.jsonl` (one line
   per written segment, written in one call: offset, length, MediaSource,
-  `tfdt`, timescale, duration, `timestampOffset`, sequence mode, MIME). The
+  `tfdt`, the track ID it belongs to, timescale, duration, `timestampOffset`, sequence mode, MIME). The
   extension opens one connection per MediaSource, so one directory is one
   video.
 - Limits: 64 KiB JSON header, 64 MiB per message and per WebSocket frame
@@ -231,7 +231,8 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   monotonic; in a SourceBuffer with several tracks each `traf` is moved in
   its own track's timescale (from the init's `tkhd`/`mdhd`). With durations
   on all segments, one that earlier ones fully cover (an LL-HLS full segment
-  after its parts) is left out; partial overlaps are kept and counted (frames
+  after its parts) is left out, per track (the track ID of the append's first
+  `traf` says which; gaps are reported per track too); partial overlaps are kept and counted (frames
   may repeat there). Without durations that check cannot run, which is
   warned. Without a `tfdt` on every media segment (WebM blocks, continuation
   chunks, a segment cut inside its `moof`) the arrival order is kept, and
@@ -301,7 +302,7 @@ Headers:
 | `type` | fields | payload |
 |---|---|---|
 | `hello` | `token`, `session`, `url`, `title` | none; must be the first message |
-| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append that carried samples; an init, boxes in front of samples, a short head or a piece cut inside the head boxes, appended without samples do not use it up; the piece with the `moof`/`mdat` takes it) | the segment bytes exactly as passed to `appendBuffer` |
+| `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `track` (track ID of the first fragment: the track `tfdt` and `dur` belong to; optional, older extensions send none), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append that carried samples; an init, boxes in front of samples, a short head or a piece cut inside the head boxes, appended without samples do not use it up; the piece with the `moof`/`mdat` takes it) | the segment bytes exactly as passed to `appendBuffer` |
 | `event` | `name` (`endofstream`, `changetype`, `initlost`), `sb` | none |
 ## Test without a browser
 

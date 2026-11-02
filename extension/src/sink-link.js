@@ -38,6 +38,7 @@ const sinkSegmentHeader = (h) => ({
   initCont: h.initCont === true && h.isInit !== true,
   kind: typeof h.kind === "string" ? h.kind.slice(0, 16) : "",
   tfdt: typeof h.tfdt === "number" || typeof h.tfdt === "string" ? h.tfdt : null,
+  track: h.track ?? null,
   timescale: h.timescale ?? null,
   dur: h.dur ?? null,
   tso: h.tso ?? null,
@@ -56,7 +57,7 @@ const sinkItem = (header, payload, initLen) => {
     keep: null,
   };
   if (header.isInit && Number.isSafeInteger(initLen) && initLen > 0 && initLen < payload.byteLength) {
-    item.keep = sinkFrame({ ...header, tfdt: null, dur: null }, payload.slice(0, initLen));
+    item.keep = sinkFrame({ ...header, tfdt: null, track: null, dur: null }, payload.slice(0, initLen));
   }
   return item;
 };

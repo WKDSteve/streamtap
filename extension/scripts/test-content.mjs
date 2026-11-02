@@ -149,6 +149,17 @@ const payloadLen = (m) => Buffer.from(m.payload.split(",")[1], "base64").length;
     part && payloadLen(part) === 700 && part.header.initLen === null && part.header.tfdt === null,
     `full queue, init+media: only the init part, no media fields (got ${part && payloadLen(part)} bytes)`
   );
+  {
+    rec(2, 1, { tfdt: 5, dur: 1, track: 2 }, 100);
+    rec(2, 1, { tfdt: 6, dur: 1, track: 0 }, 100);
+    rec(2, 1, { tfdt: 7, dur: 1, track: "2" }, 100);
+    await sleep(100);
+    const timed = p.sent.filter((m) => m.t === "segment" && [5, 6, 7].includes(m.header.tfdt));
+    check(
+      timed.length === 1 && timed[0].header.tfdt === 5 && timed[0].header.track === 2,
+      `the track ID of the first traf is passed on, a forged one drops the record (got ${timed.map((m) => m.header.tfdt)})`
+    );
+  }
   const kept = links.get("2").inits.get(1);
   check(kept && kept[0].payload.byteLength === 700, "full queue, init+media: that init part is the one kept");
 }
