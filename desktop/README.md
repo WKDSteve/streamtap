@@ -150,7 +150,7 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
   first init when media came before it (the hook attached late) starts a new
   part too: that media stays alone in part 0. Beyond 64 parts a new init's
   media is skipped until a known init comes back (a page can forge inits).
-- A media segment whose (`tfdt`, `timestampOffset`, duration) was already
+- A media segment whose (`tfdt`, `timestampOffset`, duration, track ID) was already
   written for that part is skipped (players re-fetch ranges after seeks). The
   offset matters: multi-period DASH and HLS discontinuities restart `tfdt` and
   move the timeline with `timestampOffset` instead. In sequence mode

@@ -538,10 +538,12 @@ const MAX_PARTS_PER_TRACK: u32 = 64;
 /// Budget charged for each part file (its directory entry and cluster).
 const PART_FILE_COST: u64 = 4096;
 
-/// Dedupe keys: (tfdt, timestampOffset in ms, duration), or in sequence mode
-/// (payload hash, `i64::MIN`, length); each with the offset of its row in the
-/// part file (a sequence-mode duplicate points there, `Admit::Mark`).
-type SeenSet = HashMap<(u64, i64, u64), u64>;
+/// Dedupe keys: (tfdt, timestampOffset in ms, duration, track ID), or in
+/// sequence mode (payload hash, `i64::MIN`, length, 0); each with the offset
+/// of its row in the part file (a sequence-mode duplicate points there,
+/// `Admit::Mark`). The track keeps the appends of two tracks of one
+/// `SourceBuffer` that share a start and duration apart (0: no track ID).
+type SeenSet = HashMap<(u64, i64, u64, u32), u64>;
 
 #[allow(
     clippy::struct_excessive_bools,
@@ -1412,9 +1414,14 @@ impl TrackState {
         // values. A re-append after a seek has the same bytes, a new period
         // other bytes: the key there is the payload.
         let key = if h.seq_mode {
-            (fnv1a(payload), i64::MIN, payload.len() as u64)
+            (fnv1a(payload), i64::MIN, payload.len() as u64, 0)
         } else {
-            (t, tso_millis(h.tso), h.dur.unwrap_or(0))
+            (
+                t,
+                tso_millis(h.tso),
+                h.dur.unwrap_or(0),
+                h.track.unwrap_or(0),
+            )
         };
         if let Some(&offset) = self.seen.get(&key) {
             self.dupes += 1;
@@ -4317,6 +4324,28 @@ mod tests {
             track(1, 1, 700_000, 12_000),
         ];
         assert_eq!(ranked_parts(&rows), vec![1, 0], "12 s beats 10 s, not 20 s");
+    }
+
+    /// Appends of two tracks that share a start and duration are not each
+    /// other's re-fetch; the same track again is.
+    #[test]
+    fn dedupe_keeps_the_tracks_of_one_sourcebuffer_apart() {
+        let mut s = session("dedupetrack");
+        write(&mut s, &seg(1, true, None, None), &init_with_traks(2));
+        let media = |track: Option<u32>| {
+            let mut h = seg(1, false, Some(1000), None);
+            h.dur = Some(500);
+            h.track = track;
+            h
+        };
+        write(&mut s, &media(Some(1)), &moof(1000));
+        write(&mut s, &media(Some(2)), &moof(1000));
+        write(&mut s, &media(Some(1)), &moof(1000)); // re-fetch of the first
+        let media_rows = index_rows(&s.dir)
+            .into_iter()
+            .filter(|r| r["is_init"] == false)
+            .count();
+        assert_eq!(media_rows, 2, "one per track, the re-fetch dropped");
     }
 
     #[test]
