@@ -16,9 +16,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,20 @@ const DEFAULT_MAX_SESSION_GIB: u64 = 16;
 /// Default cap of bytes written by one sink process (`--max-total-gib`).
 const DEFAULT_MAX_TOTAL_GIB: u64 = 64;
 const DEFAULT_PORT: u16 = 17_650;
+/// Default time a connection has from accept to a valid `hello` (the TCP
+/// accept, the WebSocket handshake and the first message together). A client
+/// that never finishes would hold its thread for good (`--hello-timeout-secs`).
+const DEFAULT_HELLO_TIMEOUT_SECS: u64 = 10;
+/// Default silence tolerated after `hello` (`--idle-timeout-secs`). Generous: a
+/// paused video sends nothing for minutes, and that must not end the capture.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
+// A paused video must not end the capture: the default tolerates well over ten minutes of silence.
+const _: () = assert!(DEFAULT_IDLE_TIMEOUT_SECS >= 1800);
+/// Default cap of simultaneous connections, one thread each (`--max-connections`).
+/// More are closed at once, before a thread is started.
+const DEFAULT_MAX_CONNECTIONS: usize = 16;
+/// How long a write to a client that does not read may block.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Origin of the streamtap extension. Its id is fixed by the `key` in
 /// `extension/manifest.json`; the service worker owns the socket, so the
 /// handshake carries exactly this origin (SRV-03/04: compared exactly).
@@ -69,7 +83,7 @@ fn main() {
         _ => (
             "streamtap-sink",
             Err(SinkError::Usage(format!(
-                "usage:\n  streamtap-sink serve (--token-stdin | --token <token>) [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}]"
+                "usage:\n  streamtap-sink serve (--token-stdin | --token <token>) [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}] [--hello-timeout-secs {DEFAULT_HELLO_TIMEOUT_SECS}] [--idle-timeout-secs {DEFAULT_IDLE_TIMEOUT_SECS}] [--max-connections {DEFAULT_MAX_CONNECTIONS}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}]"
             ))),
         ),
     };
@@ -135,6 +149,76 @@ struct ServeConfig {
     origin: String,
     per_session: u64,
     total_max: u64,
+    limits: Limits,
+}
+
+/// The time and connection limits of `serve`.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    hello: Duration,
+    idle: Duration,
+    max_connections: usize,
+}
+
+/// A client socket with a deadline to the first `hello` and an idle timeout
+/// after it. The deadline is absolute: a client that trickles bytes does not
+/// start it over, as a plain per-read socket timeout would.
+struct Timed {
+    inner: TcpStream,
+    /// Moment by which `hello` must be in; `None` once it was.
+    deadline: Option<Instant>,
+    idle: Duration,
+}
+
+impl Timed {
+    /// The handshake and the first message share one deadline.
+    fn new(inner: TcpStream, limits: Limits) -> Self {
+        Self {
+            inner,
+            deadline: Some(Instant::now() + limits.hello),
+            idle: limits.idle,
+        }
+    }
+
+    fn arm(&self) -> io::Result<()> {
+        let wait = match self.deadline {
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                left
+            }
+            None => self.idle,
+        };
+        self.inner.set_read_timeout(Some(wait))
+    }
+}
+
+impl Read for Timed {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.arm()?;
+        self.inner.read(buf)
+    }
+}
+
+impl Write for Timed {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Counts a live connection; frees its place when the connection thread ends
+/// (or never starts).
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Reads the token for `--token-stdin`: the first line of `r`, at most
@@ -217,6 +301,24 @@ fn serve_config(args: &[String], stdin: impl Read) -> Result<ServeConfig, SinkEr
     let per_session = gib("--max-session-gib", DEFAULT_MAX_SESSION_GIB)?;
     let total_max = gib("--max-total-gib", DEFAULT_MAX_TOTAL_GIB)?;
     // Last: a bad flag ends the sink before it waits for stdin.
+    let secs = |name: &str, default: u64, max: u64| match flag(args, name)?.map(str::parse::<u64>) {
+        None => Ok(Duration::from_secs(default)),
+        Some(Ok(n)) if (1..=max).contains(&n) => Ok(Duration::from_secs(n)),
+        Some(_) => Err(SinkError::Usage(format!(
+            "{name} must be a whole number from 1 to {max}"
+        ))),
+    };
+    let hello = secs("--hello-timeout-secs", DEFAULT_HELLO_TIMEOUT_SECS, 600)?;
+    let idle = secs("--idle-timeout-secs", DEFAULT_IDLE_TIMEOUT_SECS, 86_400)?;
+    let max_connections = match flag(args, "--max-connections")?.map(str::parse::<usize>) {
+        None => DEFAULT_MAX_CONNECTIONS,
+        Some(Ok(n)) if (1..=1024).contains(&n) => n,
+        Some(_) => {
+            return Err(SinkError::Usage(
+                "--max-connections must be a whole number from 1 to 1024".into(),
+            ))
+        }
+    };
     let token = serve_token(args, stdin)?;
     Ok(ServeConfig {
         token,
@@ -225,6 +327,11 @@ fn serve_config(args: &[String], stdin: impl Read) -> Result<ServeConfig, SinkEr
         origin,
         per_session,
         total_max,
+        limits: Limits {
+            hello,
+            idle,
+            max_connections,
+        },
     })
 }
 
@@ -237,6 +344,7 @@ fn run_serve(args: &[String]) -> Result<(), SinkError> {
         origin,
         per_session,
         total_max,
+        limits,
     } = serve_config(args, io::stdin().lock())?;
     let budget = Arc::new(Budget {
         per_session,
@@ -249,25 +357,46 @@ fn run_serve(args: &[String]) -> Result<(), SinkError> {
     // Loopback only. Binding anything else is not an option, not a flag.
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| SinkError::io(format!("bind 127.0.0.1:{port} failed"), None, e))?;
+    // The port actually bound: `--port 0` lets the system pick one, and this
+    // line is the start signal a test (or a parent process) waits for.
+    let port = listener
+        .local_addr()
+        .map_err(|e| SinkError::io("cannot read the bound address", None, e))?
+        .port();
     println!(
         "streamtap-sink listening on ws://127.0.0.1:{port}  out={}  origin={origin}",
         out.display()
     );
 
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
+                if active.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    eprintln!(
+                        "connection refused: {} already open (--max-connections)",
+                        limits.max_connections
+                    );
+                    continue;
+                }
+                let slot = Slot(Arc::clone(&active));
                 let token = token.clone();
                 let out = out.clone();
                 let origin = origin.clone();
                 let budget = Arc::clone(&budget);
                 let refusals = Arc::clone(&refusals);
-                std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(s, &token, &origin, &out, &budget, &refusals)
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    let _slot = slot;
+                    if let Err(e) =
+                        handle_connection(s, &token, &origin, &out, &budget, &refusals, limits)
                     {
                         eprintln!("connection ended with error: {e}");
                     }
                 });
+                if let Err(e) = spawned {
+                    eprintln!("cannot start a connection thread: {e}");
+                }
             }
             Err(e) => eprintln!("accept failed: {e}"),
         }
@@ -904,7 +1033,7 @@ fn check_origin(
 /// The next binary message; `None` when the connection ended (closed,
 /// broken). Pings are answered, other frame types skipped.
 fn next_binary(
-    ws: &mut tungstenite::WebSocket<TcpStream>,
+    ws: &mut tungstenite::WebSocket<Timed>,
     peer: std::net::SocketAddr,
 ) -> Option<tungstenite::Bytes> {
     loop {
@@ -923,6 +1052,20 @@ fn next_binary(
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
                 return None
             }
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                let what = if ws.get_ref().deadline.is_some() {
+                    "no hello in time"
+                } else {
+                    "idle too long"
+                };
+                eprintln!("{peer}: {what}, closing");
+                return None;
+            }
             Err(e) => {
                 eprintln!("{peer}: connection error: {e}");
                 return None;
@@ -940,8 +1083,11 @@ fn handle_connection(
     out: &Path,
     budget: &Arc<Budget>,
     refusals: &Arc<Refusals>,
+    limits: Limits,
 ) -> io::Result<()> {
     let peer = stream.peer_addr()?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    let stream = Timed::new(stream, limits);
     // tungstenite's default caps a frame at 16 MiB; segments may be up to
     // MAX_MESSAGE, so the frame and message caps follow it (plus header).
     let config = tungstenite::protocol::WebSocketConfig::default()
@@ -1010,6 +1156,8 @@ fn handle_connection(
                     printable(&url, 300)
                 );
                 session = Some(s);
+                // In: the deadline is spent, silence is judged by the idle timeout now.
+                ws.get_mut().deadline = None;
             }
             (Header::Hello { .. }, Some(_)) => {
                 eprintln!("{peer}: second hello, ignoring");
@@ -5440,6 +5588,10 @@ mod tests {
             a(&["--token-stdin", "--port", "x"]),
             a(&["--token", "t", "--token-stdin"]),
             a(&["--token-stdin", "--token", "t"]),
+            a(&["--token", "t", "--hello-timeout-secs", "0"]),
+            a(&["--token", "t", "--idle-timeout-secs", "x"]),
+            a(&["--token", "t", "--max-connections", "0"]),
+            a(&["--token", "t", "--max-connections", "5000"]),
         ] {
             let err = serve_config(&args, NoStdin).unwrap_err();
             assert_eq!(err.exit_code(), 2, "{args:?}: {err}");
@@ -5447,6 +5599,11 @@ mod tests {
         let ok = serve_config(&a(&["--port", "0", "--token", "secret"]), NoStdin).expect("valid");
         assert_eq!((ok.token.expose(), ok.port), (&b"secret"[..], 0));
         assert_eq!(ok.out, PathBuf::from("captures"));
+        assert_eq!(
+            ok.limits.hello,
+            Duration::from_secs(DEFAULT_HELLO_TIMEOUT_SECS)
+        );
+        assert_eq!(ok.limits.max_connections, DEFAULT_MAX_CONNECTIONS);
     }
 
     /// A stdin that must not be read: `serve` reads it only for

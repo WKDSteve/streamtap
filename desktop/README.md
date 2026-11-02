@@ -27,6 +27,7 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
     [--port 17650] [--out captures]
     [--allow-origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia]
     [--max-session-gib 16] [--max-total-gib 64]
+    [--hello-timeout-secs 10] [--idle-timeout-secs 3600] [--max-connections 16]
 ```
 
 ```
@@ -79,7 +80,12 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
   (`--max-total-gib`); when either is reached the session stops for good
   (logged once). The directory is charged before it is created: once the
   process budget cannot hold another one, a new connection is closed without
-  creating anything. Empty payloads are not written. A
+  creating anything. Time and number: a connection has 10 s from accept to a
+  valid `hello` (one deadline, trickled bytes do not restart it;
+  `--hello-timeout-secs`), after it the sink tolerates an hour of silence
+  (`--idle-timeout-secs`; a paused video sends nothing for minutes), and at
+  most 16 connections are open at once, the next one is closed at once
+  (`--max-connections`). Empty payloads are not written. A
   malformed message after `hello` is skipped and logged (a page can forge the
   hook's records); more than 100 close the connection. Before `hello` any bad
   message closes it. Every way a connection ends prints the per-SourceBuffer
