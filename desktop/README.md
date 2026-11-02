@@ -185,7 +185,7 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   before any work with "ffmpeg not found on PATH". A missing ffprobe is a
   warning, said once (also when it exists but cannot be started): the parts are then not checked for decodability and
   are aligned by the capture's own timestamps (without B-frame offsets and
-  edit lists). ffprobe timing out on a part is a warning for that part.
+  edit lists). ffprobe timing out on a part is a warning for that part; after 3 timeouts in a row the remaining parts are not probed (one more warning).
 - **Exit codes:** `0` ok, `1` file or socket error, `2` usage, `3` the capture
   holds nothing to mux, `4` ffmpeg missing or not startable (a missing ffprobe is only a warning), `5` a tool
   timed out or exceeded its output limit, `6` ffmpeg failed (its stderr tail is

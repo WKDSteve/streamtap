@@ -3165,6 +3165,7 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
     let mut prober = Prober {
         tools,
         missing: false,
+        timeouts: 0,
         warnings: Vec::new(),
     };
     let picked = pick_parts(&stored);
@@ -3274,11 +3275,17 @@ fn mux_inputs(dir: &Path, rows: &[IndexRow], tools: &Tools) -> Result<MuxPlan, S
 /// Runs ffprobe per part and collects what went wrong with ffprobe itself.
 struct Prober<'a> {
     tools: &'a Tools,
-    /// Set once ffprobe turned out to be missing or not startable: not asked
-    /// again per part.
+    /// Set once ffprobe turned out to be missing or not startable, or kept
+    /// timing out: not asked again per part.
     missing: bool,
+    /// ffprobe timeouts in a row; any answer resets it.
+    timeouts: u32,
     warnings: Vec<String>,
 }
+
+/// After this many ffprobe timeouts in a row the remaining parts are not
+/// probed any more: a hanging ffprobe would cost `PROBE_TIMEOUT` per part.
+const MAX_PROBE_TIMEOUTS: u32 = 3;
 
 impl Prober<'_> {
     /// Records a warning once: a relayout round probes the same part again.
@@ -3294,22 +3301,43 @@ impl Prober<'_> {
             return None;
         }
         match probe_start(self.tools, format, path) {
-            Ok(p) => Some(p),
+            Ok(p) => {
+                self.timeouts = 0;
+                Some(p)
+            }
+            Err(e) => {
+                self.note_error(&e, name);
+                None
+            }
+        }
+    }
+
+    /// Records a failed probe; decides whether ffprobe is asked again.
+    fn note_error(&mut self, e: &SinkError, name: &str) {
+        match e {
             // Missing or not startable: the same for every part, so said
             // once and not tried again (ENG-13).
-            Err(e @ (SinkError::ToolMissing { .. } | SinkError::ToolSpawn { .. })) => {
+            SinkError::ToolMissing { .. } | SinkError::ToolSpawn { .. } => {
                 self.missing = true;
                 self.warn(format!(
                     "{e}. Without it the parts are not checked for decodability and are aligned by the capture's own timestamps (B-frame offsets and edit lists not counted)."
                 ));
-                None
             }
-            Err(e) => {
+            SinkError::ToolTimeout { .. } => {
+                self.timeouts += 1;
                 self.warn(format!(
                     "{name}: {e}; aligned by the capture's own timestamps"
                 ));
-                None
+                if self.timeouts >= MAX_PROBE_TIMEOUTS {
+                    self.missing = true;
+                    self.warn(format!(
+                        "ffprobe timed out {MAX_PROBE_TIMEOUTS} times in a row; the remaining parts are not probed and are aligned by the capture's own timestamps"
+                    ));
+                }
             }
+            _ => self.warn(format!(
+                "{name}: {e}; aligned by the capture's own timestamps"
+            )),
         }
     }
 }
@@ -3788,11 +3816,52 @@ mod tests {
     }
 
     #[test]
+    fn a_hanging_ffprobe_is_given_up_after_a_few_timeouts() {
+        let tools = Tools::default();
+        let mut prober = Prober {
+            tools: &tools,
+            missing: false,
+            timeouts: 0,
+            warnings: Vec::new(),
+        };
+        let timeout = SinkError::ToolTimeout {
+            tool: Tool::Ffprobe,
+            after: Duration::from_secs(60),
+        };
+        for i in 0..MAX_PROBE_TIMEOUTS {
+            assert!(!prober.missing, "still asked before timeout {i}");
+            prober.note_error(&timeout, &format!("sb1.p{i}"));
+        }
+        assert!(prober.missing, "not asked any more");
+        let last = prober.warnings.last().expect("warning");
+        assert!(last.contains("timed out 3 times in a row"), "{last}");
+    }
+
+    #[test]
+    fn a_single_ffprobe_timeout_stays_a_warning_for_that_part() {
+        let tools = Tools::default();
+        let mut prober = Prober {
+            tools: &tools,
+            missing: false,
+            timeouts: 0,
+            warnings: Vec::new(),
+        };
+        let timeout = SinkError::ToolTimeout {
+            tool: Tool::Ffprobe,
+            after: Duration::from_secs(60),
+        };
+        prober.note_error(&timeout, "sb1.p0");
+        assert!(!prober.missing);
+        assert_eq!(prober.warnings.len(), 1);
+    }
+
+    #[test]
     fn a_prober_warning_is_kept_once() {
         let tools = Tools::default();
         let mut prober = Prober {
             tools: &tools,
             missing: false,
+            timeouts: 0,
             warnings: Vec::new(),
         };
         prober.warn("sb1.p0: x".into());
