@@ -18,6 +18,8 @@ pub enum SinkError {
         path: Option<PathBuf>,
         source: io::Error,
     },
+    /// The peer broke the wire protocol (bad handshake, malformed record).
+    Protocol(String),
     /// The capture holds nothing that can be muxed.
     Capture(String),
     /// The tool is not on `PATH`.
@@ -44,7 +46,7 @@ impl SinkError {
     /// The process exit code of this error (documented in the README).
     pub fn exit_code(&self) -> i32 {
         match self {
-            SinkError::Io { .. } => 1,
+            SinkError::Io { .. } | SinkError::Protocol(_) => 1,
             SinkError::Usage(_) => 2,
             SinkError::Capture(_) => 3,
             SinkError::ToolMissing { .. } | SinkError::ToolSpawn { .. } => 4,
@@ -65,7 +67,7 @@ impl SinkError {
 impl fmt::Display for SinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SinkError::Usage(m) | SinkError::Capture(m) => f.write_str(m),
+            SinkError::Usage(m) | SinkError::Capture(m) | SinkError::Protocol(m) => f.write_str(m),
             SinkError::Io {
                 what,
                 path: Some(p),
@@ -124,6 +126,7 @@ mod tests {
         let io_err = || io::Error::other("x");
         let cases = [
             (SinkError::io("read", None, io_err()), 1),
+            (SinkError::Protocol("p".into()), 1),
             (SinkError::Usage("u".into()), 2),
             (SinkError::Capture("c".into()), 3),
             (SinkError::ToolMissing { tool: Tool::Ffmpeg }, 4),

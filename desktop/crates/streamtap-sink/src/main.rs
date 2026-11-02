@@ -1084,8 +1084,35 @@ fn next_binary(
     }
 }
 
+/// The WebSocket handshake (loopback origin check, frame caps) on a fresh
+/// connection.
 // The handshake closure returns tungstenite's fixed (large) error type.
 #[allow(clippy::result_large_err)]
+fn accept_ws(
+    stream: TcpStream,
+    origin: &str,
+    limits: Limits,
+) -> Result<(tungstenite::WebSocket<Timed>, std::net::SocketAddr), SinkError> {
+    let io_err = |what: &'static str| move |e: io::Error| SinkError::io(what, None, e);
+    let peer = stream.peer_addr().map_err(io_err("peer address"))?;
+    stream
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .map_err(io_err("set write timeout"))?;
+    let stream = Timed::new(stream, limits);
+    // tungstenite's default caps a frame at 16 MiB; segments may be up to
+    // MAX_MESSAGE, so the frame and message caps follow it (plus header).
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE + MAX_HEADER + 4))
+        .max_frame_size(Some(MAX_MESSAGE + MAX_HEADER + 4));
+    let ws = tungstenite::accept_hdr_with_config(
+        stream,
+        |req: &_, resp| check_origin(origin, req, resp),
+        Some(config),
+    )
+    .map_err(|e| SinkError::Protocol(format!("{peer}: {e}")))?;
+    Ok((ws, peer))
+}
+
 fn handle_connection(
     stream: TcpStream,
     token: &Secret,
@@ -1094,21 +1121,8 @@ fn handle_connection(
     budget: &Arc<Budget>,
     refusals: &Arc<Refusals>,
     limits: Limits,
-) -> io::Result<()> {
-    let peer = stream.peer_addr()?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-    let stream = Timed::new(stream, limits);
-    // tungstenite's default caps a frame at 16 MiB; segments may be up to
-    // MAX_MESSAGE, so the frame and message caps follow it (plus header).
-    let config = tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(MAX_MESSAGE + MAX_HEADER + 4))
-        .max_frame_size(Some(MAX_MESSAGE + MAX_HEADER + 4));
-    let mut ws = tungstenite::accept_hdr_with_config(
-        stream,
-        |req: &_, resp| check_origin(origin, req, resp),
-        Some(config),
-    )
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{peer}: {e}")))?;
+) -> Result<(), SinkError> {
+    let (mut ws, peer) = accept_ws(stream, origin, limits)?;
     let mut session: Option<Session> = None;
     let mut bad_messages = 0u32;
 
@@ -1156,7 +1170,9 @@ fn handle_connection(
                     break;
                 }
                 // A spent process budget creates no further directories.
-                let Some(s) = Session::open(out, &id, &url, &title, budget, refusals)? else {
+                let Some(s) = Session::open(out, &id, &url, &title, budget, refusals)
+                    .map_err(|e| SinkError::io("open session", None, e))?
+                else {
                     eprintln!("{peer}: --max-total-gib reached, closing");
                     break;
                 };
@@ -1205,15 +1221,20 @@ fn handle_connection(
     Ok(())
 }
 
-fn split_message(data: &[u8]) -> Result<(Header, &[u8]), String> {
+fn split_message(data: &[u8]) -> Result<(Header, &[u8]), SinkError> {
     if data.len() < 4 {
-        return Err("shorter than header length field".into());
+        return Err(SinkError::Protocol(
+            "shorter than header length field".into(),
+        ));
     }
     let hlen = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if hlen > MAX_HEADER || 4 + hlen > data.len() {
-        return Err(format!("header length {hlen} out of range"));
+        return Err(SinkError::Protocol(format!(
+            "header length {hlen} out of range"
+        )));
     }
-    let header: Header = serde_json::from_slice(&data[4..4 + hlen]).map_err(|e| e.to_string())?;
+    let header: Header = serde_json::from_slice(&data[4..4 + hlen])
+        .map_err(|e| SinkError::Protocol(e.to_string()))?;
     Ok((header, &data[4 + hlen..]))
 }
 
