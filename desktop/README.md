@@ -163,7 +163,7 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
 ## Mux
 
 ```
-target/release/streamtap-sink mux captures/<dir> [--out file.mp4] [--timeout-secs 3600]
+target/release/streamtap-sink mux captures/<dir> [--out file.mp4] [--timeout-secs 3600] [--verbose]
 ```
 
 Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffset <s>] -i <part> … -map 0 -map 1 … -c copy -movflags +faststart`.
@@ -176,6 +176,9 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   killed. stdout is capped at 64 KiB (more kills the child); stderr is read
   to its end and only its last 64 KiB are kept, so a long mux that logs many
   errors is not killed for it; a failure quotes the last 4 KiB of stderr.
+  `mux --verbose` runs ffmpeg with `-loglevel warning` instead of `error`, so
+  warnings such as "Non-monotonous DTS" appear in the `ffmpeg reported` tail
+  (also bounded; the default stays quiet).
   ffmpeg writes to `out.part.mp4` next to the result and the file is renamed
   to `out.mp4` only when ffmpeg succeeded: a killed or failed mux leaves no
   truncated file and an older result in place. ffmpeg logs errors only,

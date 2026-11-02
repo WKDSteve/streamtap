@@ -83,7 +83,7 @@ fn main() {
         _ => (
             "streamtap-sink",
             Err(SinkError::Usage(format!(
-                "usage:\n  streamtap-sink serve (--token-stdin | --token <token>) [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}] [--hello-timeout-secs {DEFAULT_HELLO_TIMEOUT_SECS}] [--idle-timeout-secs {DEFAULT_IDLE_TIMEOUT_SECS}] [--max-connections {DEFAULT_MAX_CONNECTIONS}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}]"
+                "usage:\n  streamtap-sink serve (--token-stdin | --token <token>) [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}] [--hello-timeout-secs {DEFAULT_HELLO_TIMEOUT_SECS}] [--idle-timeout-secs {DEFAULT_IDLE_TIMEOUT_SECS}] [--max-connections {DEFAULT_MAX_CONNECTIONS}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}] [--verbose]"
             ))),
         ),
     };
@@ -2915,7 +2915,13 @@ fn run_mux(args: &[String], tools: &Tools) -> Result<(), SinkError> {
     for w in &plan.warnings {
         eprintln!("mux: {w}");
     }
-    run_ffmpeg(tools, &plan.inputs, &out, timeout)
+    run_ffmpeg(
+        tools,
+        &plan.inputs,
+        &out,
+        timeout,
+        args.iter().any(|a| a == "--verbose"),
+    )
 }
 
 /// Names the `SourceBuffer`s whose capture ends early because the extension
@@ -3486,13 +3492,15 @@ fn input_args(inputs: &[MuxInput]) -> Vec<Vec<String>> {
 }
 
 /// The whole ffmpeg argv of the mux. Errors only (no progress, no
-/// per-packet warnings): stderr is capped (`proc::PIPE_LIMIT`).
-fn ffmpeg_args(inputs: &[MuxInput], out: &Path) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> =
-        ["-hide_banner", "-nostats", "-loglevel", "error", "-y"]
-            .iter()
-            .map(Into::into)
-            .collect();
+/// per-packet warnings) unless `verbose` asks for warnings too (such as
+/// "Non-monotonous DTS"): stderr keeps its tail either way
+/// (`proc::PIPE_LIMIT`), so a chatty ffmpeg is not killed for it.
+fn ffmpeg_args(inputs: &[MuxInput], out: &Path, verbose: bool) -> Vec<std::ffi::OsString> {
+    let level = if verbose { "warning" } else { "error" };
+    let mut args: Vec<std::ffi::OsString> = ["-hide_banner", "-nostats", "-loglevel", level, "-y"]
+        .iter()
+        .map(Into::into)
+        .collect();
     args.extend(input_args(inputs).into_iter().flatten().map(Into::into));
     // Every stream of every input, not ffmpeg's "one best video, one best
     // audio" pick across inputs.
@@ -3510,6 +3518,7 @@ fn run_ffmpeg(
     inputs: &[MuxInput],
     out: &Path,
     timeout: Duration,
+    verbose: bool,
 ) -> Result<(), SinkError> {
     if inputs.iter().any(|i| i.start.is_none()) && inputs.len() > 1 {
         eprintln!("mux: some inputs have no start time; their alignment is ffmpeg's guess");
@@ -3519,7 +3528,7 @@ fn run_ffmpeg(
         proc::run(&Spec {
             tool: Tool::Ffmpeg,
             program: tools.program(Tool::Ffmpeg),
-            args: ffmpeg_args(inputs, part),
+            args: ffmpeg_args(inputs, part, verbose),
             extra_env: Vec::new(),
             timeout,
         })
@@ -5939,13 +5948,32 @@ built with gcc"),
     }
 
     #[test]
+    fn verbose_asks_ffmpeg_for_warnings() {
+        let inputs = [MuxInput {
+            path: PathBuf::from("v"),
+            format: "mp4",
+            start: None,
+        }];
+        let level = |verbose| -> String {
+            let args: Vec<String> = ffmpeg_args(&inputs, Path::new("out.mp4"), verbose)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let i = args.iter().position(|a| a == "-loglevel").expect("level");
+            args[i + 1].clone()
+        };
+        assert_eq!(level(false), "error");
+        assert_eq!(level(true), "warning");
+    }
+
+    #[test]
     fn ffmpeg_runs_quiet_and_maps_every_input() {
         let inputs = [MuxInput {
             path: PathBuf::from("v"),
             format: "mp4",
             start: None,
         }];
-        let args: Vec<String> = ffmpeg_args(&inputs, Path::new("out.mp4"))
+        let args: Vec<String> = ffmpeg_args(&inputs, Path::new("out.mp4"), false)
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
