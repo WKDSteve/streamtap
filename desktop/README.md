@@ -401,7 +401,7 @@ machine); `-BuildOnly` builds anywhere.
 | What | Where | `uninstall.ps1` |
 |---|---|---|
 | `streamtap-app.exe`, `streamtap-sink.exe`, `streamtap-host.exe` | `%LOCALAPPDATA%\streamtap\bin` | removed (also from the root, where the earlier layout had them); `bin` only when empty |
-| the extension, unpacked (`manifest.json`, `popup\`, `src\`; no tests, no README) | `%LOCALAPPDATA%\streamtap\extension` | removed with everything in it |
+| the extension, unpacked (`manifest.json`, `popup\`, `src\`, `icons\`; no tests, no README) | `%LOCALAPPDATA%\streamtap\extension` | removed with everything in it |
 | a copy of `uninstall.ps1`, `LICENSE`, `README.md`, `VERSION` | `%LOCALAPPDATA%\streamtap` | removed; the folder only when nothing else is in it |
 | Start menu entry `streamtap.lnk` | the user's Start menu programs folder | removed when it starts the installed app |
 | *Settings > Apps* entry (runs the installed `uninstall.ps1` with the places of this install) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\streamtap` | removed last, when its `InstallLocation` is this folder |

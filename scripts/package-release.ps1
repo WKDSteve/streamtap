@@ -7,7 +7,7 @@ Nothing is built here unless -Build asks for it (scripts\build.ps1). The zip hol
 scripts\install.ps1 installs, in the layout it installs it:
 
   bin\streamtap-app.exe, streamtap-sink.exe, streamtap-host.exe
-  extension\   the files Chrome needs (manifest.json, popup\, src\), no tests, no README, no keys
+  extension\   the files Chrome needs (manifest.json, popup\, src\, icons\), no tests, no README, no keys
   install.ps1  installs this zip's content for the current user
   uninstall.ps1, LICENSE, README.md (how to install), VERSION
 
@@ -81,7 +81,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $programs = @('streamtap-app', 'streamtap-sink', 'streamtap-host')
-# What Chrome needs from the extension folder, by type; anything else in popup\ or src\ is refused.
+# What Chrome needs from the extension folder, by type; anything else in popup\, src\ or icons\ is refused.
 $extensionTypes = @('.js', '.json', '.html', '.css', '.png', '.svg', '.ico')
 $secretTypes = @('.pem', '.key', '.crx', '.p12', '.pfx')
 
@@ -165,13 +165,13 @@ try {
 
     foreach ($name in $programs) { Copy-Into (Join-Path $BuildDir "$name.exe") "bin\$name.exe" }
 
-    # The extension: manifest.json, popup\ and src\ only (the tests in scripts\ and the README stay out).
+    # The extension: manifest.json, popup\, src\ and icons\ only (the tests in scripts\ and the README stay out).
     if (-not (Test-Path -LiteralPath (Join-Path $ExtensionDir 'manifest.json') -PathType Leaf)) {
         Exit-Package "no manifest.json in $ExtensionDir"
     }
     $extFull = (Resolve-Path -LiteralPath $ExtensionDir).ProviderPath.TrimEnd('\') + '\'
     $extFiles = @(Get-Item -LiteralPath (Join-Path $ExtensionDir 'manifest.json'))
-    foreach ($sub in 'popup', 'src') {
+    foreach ($sub in 'popup', 'src', 'icons') {
         $dir = Join-Path $ExtensionDir $sub
         if (Test-Path -LiteralPath $dir -PathType Container) {
             $extFiles += @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force)

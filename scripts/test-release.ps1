@@ -113,11 +113,11 @@ function Read-ZipEntry([string] $Path, [string] $Name) {
     finally { $archive.Dispose() }
 }
 
-# What the extension folder ships: manifest.json, popup\ and src\ (never scripts\ or the README).
+# What the extension folder ships: manifest.json, popup\, src\ and icons\ (never scripts\ or the README).
 function Get-ExtensionShipped([string] $Dir) {
     $prefix = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\') + '\'
     $files = @(Get-Item -LiteralPath (Join-Path $Dir 'manifest.json'))
-    foreach ($sub in 'popup', 'src') { $files += @(Get-ChildItem -LiteralPath (Join-Path $Dir $sub) -Recurse -File) }
+    foreach ($sub in 'popup', 'src', 'icons') { $files +=@(Get-ChildItem -LiteralPath (Join-Path $Dir $sub) -Recurse -File) }
     @($files | ForEach-Object { 'extension/' + $_.FullName.Substring($prefix.Length).Replace('\', '/') })
 }
 
@@ -310,8 +310,8 @@ try {
         if (-not $text.Contains($Old)) { throw "no '$Old' in $Path" }
         [IO.File]::WriteAllText($Path, $text.Replace($Old, $New), (New-Object Text.UTF8Encoding($false)))
     }
-    Test-ExtensionVariant 'ext icons' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"manifest_version": 3,' '"manifest_version": 3, "icons": {"16": "icons/16.png"},' } "names 'icons/16.png'" 'an icon the manifest names but the folder lacks is refused'
-    Test-ExtensionVariant 'ext default icon' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"default_title": "streamtap",' '"default_title": "streamtap", "default_icon": "icons/a.png",' } "names 'icons/a.png'" 'so is the action icon'
+    Test-ExtensionVariant 'ext icons' { param($e) Edit-Text (Join-Path $e 'manifest.json') 'icons/streamtap-128.png' 'icons/16.png' } "names 'icons/16.png'" 'an icon the manifest names but the folder lacks is refused'
+    Test-ExtensionVariant 'ext default icon' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"default_icon": {' '"default_icon": "icons/a.png", "x_icon": {' } "names 'icons/a.png'" 'so is the action icon'
     Test-ExtensionVariant 'ext css' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"src/hook.js"' '"src/hook.js"], "css": ["styles/missing.css"' } "names 'styles/missing.css'" 'so is a content script style'
     Test-ExtensionVariant 'ext war' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"manifest_version": 3,' '"manifest_version": 3, "web_accessible_resources": [{"resources": ["assets/x.js"], "matches": ["<all_urls>"]}],' } "names 'assets/x.js'" 'so is a web accessible resource'
     Test-ExtensionVariant 'ext war glob' { param($e) Edit-Text (Join-Path $e 'manifest.json') '"manifest_version": 3,' '"manifest_version": 3, "web_accessible_resources": [{"resources": ["assets/*"], "matches": ["<all_urls>"]}],' } 'pattern .assets/\*.' 'and a pattern that points outside popup and src'
