@@ -10,9 +10,19 @@
     "nativeMessaging",
     "favicon"
   ],
+  "icons": {
+    "16": "icons/streamtap-16.png",
+    "32": "icons/streamtap-32.png",
+    "48": "icons/streamtap-48.png",
+    "128": "icons/streamtap-128.png"
+  },
   "action": {
     "default_title": "streamtap",
-    "default_popup": "popup/popup.html"
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/streamtap-16.png",
+      "32": "icons/streamtap-32.png"
+    }
   },
   "background": {
     "service_worker": "src/background.js"

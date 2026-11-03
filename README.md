@@ -1,3 +1,5 @@
+![streamtap](assets/icons/streamtap/png/streamtap-128.png)
+
 # streamtap
 
 Save videos that play in your browser, tapped at the point where they are
