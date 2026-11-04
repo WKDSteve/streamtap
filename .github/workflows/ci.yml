@@ -89,6 +89,9 @@ jobs:
           persist-credentials: false
       - run: python -m unittest discover tools
       - run: python tools/check-control-chars.py
+      # Every colour of the app's UI comes from palette.css (generated from the icon by the app icons tool of the
+      # tasks vault); a hex colour or a colour function in any other stylesheet is refused. Copy of appkit's tool.
+      - run: python tools/check-color-literals.py --root desktop/crates/streamtap-app/ui --tokens desktop/crates/streamtap-app/ui/palette.css
       # The rules of the workflows (release.yml, rolling.yml, this one): actions pinned by commit, appkit's release-kit
       # on one commit, self-hosted runner only, no pull request trigger, a release stays a draft; --online asks each
       # action's repository whether its tag still names the pinned commit.

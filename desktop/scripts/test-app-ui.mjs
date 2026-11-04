@@ -87,15 +87,44 @@ for (const reason of ["exit-1", "exit-2", "exit-3", "exit-4", "exit-5", "exit-6"
 
 // ---- themes -------------------------------------------------------------
 
+// The colours come from palette.css (generated from the icon by the app icons tool): every token is
+// light-dark(<light>, <dark>). style.css writes no colour of its own; it only derives the tinted notice
+// surfaces with color-mix() in srgb, which the test computes the same way.
+const palette = read("palette.css");
 const css = read("style.css");
-const tokens = (block) => Object.fromEntries([...block.matchAll(/--([\w-]+):\s*(#[0-9a-fA-F]{6})/g)].map((m) => [m[1], m[2].toLowerCase()]));
-const light = tokens(css.match(/^:root \{([^}]*)\}/m)?.[1] ?? "");
-const darkMedia = tokens(css.match(/:root:not\(\[data-theme="light"\]\) \{([^}]*)\}/)?.[1] ?? "");
-const darkForced = tokens(css.match(/:root\[data-theme="dark"\] \{([^}]*)\}/)?.[1] ?? "");
-check(Object.keys(light).length >= 14, "light tokens found");
-check(Object.keys(darkMedia).length >= 14, "dark tokens (system) found");
-check(JSON.stringify(darkMedia) === JSON.stringify(darkForced), "the system dark and the forced dark tokens are identical");
-check(JSON.stringify(Object.keys(light).sort()) === JSON.stringify(Object.keys(darkMedia).sort()), "both themes set the same tokens");
+const light = {};
+const dark = {};
+for (const m of palette.matchAll(/--([\w-]+):\s*light-dark\(\s*(#[0-9a-fA-F]{6})\s*,\s*(#[0-9a-fA-F]{6})\s*\)/g)) {
+  light[m[1]] = m[2].toLowerCase();
+  dark[m[1]] = m[3].toLowerCase();
+}
+for (const name of ["bg", "surface", "text", "muted", "line", "accent", "accent-text", "tertiary", "focus", "ok", "warn", "bad"]) {
+  check(name in light, `palette.css has --${name}`);
+}
+check(/GENERATED/.test(palette), "palette.css is the generated file");
+check(
+  html.indexOf('href="palette.css"') >= 0 && html.indexOf('href="palette.css"') < html.indexOf('href="style.css"'),
+  "index.html loads palette.css before style.css"
+);
+check(!/#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?|oklch|oklab|lab|lch|hwb|color)\(/i.test(css.replace(/\/\*[\s\S]*?\*\//g, "")), "style.css writes no colour literal");
+const ownTokens = [...css.matchAll(/^\s*--([\w-]+):/gm)].map((m) => m[1]).sort().join(",");
+check(ownTokens === "err-bg,info-bg,warn-bg", `style.css defines only the notice surfaces (${ownTokens})`);
+for (const gone of ["--border", "--danger"]) check(!css.includes(`var(${gone})`), `style.css no longer uses ${gone}`);
+
+const mixes = [...css.matchAll(/--([\w-]+):\s*color-mix\(in srgb, var\(--([\w-]+)\) (\d+)%, var\(--([\w-]+)\)\)/g)];
+check(mixes.length === 3, "three notice surfaces are mixed");
+const mix = (a, b, p) => {
+  const ch = (h, i) => parseInt(h.slice(i, i + 2), 16);
+  return "#" + [1, 3, 5].map((i) => Math.round(ch(a, i) * p + ch(b, i) * (1 - p)).toString(16).padStart(2, "0")).join("");
+};
+for (const theme of [light, dark]) {
+  for (const [, name, a, pct, b] of mixes) theme[name] = mix(theme[a], theme[b], Number(pct) / 100);
+}
+const darkMedia = dark;
+// streamtap's accent is a red near --bad: an info notice and the muxed badge take the tertiary colour, so that
+// nothing but an error looks like one.
+check(/--info-bg: color-mix\(in srgb, var\(--tertiary\)/.test(css), "the info notice is not mixed from the red accent");
+check(/\.badge\.muxed \{ color: var\(--tertiary\)/.test(css), "the muxed badge is not red");
 
 const lum = (hex) => {
   const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
@@ -117,12 +146,13 @@ const pairs = [
   ["text", "warn-bg", 4.5, "warning notice, pairing prompt"],
   ["text", "err-bg", 4.5, "error notice, mux failed"],
   ["accent-text", "accent", 4.5, "primary buttons"],
-  ["danger", "surface", 4.5, "danger buttons, DRM badges"],
+  ["bad", "surface", 4.5, "danger buttons, DRM badges"],
   ["ok", "surface", 4.5, "live badge, connected"],
-  ["accent", "surface", 4.5, "muxed badge"],
+  ["tertiary", "surface", 4.5, "muxed badge"],
   ["bg", "text", 4.5, "toast"],
   ["text", "bg", 4.5, "inputs, selects, sink log"],
   ["focus", "surface", 3, "focus ring"],
+  ["accent", "bg", 3, "hovered button border"],
   ["focus", "bg", 3, "focus ring"],
   ["muted", "surface", 3, "stopped dot"],
 ];
