@@ -152,7 +152,7 @@ const pairs = [
   ["bg", "text", 4.5, "toast"],
   ["text", "bg", 4.5, "inputs, selects, sink log"],
   ["focus", "surface", 3, "focus ring"],
-  ["accent", "bg", 3, "hovered button border"],
+  ["accent", "surface", 3, "hovered button border (buttons sit on the bar, panels and cards)"],
   ["focus", "bg", 3, "focus ring"],
   ["muted", "surface", 3, "stopped dot"],
 ];
