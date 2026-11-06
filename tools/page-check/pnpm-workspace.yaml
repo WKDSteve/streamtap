@@ -1,0 +1,6 @@
+# Supply chain, as in the other apps: nothing younger than seven days, no downgrade of the trust level,
+# no install scripts. Playwright drives the Chrome of the machine, so no browser is downloaded.
+minimumReleaseAge: 10080
+trustPolicy: no-downgrade
+blockExoticSubdeps: true
+onlyBuiltDependencies: []

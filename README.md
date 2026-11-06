@@ -154,6 +154,7 @@ python -m unittest discover tools
 python tools/check-control-chars.py
 python tools/check-workflows.py --online          # pins, self-hosted runner, drafts only
 actionlint                                        # syntax and expressions; winget install rhysd.actionlint
+pnpm --dir tools/page-check install --frozen-lockfile; node tools/page-check.mjs tools/page-check/node_modules   # axe, light and dark
 pwsh -NoProfile -File scripts/test-install.ps1   # install/uninstall in a temp folder, fake registry root
 pwsh -NoProfile -File scripts/test-release.ps1   # the release zip: contents, checksums, install from it
 Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Error, Warning   # PSScriptAnalyzer 1.24.0

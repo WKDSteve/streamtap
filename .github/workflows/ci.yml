@@ -80,6 +80,19 @@ jobs:
       # The app UI: German and English tables match, every used key exists, both themes keep their contrast.
       - run: node desktop/scripts/test-app-ui.mjs
 
+  # The app's page in a real Chrome: axe in light and dark, also hovered and focused. Playwright and axe come at fixed
+  # versions from tools/page-check; streamtap has no other Node dependency.
+  page:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          persist-credentials: false
+      - run: node --version && pnpm --version
+      - run: pnpm --dir tools/page-check install --frozen-lockfile
+      - run: node tools/page-check.mjs tools/page-check/node_modules
+
   # A control or invisible character in a tracked text file (a backspace in a path, a bidirectional override in
   # source) is refused; the tool tests itself.
   hygiene:
