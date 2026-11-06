@@ -38,7 +38,20 @@ const bridge = () => {
     ffmpeg: "C:/ffmpeg.exe",
     config_error: "config.json could not be read",
     captures: [
-      { id: "c1", title: "A capture", url: "https://example.invalid/", state: "ended", muxed: false, bytes: 1024, drm: false },
+      {
+        id: "c1",
+        title: "A capture",
+        url: "https://example.invalid/",
+        host: "example.invalid",
+        started: 1700000000,
+        live: false,
+        muxed: false,
+        drm: false,
+        bytes: 1024,
+        segments: 3,
+        duration_ms: 4000,
+        source_buffers: [],
+      },
     ],
     captures_error: null,
     mux: {},
@@ -80,6 +93,11 @@ try {
   check("the page draws without a console error", problems.length === 0, problems.join("; "));
   const text = await page.locator("body").innerText();
   check("the stand-in's data is on the page", text.includes("A capture"), "no capture drawn: axe would check an empty page");
+
+  // The panels a click opens are part of the page.
+  await page.evaluate(() => {
+    for (const id of ["browser", "settings"]) document.getElementById(id).hidden = false;
+  });
 
   for (const theme of ["light", "dark"]) {
     await page.evaluate((name) => {
