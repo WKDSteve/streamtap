@@ -109,14 +109,27 @@ class Rules(unittest.TestCase):
         self.found(texts, "unexpected workflow file")
 
     # triggers
-    def test_a_pull_request_trigger_is_found(self):
-        self.found(sabotaged("ci.yml", "  workflow_dispatch:\n", "  workflow_dispatch:\n  pull_request:\n"), "pull request")
+    def test_a_pull_request_trigger_outside_ci_is_found(self):
+        self.found(sabotaged("rolling.yml", "on:\n", "on:\n  pull_request:\n"), "pull request")
 
-    def test_an_inline_pull_request_trigger_is_found(self):
-        self.found(sabotaged("ci.yml", "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n", "on: [push, pull_request]\n"), "pull request")
+    def test_a_pull_request_target_trigger_is_found(self):
+        self.found(sabotaged("ci.yml", "  workflow_dispatch:\n", "  workflow_dispatch:\n  pull_request_target:\n"), "pull request")
 
-    def test_a_scalar_pull_request_trigger_is_found(self):
-        self.found(sabotaged("ci.yml", "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n", "on: pull_request\n"), "pull request")
+    def test_a_ci_job_on_the_self_hosted_runner_is_found(self):
+        """Literally the self-hosted runner: a pull request would run its code on the author's machine."""
+        self.found(sabotaged("ci.yml", check.CI_RUNS_ON, "[self-hosted, windows]"), "keeps a pull request off")
+
+    def test_a_ci_job_with_another_expression_is_found(self):
+        self.found(sabotaged("ci.yml", check.CI_RUNS_ON, "${{ github.event.inputs.runner }}"), "keeps a pull request off")
+
+    def test_a_secret_in_ci_is_found(self):
+        self.found(sabotaged("ci.yml", "  CARGO_TERM_COLOR: always\n", "  CARGO_TERM_COLOR: always\n  X: ${{ secrets.X }}\n"), "reads a secret")
+
+    def test_an_inline_pull_request_target_trigger_is_found(self):
+        self.found(sabotaged("ci.yml", "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n", "on: [push, pull_request_target]\n"), "pull request")
+
+    def test_a_scalar_pull_request_target_trigger_is_found(self):
+        self.found(sabotaged("ci.yml", "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n", "on: pull_request_target\n"), "pull request")
 
     def test_a_comment_trigger_is_found(self):
         self.found(sabotaged("ci.yml", "  workflow_dispatch:\n", "  workflow_dispatch:\n  issue_comment:\n"), "outside event")
@@ -319,7 +332,7 @@ class Rules(unittest.TestCase):
         self.found(sabotaged("rolling.yml", "          expect: 1\n", "          expect: 1\n          draft: false\n"), "publishes a draft")
 
     def test_a_workflow_without_a_trigger_is_found(self):
-        self.found(sabotaged("ci.yml", "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n", ""), "no trigger")
+        self.found(sabotaged("ci.yml", "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n", ""), "no trigger")
 
     def test_a_publish_job_with_read_only_is_found(self):
         self.found(sabotaged("release.yml", "    permissions:\n      contents: write\n", "    permissions:\n      contents: read\n"), "needs contents: write")

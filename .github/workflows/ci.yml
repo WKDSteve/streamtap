@@ -1,12 +1,18 @@
 # CI of streamtap.
 #
-# Runs on a self-hosted runner (the author's Windows machine), by choice; without a running runner a push stays
-# "Queued". No `pull_request` trigger on purpose: a pull request would run its own workflow with the author's rights
-# on this machine. Checks of pull requests on GitHub-hosted runners may come later as their own legs; the repository
-# requires approval before a workflow of an outside contributor runs.
+# One pipeline, two kinds of runner, chosen per job by the event:
 #
-# Tools (rustup, cargo-audit, cargo-deny, node, python) are expected on the PATH and print their versions; the Rust
-# toolchain itself is the one desktop/rust-toolchain.toml names, so local builds and CI use the same.
+# - push and workflow_dispatch: the self-hosted runner (the author's Windows machine), by choice; without a running
+#   runner a push stays "Queued".
+# - pull_request: windows-latest, a throwaway VM with a read-only token and no secrets. A pull request never runs on the
+#   self-hosted runner: it would run its own code on the author's machine. tools/check-workflows.py holds this.
+#
+# A fork can edit this file in its pull request. The repository therefore requires approval before a workflow of an
+# outside contributor runs; never approve a pull request that touches `.github/`.
+#
+# On the self-hosted runner the tools (rustup, cargo-audit, cargo-deny, node, python) are expected on the PATH and print
+# their versions. The pull request leg installs the same versions; the steps with an `if` do only that. The Rust
+# toolchain itself is the one desktop/rust-toolchain.toml names, so local builds and both legs use the same.
 
 name: ci
 
@@ -14,6 +20,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -25,18 +33,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# `shell: bash` resolves to the WSL launcher on this machine; Git Bash is named explicitly, in 8.3 form because the
-# shell string is split at spaces.
-defaults:
-  run:
-    shell: C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+# The shell of each job: `shell: bash` resolves to the WSL launcher on the self-hosted machine, so Git Bash is named there
+# explicitly, in 8.3 form because the shell string is split at spaces; on windows-latest `bash` is Git Bash.
 
 jobs:
   rust:
-    runs-on: [self-hosted, windows]
+    runs-on: ${{ github.event_name == 'pull_request' && 'windows-latest' || fromJSON('["self-hosted","windows"]') }}
     timeout-minutes: 30
     defaults:
       run:
+        shell: ${{ github.event_name == 'pull_request' && 'bash' || 'C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}' }}
         working-directory: desktop
     steps:
       # Actions are pinned by commit; the comment names the tag.
@@ -44,6 +50,14 @@ jobs:
         with:
           persist-credentials: false
       # Installs the toolchain of rust-toolchain.toml when it is missing, then names it.
+      - if: ${{ github.event_name == 'pull_request' }}
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+      - if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 26.2.0
       - run: rustup show active-toolchain || rustup toolchain install
       - run: rustc --version && cargo --version && cargo audit --version && cargo deny --version
       # The workspace includes the Tauri app: it builds on a plain Windows runner (WebView2 is only needed to run it).
@@ -57,12 +71,19 @@ jobs:
       - run: cargo deny check
 
   extension:
-    runs-on: [self-hosted, windows]
+    runs-on: ${{ github.event_name == 'pull_request' && 'windows-latest' || fromJSON('["self-hosted","windows"]') }}
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: ${{ github.event_name == 'pull_request' && 'bash' || 'C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
         with:
           persist-credentials: false
+      - if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 26.2.0
       - run: node --version
       # Syntax of every script of the extension and of the test drivers.
       - name: node --check
@@ -83,12 +104,21 @@ jobs:
   # The app's page in a real Chrome: axe in light and dark, also hovered and focused. Playwright and axe come at fixed
   # versions from tools/page-check; streamtap has no other Node dependency.
   page:
-    runs-on: [self-hosted, windows]
+    runs-on: ${{ github.event_name == 'pull_request' && 'windows-latest' || fromJSON('["self-hosted","windows"]') }}
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: ${{ github.event_name == 'pull_request' && 'bash' || 'C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
         with:
           persist-credentials: false
+      - if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 26.2.0
+      - if: ${{ github.event_name == 'pull_request' }}
+        run: npm install --global pnpm@10.29.2
       - run: node --version && pnpm --version
       - run: pnpm --dir tools/page-check install --frozen-lockfile
       - run: node tools/page-check.mjs tools/page-check/node_modules
@@ -96,12 +126,23 @@ jobs:
   # A control or invisible character in a tracked text file (a backspace in a path, a bidirectional override in
   # source) is refused; the tool tests itself.
   hygiene:
-    runs-on: [self-hosted, windows]
+    runs-on: ${{ github.event_name == 'pull_request' && 'windows-latest' || fromJSON('["self-hosted","windows"]') }}
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: ${{ github.event_name == 'pull_request' && 'bash' || 'C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
         with:
           persist-credentials: false
+      - if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: 3.14.6
+      - if: ${{ github.event_name == 'pull_request' }}
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: actionlint@1.7.12
       - run: python -m unittest discover tools
       - run: python tools/check-control-chars.py
       # Every colour of the app's UI comes from palette.css (generated from the icon by the app icons tool of the
@@ -132,7 +173,19 @@ jobs:
       - name: PSScriptAnalyzer on the scripts
         shell: pwsh
         run: |
-          Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force
+          # The gallery is down now and then: a copy of the pinned version on the runner is enough, and a download is
+          # tried a few times.
+          $pinned = Get-Module PSScriptAnalyzer -ListAvailable | Where-Object Version -EQ '1.24.0'
+          for ($try = 1; -not $pinned -and $try -le 3; $try++) {
+              try {
+                  Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force -ErrorAction Stop
+                  $pinned = $true
+              }
+              catch {
+                  if ($try -eq 3) { throw }
+                  Start-Sleep -Seconds (20 * $try)
+              }
+          }
           # Import by version too: autoloading would take the newest copy on the runner, not the pinned one.
           Import-Module PSScriptAnalyzer -RequiredVersion 1.24.0
           (Get-Module PSScriptAnalyzer).Version

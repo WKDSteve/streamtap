@@ -90,7 +90,7 @@ jobs:
             echo "::error::the commit of the tag is not on main"
             exit 1
           fi
-          green="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq 'length')"
+          green="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push --commit "$GITHUB_SHA" --status success --json databaseId --jq 'length')"
           if [ "$green" -lt 1 ]; then
             echo "::error::no green CI run for $GITHUB_SHA: wait for it, or fix main, then tag again"
             exit 1

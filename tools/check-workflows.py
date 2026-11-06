@@ -3,8 +3,7 @@
 
     python tools/check-workflows.py [--online] [--dir .github/workflows]
 
-The workflows run on the author's self-hosted Windows runner of a private repository and publish
-releases, so a few rules are kept by a check instead of by memory. The files are read by a small
+The workflows run on the author's self-hosted Windows runner and publish releases, so a few rules are kept by a check instead of by memory. The files are read by a small
 parser of the YAML these workflows use (block mappings and lists, flow lists, block scalars; no
 anchors, no flow mappings, no multi-line plain scalars): anything it does not know is a problem, never
 a pass. The rules are then about the structure, so a comment, a different spelling of a trigger or a
@@ -14,8 +13,10 @@ renamed file does not get around them:
   * every `uses:` is pinned by a full commit and names its tag in a comment (NREL-03);
   * all actions of appkit's release-kit use the same commit (streamtap has no appkit crate, so
     this takes the place of the Cargo.lock comparison that tasks-desktop's check-appkit-pin.py does);
-  * every job runs on `[self-hosted, windows]` and has a timeout;
-  * no workflow reacts to a pull request or a comment (it would run on the author's machine);
+  * every job of release.yml and rolling.yml runs on `[self-hosted, windows]`, every job of ci.yml on
+    the one expression that gives a pull request `windows-latest`, and every job has a timeout;
+  * only ci.yml reacts to a pull request, and only to `pull_request` (no `_target`: it would run with
+    the rights of the repository); ci.yml reads no secret; no workflow reacts to a comment;
   * the token: `permissions: contents: read` for the whole workflow, `contents: write` only in the
     jobs that publish (release: publish; rolling: prepare, publish), nothing else, no write-all;
   * every checkout keeps no credentials (`persist-credentials: false`);
@@ -53,7 +54,9 @@ DRAFT_OFF = re.compile(r"draft\s*[=:]\s*['\"]?(?:false|no|off|0)\b", re.I)
 EXPECTED = ("ci.yml", "release.yml", "rolling.yml")
 # Events that hand the workflow to someone who is not the maintainer.
 OUTSIDE_EVENTS = {"pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment", "issue_comment", "issues", "discussion", "discussion_comment", "fork", "watch"}
-ALLOWED_EVENTS = {"ci.yml": {"push", "workflow_dispatch"}, "release.yml": {"push"}, "rolling.yml": {"workflow_run"}}
+ALLOWED_EVENTS = {"ci.yml": {"push", "workflow_dispatch", "pull_request"}, "release.yml": {"push"}, "rolling.yml": {"workflow_run"}}
+# The only way a job of ci.yml picks its runner: a pull request gets a throwaway VM, never the author's machine.
+CI_RUNS_ON = """${{ github.event_name == 'pull_request' && 'windows-latest' || fromJSON('["self-hosted","windows"]') }}"""
 WRITERS = {"ci.yml": set(), "release.yml": {"publish"}, "rolling.yml": {"prepare", "publish"}}
 TIP_IF = "${{ steps.tip.outputs.current == 'true' }}"
 
@@ -308,18 +311,23 @@ def check_common(name, text, wf):
     if not events:
         problems.append(f"{name}: no trigger (`on:`) found")
     for event in sorted(events):
-        if event in OUTSIDE_EVENTS:
+        if event in OUTSIDE_EVENTS and not (name == "ci.yml" and event == "pull_request"):
             problems.append(f"{name}: reacts to a pull request or an outside event ({event}); it would run on the self-hosted runner")
     if name == "ci.yml":
         for event in sorted(set(events) - ALLOWED_EVENTS["ci.yml"]):
-            problems.append(f"{name}: starts on {event}, which only push and workflow_dispatch may")
+            problems.append(f"{name}: starts on {event}, which only push, workflow_dispatch and pull_request may")
+        if "secrets." in code_of(text):
+            problems.append(f"{name}: reads a secret; a pull request runs this file")
 
     jobs = jobs_of(wf)
     if not jobs:
         problems.append(f"{name}: no jobs found")
     for job, body in jobs.items():
         runs_on = body.get("runs-on")
-        if runs_on != ["self-hosted", "windows"]:
+        if name == "ci.yml":
+            if runs_on != CI_RUNS_ON:
+                problems.append(f"{name}: job {job} runs on {runs_on or 'nothing named'}, not the expression that keeps a pull request off the self-hosted runner")
+        elif runs_on != ["self-hosted", "windows"]:
             problems.append(f"{name}: job {job} runs on {runs_on or 'nothing named'}, not [self-hosted, windows]")
         if not re.fullmatch(r"[0-9]+", str(body.get("timeout-minutes", ""))):
             problems.append(f"{name}: job {job} has no timeout-minutes")
