@@ -87,12 +87,13 @@ try {
   });
   await page.addInitScript(bridge);
   await page.goto(page_url);
-  await page.waitForFunction(() => document.querySelectorAll("button").length > 0);
-  // The page draws what the snapshot says; the first draw is done when the capture is on it.
-  await page.waitForTimeout(300);
+  // The page draws what the snapshot says; the first draw is done when the capture is on it. Without it axe would check
+  // an empty page.
+  const drawn = await page
+    .waitForFunction(() => document.body.innerText.includes("A capture"), null, { timeout: 30_000 })
+    .then(() => true, () => false);
+  check("the stand-in's data is on the page", drawn);
   check("the page draws without a console error", problems.length === 0, problems.join("; "));
-  const text = await page.locator("body").innerText();
-  check("the stand-in's data is on the page", text.includes("A capture"), "no capture drawn: axe would check an empty page");
 
   // The panels a click opens are part of the page.
   await page.evaluate(() => {

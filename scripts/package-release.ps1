@@ -144,9 +144,16 @@ foreach ($name in $programs) {
 
 # A program running from here may be halfway through replacing itself or hold what is copied; a program
 # older than the last commit is a stale build. CI builds fresh, so both are the case of a local run.
-$committed = & git -C $root log -1 --format=%ct 2>$null
-$commitTime = if ($LASTEXITCODE -eq 0 -and "$committed" -match '^\d+$') {
-    [DateTimeOffset]::FromUnixTimeSeconds([long]$committed).UtcDateTime
+# Without git (a copy of the sources) or a commit there is nothing to compare with, and that is no reason to stop.
+$commitTime = $null
+try {
+    $committed = & git -C $root log -1 --format=%ct 2>$null
+    if ($LASTEXITCODE -eq 0 -and "$committed" -match '^\d+$') {
+        $commitTime = [DateTimeOffset]::FromUnixTimeSeconds([long]$committed).UtcDateTime
+    }
+}
+catch {
+    Write-Verbose "no commit time: $_"
 }
 foreach ($name in $programs) {
     $exe = (Resolve-Path -LiteralPath (Join-Path $BuildDir "$name.exe")).ProviderPath
