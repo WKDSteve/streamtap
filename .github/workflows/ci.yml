@@ -99,6 +99,9 @@ jobs:
       - name: Workflow rules
         timeout-minutes: 3
         run: python tools/check-workflows.py --online
+      # Syntax and expressions of the workflows, which the rules above do not read. The runner has it
+      # (TOOLS/self-hosted-runner.md, `runners.ps1 check`).
+      - run: actionlint
       # scripts/install.ps1, build-install.ps1 and uninstall.ps1 against stand-in programs: install folder, Start menu folder and
       # data folders in a temp folder of the test, the registry root a throw-away HKCU key it removes; the runner's
       # own Start menu, uninstall entries and browser keys are left alone, nothing is built.

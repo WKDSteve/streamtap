@@ -274,6 +274,31 @@ try {
     $r = Invoke-Package @{ BuildDir = $partial; OutDir = (Join-Path $tmp 'dist p') }
     Write-Check (-not $r.Ok -and $r.Text -match 'is empty') 'an empty program is refused'
 
+    # 5b. A program that runs from the build folder, and programs older than the last commit.
+    $busy = Join-Path $tmp 'busy'
+    New-Item -ItemType Directory -Path $busy | Out-Null
+    Copy-Item -Path (Join-Path $BuildDir '*.exe') -Destination $busy
+    # A stand-in is a copy of cmd.exe, so it can simply wait. With -BuildDir there is no stand-in to start.
+    if (-not $PSBoundParameters.ContainsKey('BuildDir')) {
+        $running = Start-Process -FilePath (Join-Path $busy 'streamtap-sink.exe') -ArgumentList '/c', 'ping -n 60 127.0.0.1 >NUL' -WindowStyle Hidden -PassThru
+        try {
+            $r = Invoke-Package @{ BuildDir = $busy; OutDir = (Join-Path $tmp 'dist busy') }
+            Write-Check (-not $r.Ok -and $r.Text -match 'streamtap-sink is running') 'a program running from the build folder is refused, and named'
+            Write-Check (-not (Test-Path -LiteralPath (Join-Path $tmp 'dist busy'))) 'and nothing is written for it'
+        }
+        finally {
+            & taskkill.exe /T /F /PID $running.Id 2>&1 | Out-Null
+            $running.WaitForExit(10000) | Out-Null
+        }
+    }
+    $old = [DateTime]::UtcNow.AddYears(-5)
+    Get-ChildItem -LiteralPath $busy -Filter *.exe | ForEach-Object { $_.LastWriteTimeUtc = $old }
+    $warned = @(& $packager -BuildDir $busy -OutDir (Join-Path $tmp 'dist old') 3>&1 | Where-Object { $_ -is [Management.Automation.WarningRecord] })
+    Write-Check (@($warned | Where-Object { "$_" -match 'older than the last commit' }).Count -eq 3) 'programs older than the last commit are named in a warning, one each'
+    Get-ChildItem -LiteralPath $busy -Filter *.exe | ForEach-Object { $_.LastWriteTimeUtc = [DateTime]::UtcNow }
+    $warned = @(& $packager -BuildDir $busy -OutDir (Join-Path $tmp 'dist new') 3>&1 | Where-Object { $_ -is [Management.Automation.WarningRecord] })
+    Write-Check ($warned.Count -eq 0) 'fresh programs give no warning'
+
     # 6. What the extension may hold.
     $fake = Copy-FakeRoot 'fake extension'
     $ext = Join-Path $fake 'extension'

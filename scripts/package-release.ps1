@@ -18,9 +18,9 @@ and PowerShell 7 give different zips with the same content). SHA256SUMS ("<hash>
 per zip packed into that folder) is written next to it for a local check; the release workflow does
 not upload that file, the publish action of appkit's release-kit makes the one of the release.
 
-It packs the programs that are in -BuildDir; it does not know whether they are fresh. Build first
-(-Build, or scripts\build.ps1, which also refuses while a streamtap program runs from the build
-folder); the release workflow builds from a clean checkout first.
+It packs the programs that are in -BuildDir: it refuses while one of them runs from there and warns
+about one older than the last commit, but it builds nothing. Build first (-Build, or
+scripts\build.ps1); the release workflow builds from a clean checkout first.
 
 The release is a zip plus scripts, not a setup.exe: an unsigned setup would be stopped by
 SmartScreen exactly like the programs, and the scripts already do the per-user install
@@ -140,6 +140,23 @@ foreach ($name in $programs) {
     $exe = Join-Path $BuildDir "$name.exe"
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { Exit-Package "no $exe (build first: scripts\build.ps1)" }
     if ((Get-Item -LiteralPath $exe).Length -eq 0) { Exit-Package "$exe is empty" }
+}
+
+# A program running from here may be halfway through replacing itself or hold what is copied; a program
+# older than the last commit is a stale build. CI builds fresh, so both are the case of a local run.
+$committed = & git -C $root log -1 --format=%ct 2>$null
+$commitTime = if ($LASTEXITCODE -eq 0 -and "$committed" -match '^\d+$') {
+    [DateTimeOffset]::FromUnixTimeSeconds([long]$committed).UtcDateTime
+}
+foreach ($name in $programs) {
+    $exe = (Resolve-Path -LiteralPath (Join-Path $BuildDir "$name.exe")).ProviderPath
+    $running = @(Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ($_.Path -eq $exe) })
+    if ($running.Count) {
+        Exit-Package "$name is running from $BuildDir (PID $(($running | ForEach-Object { $_.Id }) -join ', ')): stop it first"
+    }
+    if ($commitTime -and (Get-Item -LiteralPath $exe).LastWriteTimeUtc -lt $commitTime) {
+        Write-Warning "$exe is older than the last commit: is it a stale build? (-Build makes a fresh one)"
+    }
 }
 
 if ($StageDir) {
