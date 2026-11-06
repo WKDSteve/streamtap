@@ -381,6 +381,52 @@ fn a_quiet_session_after_hello_is_kept_until_the_idle_timeout() {
 }
 
 #[test]
+fn a_stream_of_pings_does_not_keep_an_idle_session_open() {
+    let sink = Sink::start(
+        "pings",
+        &["--hello-timeout-secs", "5", "--idle-timeout-secs", "2"],
+    );
+    let mut c = sink.connect();
+    assert!(c.handshake());
+    c.hello(TOKEN);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(6) {
+        if c.closed_within(Duration::from_millis(200)) {
+            let took = start.elapsed();
+            assert!(took >= Duration::from_secs(1), "closed too early: {took:?}");
+            return;
+        }
+        c.frame(0x9, b"still here");
+    }
+    panic!("the pings kept the session open past the idle timeout");
+}
+
+#[test]
+fn silent_connections_do_not_lock_out_a_client() {
+    // Well above --max-connections: a local process that keeps connecting and says nothing.
+    let sink = Sink::start("lockout", &["--max-connections", "8"]);
+    let mut settled = sink.connect();
+    assert!(settled.handshake());
+    settled.hello(TOKEN);
+    std::thread::sleep(Duration::from_millis(300));
+    let silent: Vec<Client> = (0..20).map(|_| sink.connect()).collect();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut late = sink.connect();
+    assert!(late.handshake(), "a new client gets past the silent ones");
+    late.hello(TOKEN);
+    assert!(
+        !late.closed_within(Duration::from_millis(300)),
+        "and stays connected"
+    );
+    assert!(
+        !settled.closed_within(Duration::from_millis(100)),
+        "a session after hello is never pushed out"
+    );
+    drop(silent);
+}
+
+#[test]
 fn hostile_boxes_do_not_stop_the_sink() {
     let mut sink = Sink::start("hostile", &[]);
     let mut c = sink.connect();

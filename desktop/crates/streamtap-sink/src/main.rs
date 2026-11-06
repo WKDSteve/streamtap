@@ -16,8 +16,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,13 @@ const _: () = assert!(DEFAULT_IDLE_TIMEOUT_SECS >= 1800);
 /// Default cap of simultaneous connections, one thread each (`--max-connections`).
 /// More are closed at once, before a thread is started.
 const DEFAULT_MAX_CONNECTIONS: usize = 16;
+/// Connections waiting for their `hello` at the same time. One more pushes the oldest of them
+/// out, so whoever connects and says hello at once always gets in, however many silent
+/// connections a local process keeps opening. Far below `DEFAULT_MAX_CONNECTIONS`, so they cannot
+/// use up the places either.
+const MAX_WAITING_FOR_HELLO: usize = 4;
+/// How soon a connection that was pushed out notices it and frees its place.
+const WAITING_POLL: Duration = Duration::from_millis(50);
 /// How long a write to a client that does not read may block.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Origin of the streamtap extension. Its id is fixed by the `key` in
@@ -161,35 +168,52 @@ struct Limits {
 }
 
 /// A client socket with a deadline to the first `hello` and an idle timeout
-/// after it. The deadline is absolute: a client that trickles bytes does not
-/// start it over, as a plain per-read socket timeout would.
+/// after it. Both are absolute: a client that trickles bytes or sends pings
+/// does not start them over, as a plain per-read socket timeout would. Only a
+/// message that does work does (`Timed::worked`).
 struct Timed {
     inner: TcpStream,
     /// Moment by which `hello` must be in; `None` once it was.
     deadline: Option<Instant>,
+    /// Moment the session counts as idle; `None` until `hello`.
+    idle_until: Option<Instant>,
     idle: Duration,
+    /// Set when a newer connection pushed this one out while it waited for `hello`.
+    pushed_out: Arc<AtomicBool>,
 }
 
 impl Timed {
     /// The handshake and the first message share one deadline.
-    fn new(inner: TcpStream, limits: Limits) -> Self {
+    fn new(inner: TcpStream, limits: Limits, pushed_out: Arc<AtomicBool>) -> Self {
         Self {
             inner,
             deadline: Some(Instant::now() + limits.hello),
+            idle_until: None,
             idle: limits.idle,
+            pushed_out,
         }
     }
 
+    /// A message that does work came in: `hello` is over, the idle time starts anew.
+    fn worked(&mut self) {
+        self.deadline = None;
+        self.idle_until = Some(Instant::now() + self.idle);
+    }
+
     fn arm(&self) -> io::Result<()> {
-        let wait = match self.deadline {
-            Some(d) => {
-                let left = d.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(io::ErrorKind::TimedOut.into());
-                }
-                left
-            }
-            None => self.idle,
+        let Some(until) = self.deadline.or(self.idle_until) else {
+            return self.inner.set_read_timeout(Some(self.idle));
+        };
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        // Waiting for `hello`, the read wakes up to see whether it was pushed out: closing the
+        // socket from the accept loop does not end a blocked read on every system.
+        let wait = if self.deadline.is_some() {
+            left.min(WAITING_POLL)
+        } else {
+            left
         };
         self.inner.set_read_timeout(Some(wait))
     }
@@ -197,8 +221,22 @@ impl Timed {
 
 impl Read for Timed {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.arm()?;
-        self.inner.read(buf)
+        loop {
+            self.arm()?;
+            let waiting = self.deadline.is_some();
+            if waiting && self.pushed_out.load(Ordering::SeqCst) {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            match self.inner.read(buf) {
+                Err(e)
+                    if waiting
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) => {}
+                other => return other,
+            }
+        }
     }
 }
 
@@ -208,6 +246,51 @@ impl Write for Timed {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// The connections that have not said `hello` yet, oldest first.
+#[derive(Default)]
+struct Waiting {
+    next: AtomicUsize,
+    entries: Mutex<VecDeque<(usize, Arc<AtomicBool>)>>,
+}
+
+impl Waiting {
+    /// Adds a connection and pushes out the oldest above `MAX_WAITING_FOR_HELLO`: its thread sees
+    /// the flag within `WAITING_POLL` and frees its place.
+    fn add(self: &Arc<Self>) -> WaitingEntry {
+        let id = self.next.fetch_add(1, Ordering::SeqCst);
+        let pushed_out = Arc::new(AtomicBool::new(false));
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.push_back((id, Arc::clone(&pushed_out)));
+        while entries.len() > MAX_WAITING_FOR_HELLO {
+            if let Some((_, oldest)) = entries.pop_front() {
+                oldest.store(true, Ordering::SeqCst);
+            }
+        }
+        WaitingEntry {
+            id,
+            waiting: Arc::clone(self),
+            pushed_out,
+        }
+    }
+}
+
+/// A connection's place among those waiting for `hello`: dropped on `hello` or at its end.
+struct WaitingEntry {
+    id: usize,
+    waiting: Arc<Waiting>,
+    pushed_out: Arc<AtomicBool>,
+}
+
+impl Drop for WaitingEntry {
+    fn drop(&mut self) {
+        self.waiting
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(id, _)| *id != self.id);
     }
 }
 
@@ -369,6 +452,7 @@ fn run_serve(args: &[String]) -> Result<(), SinkError> {
     );
 
     let active = Arc::new(AtomicUsize::new(0));
+    let waiting = Arc::new(Waiting::default());
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -381,6 +465,7 @@ fn run_serve(args: &[String]) -> Result<(), SinkError> {
                     continue;
                 }
                 let slot = Slot(Arc::clone(&active));
+                let entry = waiting.add();
                 let token = token.clone();
                 let out = out.clone();
                 let origin = origin.clone();
@@ -388,9 +473,9 @@ fn run_serve(args: &[String]) -> Result<(), SinkError> {
                 let refusals = Arc::clone(&refusals);
                 let spawned = std::thread::Builder::new().spawn(move || {
                     let _slot = slot;
-                    if let Err(e) =
-                        handle_connection(s, &token, &origin, &out, &budget, &refusals, limits)
-                    {
+                    if let Err(e) = handle_connection(
+                        s, &token, &origin, &out, &budget, &refusals, limits, entry,
+                    ) {
                         eprintln!("connection ended with error: {e}");
                     }
                 });
@@ -1107,13 +1192,14 @@ fn accept_ws(
     stream: TcpStream,
     origin: &str,
     limits: Limits,
+    pushed_out: Arc<AtomicBool>,
 ) -> Result<(tungstenite::WebSocket<Timed>, std::net::SocketAddr), SinkError> {
     let io_err = |what: &'static str| move |e: io::Error| SinkError::io(what, None, e);
     let peer = stream.peer_addr().map_err(io_err("peer address"))?;
     stream
         .set_write_timeout(Some(WRITE_TIMEOUT))
         .map_err(io_err("set write timeout"))?;
-    let stream = Timed::new(stream, limits);
+    let stream = Timed::new(stream, limits, pushed_out);
     // tungstenite's default caps a frame at 16 MiB; segments may be up to
     // MAX_MESSAGE, so the frame and message caps follow it (plus header).
     let config = tungstenite::protocol::WebSocketConfig::default()
@@ -1128,6 +1214,7 @@ fn accept_ws(
     Ok((ws, peer))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: TcpStream,
     token: &Secret,
@@ -1136,9 +1223,11 @@ fn handle_connection(
     budget: &Arc<Budget>,
     refusals: &Arc<Refusals>,
     limits: Limits,
+    waiting: WaitingEntry,
 ) -> Result<(), SinkError> {
-    let (mut ws, peer) = accept_ws(stream, origin, limits)?;
+    let (mut ws, peer) = accept_ws(stream, origin, limits, Arc::clone(&waiting.pushed_out))?;
     let mut session: Option<Session> = None;
+    let mut waiting = Some(waiting);
     let mut bad_messages = 0u32;
 
     // A broken connection still ends with the summary below.
@@ -1197,8 +1286,10 @@ fn handle_connection(
                     printable(&url, 300)
                 );
                 session = Some(s);
-                // In: the deadline is spent, silence is judged by the idle timeout now.
-                ws.get_mut().deadline = None;
+                // In: the deadline is spent, silence is judged by the idle timeout now, and
+                // no later connection can push this one out.
+                ws.get_mut().worked();
+                waiting.take();
             }
             (Header::Hello { .. }, Some(_)) => {
                 eprintln!("{peer}: second hello, ignoring");
@@ -1208,12 +1299,14 @@ fn handle_connection(
                 break;
             }
             (Header::Segment(h), Some(s)) => {
+                ws.get_mut().worked();
                 if let Err(e) = s.write_segment(&h, payload) {
                     eprintln!("{}: write failed, closing: {e}", s.dir.display());
                     break;
                 }
             }
             (Header::Event { name, sb }, Some(s)) => {
+                ws.get_mut().worked();
                 println!("{}", event_log_line(&s.dir, &name, sb));
                 if let ("initlost", Some(sb)) = (name.as_str(), sb) {
                     if let Err(e) = s.note_lost_init(sb) {
