@@ -1495,6 +1495,22 @@ impl TrackState {
     /// Decides about a media segment (timed) or an untimed continuation.
     fn admit_media(&mut self, h: &SegmentHeader, payload: &[u8], seen_room: bool) -> Admit {
         let Some(t) = h.tfdt else {
+            // A segment cut before its tfdt: the sequence number of the moof makes the head
+            // the same bytes only when it is the same segment, fetched again.
+            if starts_a_numbered_moof(payload) {
+                let key = (fnv1a(payload), i64::MIN + 1, payload.len() as u64, 0);
+                self.skip_tail = self.seen.contains_key(&key);
+                if self.skip_tail {
+                    self.dupes += 1;
+                    return Admit::Skip;
+                }
+                if !seen_room {
+                    self.skipped += 1;
+                    return Admit::Skip;
+                }
+                self.seen.insert(key, self.offset);
+                return Admit::Write { as_init: false };
+            }
             if self.skip_tail {
                 self.dupes += 1;
                 return Admit::Skip;
@@ -1532,6 +1548,11 @@ impl TrackState {
         self.seen.insert(key, self.offset);
         Admit::Write { as_init: false }
     }
+}
+
+/// The chunk starts with a `moof` whose `mfhd` (and so its sequence number) arrived in full.
+fn starts_a_numbered_moof(payload: &[u8]) -> bool {
+    payload.len() >= 24 && &payload[4..8] == b"moof" && &payload[12..16] == b"mfhd"
 }
 
 /// Written atomically: a reader never sees half a file.
@@ -2073,7 +2094,7 @@ impl Session {
             Admit::Skip => Ok(()),
             Admit::Mark { offset } => self.write_mark(h.sb, h, offset, payload.len()),
             Admit::Write { as_init } => {
-                if h.tfdt.is_some() {
+                if h.tfdt.is_some() || starts_a_numbered_moof(payload) {
                     self.seen_total += 1;
                 }
                 self.write_row(h.sb, h, payload, as_init)
@@ -2543,6 +2564,10 @@ fn part_init<'a>(sb: u32, part: u32, rows: &[&'a IndexRow]) -> (Vec<&'a IndexRow
     (init, stray == 0)
 }
 
+/// How much of a segment cut into pieces is read for its first `trun`: a moof is far smaller,
+/// and the pieces that follow can be the whole media data.
+const MAX_MOOF_FOR_LEAD: usize = 1024 * 1024;
+
 /// The presentation lead (`seq_layout`) of every sequence-mode row appended
 /// right after a set `timestampOffset`: read from its segment and its part's
 /// init. Unreadable rows get none.
@@ -2568,13 +2593,27 @@ fn seq_leads(dir: &Path, sb: u32, rows: &[&IndexRow]) -> SeqMoves {
             }
         }
         let media_time = elst_media_time(&init);
-        for r in rows
-            .iter()
-            .filter(|r| r.part == part && r.seq_mode && r.tso_set && !r.is_init)
-        {
-            if read_segment(&mut src, r, &mut buf).is_ok() {
-                leads.insert((part, r.offset), first_cto(&buf) - media_time);
+        for (i, r) in part_rows.iter().enumerate() {
+            if !r.seq_mode || !r.tso_set || r.is_init {
+                continue;
             }
+            if read_segment(&mut src, r, &mut buf).is_err() {
+                continue;
+            }
+            // Cut inside the moof, the rest of it (and the trun) is in the pieces that follow.
+            let mut seg = std::mem::take(&mut buf);
+            for next in part_rows[i + 1..]
+                .iter()
+                .take_while(|n| n.tfdt.is_none() && !n.is_init)
+            {
+                if seg.len() >= MAX_MOOF_FOR_LEAD || read_segment(&mut src, next, &mut buf).is_err()
+                {
+                    break;
+                }
+                seg.extend_from_slice(&buf);
+            }
+            leads.insert((part, r.offset), first_cto(&seg) - media_time);
+            buf = seg;
         }
     }
     leads
@@ -5559,6 +5598,85 @@ mod tests {
             !lifted("liftwebm", b"\x1f\x43\xb6\x75cluster"),
             "nothing to move"
         );
+    }
+
+    /// A moof of the given sequence number, cut before its tfdt: what a chunked fetch can deliver
+    /// as an append of its own.
+    fn cut_moof_head(seq: u32) -> Vec<u8> {
+        let mut mfhd = vec![0, 0, 0, 0];
+        mfhd.extend(seq.to_be_bytes());
+        let mut head = 100u32.to_be_bytes().to_vec(); // the moof goes on in the next chunk
+        head.extend(b"moof");
+        head.extend(mp4_box(*b"mfhd", &mfhd));
+        head
+    }
+
+    #[test]
+    fn a_refetched_segment_cut_before_its_tfdt_is_dropped_whole() {
+        let mut s = session("cuthead");
+        write(&mut s, &seg(1, true, None, None), b"INIT");
+        let first = cut_moof_head(1);
+        let second = cut_moof_head(2);
+        write(&mut s, &seg(1, false, None, None), &first);
+        write(&mut s, &seg(1, false, None, None), b"TAIL");
+        // Seek back: the player fetches the first segment again, then goes on.
+        write(&mut s, &seg(1, false, None, None), &first);
+        write(&mut s, &seg(1, false, None, None), b"TAIL");
+        write(&mut s, &seg(1, false, None, None), &second);
+        write(&mut s, &seg(1, false, None, None), b"TAIL");
+        let mut want = b"INIT".to_vec();
+        want.extend(&first);
+        want.extend(b"TAIL");
+        want.extend(&second);
+        want.extend(b"TAIL");
+        assert_eq!(fs::read(s.dir.join("sb1.p0.bin")).expect("part"), want);
+        assert_eq!(
+            index_lines(&s.dir),
+            5,
+            "init, then head and tail of two segments"
+        );
+    }
+
+    #[test]
+    fn equal_untimed_chunks_that_start_no_moof_are_all_kept() {
+        // Silence and repeated WebM blocks hold equal bytes at different times: only a moof
+        // head has a sequence number that says it is the same segment.
+        let mut s = session("equaltails");
+        write(&mut s, &seg(1, true, None, None), b"INIT");
+        write(&mut s, &seg(1, false, Some(0), None), b"HEAD");
+        write(&mut s, &seg(1, false, None, None), b"SAME");
+        write(&mut s, &seg(1, false, None, None), b"SAME");
+        assert_eq!(
+            fs::read(s.dir.join("sb1.p0.bin")).expect("part"),
+            b"INITHEADSAMESAME"
+        );
+    }
+
+    #[test]
+    fn the_lead_is_found_when_the_append_was_cut_inside_the_moof() {
+        // tfdt in the first chunk, the trun with the composition offset in the second.
+        let mut trun = vec![0, 0, 0x09, 0x00];
+        trun.extend(1u32.to_be_bytes());
+        trun.extend(40u32.to_be_bytes());
+        trun.extend(80u32.to_be_bytes());
+        let segment = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"trun", &trun)));
+        let (head, tail) = segment.split_at(segment.len() - 6);
+        let dir = temp_dir("cutlead");
+        let init = init_with_traks(1);
+        let mut rows = write_part(
+            &dir,
+            &[
+                (&init, true, None, None),
+                (head, false, Some(1000), Some(4.0)),
+                (tail, false, None, Some(4.0)),
+            ],
+        );
+        rows[1].seq_mode = true;
+        rows[1].tso_set = true;
+        rows[2].seq_mode = true;
+        let refs: Vec<&IndexRow> = rows.iter().collect();
+        let leads = seq_leads(&dir, 1, &refs);
+        assert_eq!(leads[&(0, rows[1].offset)], 80, "read across the cut");
     }
 
     #[test]

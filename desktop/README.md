@@ -241,8 +241,11 @@ Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffse
   `traf` says which; gaps are reported per track too); partial overlaps are kept and counted (frames
   may repeat there). Without durations that check cannot run, which is
   warned. Without a `tfdt` on every media segment (WebM blocks, continuation
-  chunks, a segment cut inside its `moof`) the arrival order is kept, and
-  re-fetches cannot be told apart there.
+  chunks, a segment cut inside its `moof`) the arrival order is kept. Re-fetches
+  cannot be told apart there, except a segment cut before its `tfdt` whose head
+  holds the `mfhd`: the sequence number makes it the same bytes only when it is
+  the same segment, so it is dropped with the pieces that follow it. The lead of
+  a sequence-mode append cut inside its `moof` is read across those pieces.
 - **Sequence mode:** `mux` places each append where the browser placed it
   (MSE coded frame processing), per SourceBuffer over all its parts in
   arrival order, so an ABR switch and back keeps one timeline. After the
