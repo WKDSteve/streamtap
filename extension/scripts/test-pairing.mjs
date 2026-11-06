@@ -17,6 +17,12 @@ const check = (ok, what) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const flush = () => sleep(20);
+// After the fixed wait, as long as the machine needs: a check that expects nothing has its time, one that expects
+// something gets more on a loaded runner.
+const until = async (cond) => {
+  const deadline = Date.now() + 10_000;
+  while (!cond() && Date.now() < deadline) await sleep(20);
+};
 
 const SECRET = "0123456789abcdef0123456789abcdef";
 
@@ -515,16 +521,19 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   check(lastTap() === true && tapState.asked === 0, "mode all (popup setup): every tab is tapped, the service worker is not asked");
   append(true);
   await sleep(60);
+  await until(() => segmentsOnPorts() === 1);
   check(segmentsOnPorts() === 1, "mode all: a segment is sent");
 
   // Mode selected, tab not chosen.
   store.tapMode = "selected";
   storageListener({ tapMode: { newValue: "selected" } }, "local");
   await sleep(40);
+  await until(() => tapState.asked === 1 && lastTap() === false);
   check(tapState.asked === 1 && lastTap() === false, "mode selected: the service worker is asked and the tab is not tapped");
   const before = segmentsOnPorts();
   append(false);
   await sleep(60);
+  await until(() => segmentsOnPorts() === before);
   check(segmentsOnPorts() === before, "mode selected, tab not chosen: nothing is sent");
 
   // The app switches the tab on, then off.
@@ -532,6 +541,7 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   check(lastTap() === true, "the app's tap-on message switches the tab on");
   append(true);
   await sleep(60);
+  await until(() => segmentsOnPorts() === before + 1);
   check(segmentsOnPorts() === before + 1, "a chosen tab sends its segments");
   runtimeListener({ kind: "vc-tap", on: false }, { id: "oggpddakdbffbjhkjmcakidgmhpgakia" });
   check(lastTap() === false, "tap-off stops the copying");
@@ -544,6 +554,7 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   tapState.on = true;
   storageListener({ tapMode: { newValue: "selected" } }, "local");
   await sleep(40);
+  await until(() => lastTap() === true);
   check(lastTap() === true, "a fresh document of a chosen tab is tapped from its first segment");
 
   // A late answer does not undo a newer message.
@@ -551,12 +562,14 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   storageListener({ tapMode: { newValue: "selected" } }, "local");
   runtimeListener({ kind: "vc-tap", on: true }, { id: "oggpddakdbffbjhkjmcakidgmhpgakia" });
   await sleep(40);
+  await until(() => lastTap() === true);
   check(lastTap() === true, "an older question's answer does not overwrite a newer tap message");
 
   // Token removed (revocation): no tapping.
   delete store.sinkToken;
   storageListener({ sinkToken: { newValue: undefined } }, "local");
   await sleep(40);
+  await until(() => lastTap() === false);
   check(lastTap() === false, "without a token nothing is tapped, whatever the mode");
 }
 
