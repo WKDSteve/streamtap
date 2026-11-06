@@ -10,8 +10,8 @@
 # The kit's own stamped install.ps1 is not used: it needs a program with an `install` command (kind hub) or a
 # setup (nsis, inno), and a multi-file zip with the extension is neither. The install script is in the zip.
 #
-# Runs on the self-hosted Windows runner of the maintainer (`runs-on: [self-hosted, windows]`, the repository is
-# private), so only Windows is built. The release-kit actions run there by Git Bash. appkit is public and read
+# Runs on the self-hosted Windows runner of the maintainer (`runs-on: [self-hosted, windows]`, by the
+# author's choice), so only Windows is built. The release-kit actions run there by Git Bash. appkit is public and read
 # without credentials.
 #
 # Before anything is built: the tag, the version in desktop/crates/streamtap-app/Cargo.toml (and tauri.conf.json)

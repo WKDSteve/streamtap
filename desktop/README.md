@@ -504,7 +504,7 @@ after a green `ci` on `main` the pre-release `latest` gets the zip of that commi
 `main` only) and `SHA256SUMS`, replaced each time. A newer build cancels an older one, but a running
 publish is never cancelled (it would leave `latest` without a file); a publish that waited behind a newer one
 publishes nothing when `main` has moved on. Both run on the self-hosted Windows runner
-(the repository is private). The kit's own stamped `install.ps1` is not used (it needs a program
+(the author's choice). The kit's own stamped `install.ps1` is not used (it needs a program
 with an `install` command or a setup); `install.ps1` is in the zip. streamtap has no appkit crate,
 so `tools/check-workflows.py` (CI, job `hygiene`; `--online` asks GitHub whether each action's tag
 still names the pinned commit) takes the place of `check-appkit-pin.py`: every action is pinned by

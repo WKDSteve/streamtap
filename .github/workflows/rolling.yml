@@ -7,8 +7,8 @@
 #                                  says <version>+<short commit>, which the install shows in Settings > Apps
 #   SHA256SUMS                     the checksum of the zip
 #
-# Runs on the self-hosted Windows runner of the maintainer (`runs-on: [self-hosted, windows]`, the repository is
-# private), so only Windows is built. appkit is public and read without credentials.
+# Runs on the self-hosted Windows runner of the maintainer (`runs-on: [self-hosted, windows]`, by the
+# author's choice), so only Windows is built. appkit is public and read without credentials.
 #
 # Deciding (only the tip of main is built) and publishing (SHA256SUMS first, the words of the page
 # last) are the actions prepare and publish of appkit's release-kit, pinned by commit (tools/check-workflows.py

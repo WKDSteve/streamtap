@@ -2,7 +2,7 @@ streamtap {tag} for Windows. Unsigned, for private machines only: not for a mana
 
 **This is a zip with install scripts, not a setup.exe.**
 
-1. Download `streamtap-<version>-x86_64-pc-windows-msvc.zip` (the repository is private, so use `gh release download {tag}` or the page while signed in).
+1. Download `streamtap-<version>-x86_64-pc-windows-msvc.zip` (from this page, or with `gh release download {tag} -R WKDSteve/streamtap`).
    Before you unpack it, check it against `SHA256SUMS` (`(Get-FileHash <zip> -Algorithm SHA256).Hash.ToLower()` must be the hash in that file)
    and run `Unblock-File <zip>`, so the installed programs carry no Mark-of-the-Web.
 2. Unpack it into a new, empty folder, open a normal (not elevated) PowerShell in it and run
