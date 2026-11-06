@@ -623,6 +623,15 @@ const newDirs = (prefix) => {
   seen = new Set(all);
   return fresh;
 };
+// How long a reconnect takes is the machine's business: wait for the directory, then for what follows it to land.
+const waitForDirs = async (prefix, n) => {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (readdirSync(captures).filter((d) => !seen.has(d) && d.includes(prefix)).length >= n) break;
+    await sleep(100);
+  }
+  await sleep(1000);
+};
 const half = Math.ceil(segments.length / 2);
 
 // --- reconnect --------------------------------------------------------------
@@ -636,7 +645,7 @@ const half = Math.ceil(segments.length / 2);
   await sleep(1300); // past the first retry delay
   for (const s of segments.slice(half)) seg(p, s, false);
   p.onMessage({ t: "event", header: { name: "endofstream", sb: null } });
-  await sleep(1000);
+  await waitForDirs("reconnec", 2);
   check(status(1).dropped === 0, `reconnect: phase 2 sent, nothing dropped (${JSON.stringify(status(1))})`);
   p.onDisconnect();
   await sleep(500);
@@ -682,7 +691,7 @@ const half = Math.ceil(segments.length / 2);
   seg(p, segments[1], false);
   seg(p, init, true, "B");
   seg(p, segments[2], false);
-  await sleep(1000);
+  await waitForDirs("switch-a", 2);
   p.onDisconnect();
   await sleep(500);
   const dirs = newDirs("switch-a");
@@ -709,7 +718,7 @@ const half = Math.ceil(segments.length / 2);
   closeSockets(4);
   await sleep(1300);
   p.onMessage({ t: "segment", header: header(false, false, segments[1]), payload: dataUrl(segments[1]) });
-  await sleep(800);
+  await waitForDirs("splitrep", 2);
   p.onDisconnect();
   await sleep(500);
   const dirs = newDirs("splitrep");
