@@ -139,10 +139,11 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: 3.14.6
+      # taiki-e/install-action does not know actionlint on Windows. The Go proxy checks the module against its checksum.
       - if: ${{ github.event_name == 'pull_request' }}
-        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
-        with:
-          tool: actionlint@1.7.12
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          go env GOPATH | sed 's|$|/bin|' >> "$GITHUB_PATH"
       - run: python -m unittest discover tools
       - run: python tools/check-control-chars.py
       # Every colour of the app's UI comes from palette.css (generated from the icon by the app icons tool of the
