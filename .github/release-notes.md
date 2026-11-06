@@ -1,4 +1,4 @@
-streamtap {tag} for Windows. Unsigned, for private machines only: not for the Tricentis workstation.
+streamtap {tag} for Windows. Unsigned, for private machines only: not for a managed work machine.
 
 **This is a zip with install scripts, not a setup.exe.**
 

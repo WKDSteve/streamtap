@@ -47,11 +47,11 @@ streamtap/
 
 ## Download and install (Windows, from a release)
 
-For private machines. **Not for the Tricentis workstation** (no unsigned program is built, installed or
+For private machines. **Not for a managed work machine** (no unsigned program is built, installed or
 started there; the app is never run on it). The release is a **zip with install scripts, not a
 setup.exe**, and nothing in it is code-signed.
 
-1. Get the zip from the repository's *Releases* (the repository is private: sign in, or
+1. Get the zip from the repository's *Releases* (or
    `gh release download <tag>`): `streamtap-<version>-x86_64-pc-windows-msvc.zip` for a release, or
    `streamtap-windows-x86_64.zip` from the pre-release **latest** (the rolling build of the newest
    green commit of `main`). In the folder you downloaded it to, **before you unpack it**, check it against
