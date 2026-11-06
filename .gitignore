@@ -24,3 +24,4 @@ captures/
 # Extension signing keys and packed builds: never in the repository.
 *.pem
 *.crx
+!desktop/scripts/fixtures/frag.mp4
