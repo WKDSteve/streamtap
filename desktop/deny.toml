@@ -33,6 +33,8 @@ allow = [
 ]
 
 [bans]
+# windows-permissions (config_access.rs) has been unmaintained since about 2020 and is the only user of winapi. It stays on
+# purpose, see "config.json" in README.md; look at it again by 2027-05.
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true

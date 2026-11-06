@@ -11,6 +11,10 @@ for now it is a CLI with two subcommands.
 cargo test --release         # unit tests of dedupe, ordering, limits, DRM refusal
 ```
 
+On Linux without the GTK development packages (a cloud session) the app crate does not build
+(`gdk-sys`), so `cargo test --workspace` is not meant for there. The other two have no such
+dependency: `cargo test -p streamtap-sink -p streamtap-host`. The CI runs the whole workspace.
+
 `scripts/build.ps1` (repo root) is what the nvim-config's `:MyNative build`
 runs: it refuses while a sink from this checkout is running (the exe is
 locked) and gives the exe the current time after a successful build, so a
@@ -604,8 +608,12 @@ Security:
   start, and stderr); the fix is to remove those entries under *Properties >
   Security* of the file or its folder and restart the app. A DACL that cannot
   be read gives a warning as well. The check uses the `windows-permissions`
-  crate (MIT, a safe wrapper; its `winapi` and `bitflags` 1 were already in the
-  tree), so the workspace stays free of `unsafe`.
+  crate (MIT, a safe wrapper), so the workspace stays free of `unsafe`. It has
+  been unmaintained since about 2020, stays on purpose and is looked at again by
+  2027-05: the check is a warning and no protection, no advisory is known, a
+  panic on broken security data is caught (the UI says "not checked"), and the
+  alternatives are `unsafe` in this workspace (`windows`) or another unmaintained
+  wrapper (`windows-acl`). It is the only reason `winapi` is in the tree.
 
 - **Connection state:** the sink writes `"state":"open"` and its own `sink_pid`
   into `session.json` when a connection starts and rewrites it atomically with
