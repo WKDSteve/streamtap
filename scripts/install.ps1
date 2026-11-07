@@ -293,7 +293,7 @@ $link.WorkingDirectory = $binDir
 $link.IconLocation = "$app,0"
 $link.Description = 'streamtap: capture the videos of your browser tabs'
 $link.Save()
-if ($DesktopDir -eq '') { $DesktopDir = $(if ($env:STREAMTAP_DESKTOP_DIR) { $env:STREAMTAP_DESKTOP_DIR } else { [Environment]::GetFolderPath('Desktop') }) }
+$DesktopDir = Get-Place $(if ($DesktopDir) { $DesktopDir } elseif ($env:STREAMTAP_DESKTOP_DIR) { $env:STREAMTAP_DESKTOP_DIR } else { [Environment]::GetFolderPath('Desktop') })
 if ($DesktopShortcut) {
     Write-Output "==> Desktop shortcut in $DesktopDir"
     New-Item -ItemType Directory -Force -Path $DesktopDir | Out-Null
