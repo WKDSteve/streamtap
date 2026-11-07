@@ -37,10 +37,13 @@ New-Item -ItemType Directory -Path $tmp | Out-Null
 
 $install = Join-Path $tmp 'install'
 $startMenu = Join-Path $tmp 'start-menu'
+$desktop = Join-Path $tmp 'desktop'
+# The installers that are not given -DesktopDir (build-install.ps1) take it from here, never the real desktop.
+$env:STREAMTAP_DESKTOP_DIR = $desktop
 $dataDir = Join-Path $tmp 'roaming\io.github.wkdsteve.streamtap'
 $localDataDir = Join-Path $tmp 'local\io.github.wkdsteve.streamtap'
 $hostName = 'io.github.wkdsteve.streamtap'
-$places = @('-InstallDir', $install, '-StartMenuDir', $startMenu, '-RegistryRoot', $regRoot)
+$places = @('-InstallDir', $install, '-StartMenuDir', $startMenu, '-DesktopDir', $desktop, '-RegistryRoot', $regRoot)
 $dataPlaces = @('-DataDir', $dataDir, '-LocalDataDir', $localDataDir)
 
 # The defaults of the scripts point at the same places, so that a call without them (or a script that
@@ -272,6 +275,9 @@ try {
     Write-Check (@(Get-Tree $install | Where-Object { $_ -match '\.(new|old)$' }).Count -eq 0) 'no .new or .old file is left'
     $shell = New-Object -ComObject WScript.Shell
     Write-Check ((Test-Path -LiteralPath $link) -and $shell.CreateShortcut($link).TargetPath -eq (Join-Path $bin 'streamtap-app.exe')) 'the Start menu entry starts the installed app'
+    Write-Check (-not (Test-Path -LiteralPath (Join-Path $desktop 'streamtap.lnk'))) 'no desktop shortcut without -DesktopShortcut'
+    $r = Invoke-Script $installer (@('-PayloadDir', $payload, '-DesktopShortcut') + $places)
+    Write-Check ($r.Code -eq 0 -and (Test-Path -LiteralPath (Join-Path $desktop 'streamtap.lnk')) -and $shell.CreateShortcut((Join-Path $desktop 'streamtap.lnk')).TargetPath -eq (Join-Path $bin 'streamtap-app.exe')) 'with -DesktopShortcut the desktop shortcut starts the installed app'
     $entry = Get-ItemProperty -LiteralPath $uninstallKey -ErrorAction SilentlyContinue
     $version = (Get-Content -LiteralPath (Join-Path (Split-Path -Parent $here) 'desktop\crates\streamtap-app\tauri.conf.json') -Raw | ConvertFrom-Json).version
     Write-Check ($null -ne $entry -and $entry.DisplayName -eq 'streamtap' -and $entry.DisplayVersion -eq $version -and $entry.InstallLocation -eq $install) 'the Settings > Apps entry names streamtap, its version and the folder'
@@ -378,6 +384,7 @@ try {
     if ($r.Code -ne 0) { Write-Output $r.Text }
     Write-Check (-not (Test-Path -LiteralPath $install)) 'the install folder is gone, the script with it'
     Write-Check (-not (Test-Path -LiteralPath $link)) 'the Start menu entry is gone'
+    Write-Check (-not (Test-Path -LiteralPath (Join-Path $desktop 'streamtap.lnk'))) 'the desktop shortcut is gone'
     Write-Check (-not (Test-Path -LiteralPath $uninstallKey)) 'the Settings > Apps entry is gone'
     Write-Check (-not (Test-Path -LiteralPath (Get-KeyPath 'Microsoft\Edge')) -and -not (Test-Path -LiteralPath $edgeManifest)) 'the registration of the installed host is gone, its manifest too'
     Write-Check ((Test-Path -LiteralPath (Get-KeyPath 'Google\Chrome')) -and (Test-Path -LiteralPath $chromeManifest)) 'the registration of the checkout stays'

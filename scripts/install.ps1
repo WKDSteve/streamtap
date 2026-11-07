@@ -45,6 +45,12 @@ Where it goes (default $env:STREAMTAP_INSTALL_DIR, else %LOCALAPPDATA%\streamtap
 Where the Start menu entry goes (default $env:STREAMTAP_START_MENU_DIR, else the current user's
 Start menu programs folder).
 
+.PARAMETER DesktopShortcut
+Also put a shortcut on the desktop (off by default; the Start menu entry is always made).
+
+.PARAMETER DesktopDir
+Where the desktop shortcut goes (default $env:STREAMTAP_DESKTOP_DIR, else the desktop of the current user).
+
 .PARAMETER RegistryRoot
 The registry key that stands for HKCU\Software: the Settings > Apps entry is written below it, and
 the browsers' NativeMessagingHosts keys are read below it (default $env:STREAMTAP_REGISTRY_ROOT,
@@ -58,6 +64,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 [CmdletBinding()]
 param(
     [switch] $AllowElevated,
+    [switch] $DesktopShortcut,
+    [string] $DesktopDir = '',
     [string] $PayloadDir = '',
     [string] $InstallDir = '',
     [string] $StartMenuDir = '',
@@ -285,6 +293,17 @@ $link.WorkingDirectory = $binDir
 $link.IconLocation = "$app,0"
 $link.Description = 'streamtap: capture the videos of your browser tabs'
 $link.Save()
+if ($DesktopDir -eq '') { $DesktopDir = $(if ($env:STREAMTAP_DESKTOP_DIR) { $env:STREAMTAP_DESKTOP_DIR } else { [Environment]::GetFolderPath('Desktop') }) }
+if ($DesktopShortcut) {
+    Write-Output "==> Desktop shortcut in $DesktopDir"
+    New-Item -ItemType Directory -Force -Path $DesktopDir | Out-Null
+    $desk = $shell.CreateShortcut((Join-Path $DesktopDir 'streamtap.lnk'))
+    $desk.TargetPath = $link.TargetPath
+    $desk.WorkingDirectory = $link.WorkingDirectory
+    $desk.IconLocation = $link.IconLocation
+    $desk.Description = $link.Description
+    $desk.Save()
+}
 
 # The entry of Settings > Apps runs the copy of uninstall.ps1 with the places of this install.
 $uninstallKey = "$RegistryRoot\Microsoft\Windows\CurrentVersion\Uninstall\streamtap"
@@ -292,7 +311,7 @@ Write-Output "==> Settings > Apps entry ($uninstallKey)"
 $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 # -PauseOnError: Settings opens a console window that would close before an error could be read.
 $command = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`"" +
-" -InstallDir `"$InstallDir`" -StartMenuDir `"$StartMenuDir`" -RegistryRoot `"$RegistryRoot`" -PauseOnError"
+" -InstallDir `"$InstallDir`" -StartMenuDir `"$StartMenuDir`" -DesktopDir `"$DesktopDir`" -RegistryRoot `"$RegistryRoot`" -PauseOnError"
 $size = [int](((Get-ChildItem -LiteralPath $InstallDir -Recurse -File | Measure-Object -Property Length -Sum).Sum) / 1KB)
 # There is one entry: an install in another folder loses it (its files stay there), so say so.
 $previous = Get-ItemProperty -LiteralPath $uninstallKey -ErrorAction SilentlyContinue
