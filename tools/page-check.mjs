@@ -111,6 +111,16 @@ try {
     await button.focus();
     await axe(page, `${theme}, a button focused`);
     await page.mouse.move(0, 0);
+    // Axe is content with a button that does not react, so the colours are compared here.
+    const primary = page.locator("button.primary:visible:not(:disabled)").first();
+    const fill = () => primary.evaluate((node) => getComputedStyle(node).backgroundColor);
+    const atRest = await fill();
+    await primary.hover();
+    check(`${theme}: a filled button shows the pointer`, (await fill()) !== atRest);
+    await axe(page, `${theme}, a filled button hovered`);
+    await primary.focus();
+    await axe(page, `${theme}, a filled button hovered and focused`);
+    await page.mouse.move(0, 0);
   }
 } finally {
   await browser.close();
