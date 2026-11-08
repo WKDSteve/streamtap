@@ -28,7 +28,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # On main a run that started is finished, so that busy days still give green runs (and rolling builds); GitHub keeps
+  # one newer run waiting and drops the older waiting ones. Other refs still cancel the run they replace.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
