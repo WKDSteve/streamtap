@@ -24,7 +24,7 @@ return {
     { focus = "#sink-toggle" },
     { expect = "document.getElementById('sink-toggle').matches(':focus-visible')", note = "the focus ring shows" },
     { shot = "start-focus-light" },
-    { expect = "(document.activeElement.blur(), document.activeElement === document.body)", note = "the focus off again" },
+    { blur = true, note = "the focus off again" },
     { scheme = "dark" },
     { expect = "matchMedia('(prefers-color-scheme: dark)').matches", note = "the page sees the dark scheme" },
     { hover = "header.bar h1" },
