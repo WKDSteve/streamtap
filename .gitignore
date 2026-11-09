@@ -25,3 +25,6 @@ captures/
 *.pem
 *.crx
 !desktop/scripts/fixtures/frag.mp4
+
+# What a test sheet leaves to look at
+TESTS/sheets/out/

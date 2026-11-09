@@ -10,6 +10,7 @@
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { bridge } from "./bridge-stub.mjs";
 
 const [modules] = process.argv.slice(2);
 if (!modules) {
@@ -28,47 +29,6 @@ function check(what, ok, detail = "") {
   console.log(`${ok ? "ok    " : "FAILED"} ${what}${ok ? "" : ` ${detail}`}`);
   if (!ok) failed.push(what);
 }
-
-// What the Rust side answers, with something in every part of the page.
-const bridge = () => {
-  const settings = { port: 17650, token: "a-token", captures_dir: "C:/captures", language: "en", theme: "system" };
-  const snapshot = {
-    sink: { state: "stopped" },
-    sink_path: "C:/sink.exe",
-    ffmpeg: "C:/ffmpeg.exe",
-    config_error: "config.json could not be read",
-    captures: [
-      {
-        id: "c1",
-        title: "A capture",
-        url: "https://example.invalid/",
-        host: "example.invalid",
-        started: 1700000000,
-        live: false,
-        muxed: false,
-        drm: false,
-        bytes: 1024,
-        segments: 3,
-        duration_ms: 4000,
-        source_buffers: [],
-      },
-    ],
-    captures_error: null,
-    mux: {},
-    log: ["a line of the log"],
-    browser: {
-      host_path: "C:/host.exe",
-      bridge_error: null,
-      registrations: [{ browser: "chrome", registered: true, path: "C:/manifest.json" }],
-      link: { connections: [], approvals: [{ instance: "p-1", browser: "chrome", profile: "Default", connected: true }], store_error: null },
-    },
-  };
-  window.__TAURI__ = {
-    core: {
-      invoke: async (cmd) => (cmd === "snapshot" ? snapshot : cmd === "get_settings" ? settings : null),
-    },
-  };
-};
 
 async function axe(page, label) {
   const result = await new AxeBuilder({ page }).analyze();

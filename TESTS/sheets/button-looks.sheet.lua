@@ -1,0 +1,46 @@
+-- The looks of the filled button of the app's page (Start of the sink), with the stand-in for the Tauri bridge
+-- (.testing.lua): at rest, under the pointer and with the keyboard focus, light and dark. The colours themselves are
+-- checked by tools/page-check.mjs; this sheet leaves the shots for the judgement whether one sees the difference.
+--   testing sheets step button-looks --headed
+return {
+  id = "streamtap.button-looks",
+  title = "streamtap: the filled button of the app's page at rest, under the pointer and with focus, light and dark",
+  task = "streamtap/live-check-gefuellter-knopf-der-app-seite-hell-und-dunkel-in",
+  engine = "browser",
+  app = "page",
+  sizes = { { cols = 1000, rows = 700 } },
+  steps = {
+    { scheme = "light" },
+    { open = "${link}", note = "the page with the stand-in for the bridge" },
+    { wait = "document.body.innerText.includes('A capture')", timeout = 10000, note = "the stand-in's data is drawn" },
+    { expect = "!document.getElementById('sink-toggle').disabled && document.getElementById('sink-toggle').classList.contains('primary')", note = "Start is a filled button that can be pressed" },
+    { hover = "header.bar h1", note = "the pointer on the title" },
+    { expect = "!document.getElementById('sink-toggle').matches(':hover')" },
+    { shot = "start-rest-light" },
+    { hover = "#sink-toggle" },
+    { expect = "document.getElementById('sink-toggle').matches(':hover')" },
+    { shot = "start-hover-light" },
+    { hover = "header.bar h1" },
+    { focus = "#sink-toggle" },
+    { expect = "document.getElementById('sink-toggle').matches(':focus-visible')", note = "the focus ring shows" },
+    { shot = "start-focus-light" },
+    { expect = "(document.activeElement.blur(), document.activeElement === document.body)", note = "the focus off again" },
+    { scheme = "dark" },
+    { expect = "matchMedia('(prefers-color-scheme: dark)').matches", note = "the page sees the dark scheme" },
+    { hover = "header.bar h1" },
+    { expect = "!document.getElementById('sink-toggle').matches(':hover')" },
+    { shot = "start-rest-dark" },
+    { hover = "#sink-toggle" },
+    { expect = "document.getElementById('sink-toggle').matches(':hover')" },
+    { shot = "start-hover-dark" },
+    { hover = "header.bar h1" },
+    { focus = "#sink-toggle" },
+    { expect = "document.getElementById('sink-toggle').matches(':focus-visible')", note = "the focus ring shows" },
+    { shot = "start-focus-dark" },
+  },
+  judge = {
+    "Under the pointer the filled button Start is clearly lighter or darker than at rest, light and dark",
+    "With the focus a ring around it is plainly visible, light and dark",
+    "Its text stays readable in every state",
+  },
+}
