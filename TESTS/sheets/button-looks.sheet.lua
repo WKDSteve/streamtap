@@ -4,6 +4,7 @@
 --   testing sheets step button-looks --headed
 return {
   id = "streamtap.button-looks",
+  feature = "streamtap.button-states",
   title = "streamtap: the filled button of the app's page at rest, under the pointer and with focus, light and dark",
   task = "streamtap/live-check-gefuellter-knopf-der-app-seite-hell-und-dunkel-in",
   engine = "browser",
