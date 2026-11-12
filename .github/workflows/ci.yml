@@ -124,6 +124,26 @@ jobs:
       - run: node --version && pnpm --version
       - run: pnpm --dir tools/page-check install --frozen-lockfile
       - run: node tools/page-check.mjs tools/page-check/node_modules
+      # The test sheets (TESTS/sheets, .testing.lua) at a fixed version of testing.nvim; --strict: a sheet that could
+      # not run is red here. Only on the maintainer's runner: nvim comes from its PATH, the hosted VM has none.
+      - if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          repository: WKDSteve/testing.nvim
+          ref: 10dcc98a63d41a2870572cd81e14c4ab2ca548ee
+          path: .deps/testing.nvim
+          persist-credentials: false
+      - if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          repository: WKDSteve/lib.nvim
+          ref: 37bf8bd87858ca84b26cf271605fab0679ddaddb
+          path: .deps/lib.nvim
+          persist-credentials: false
+      - if: ${{ github.event_name != 'pull_request' }}
+        run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --all --root . --engine browser --strict
+        env:
+          LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
 
   # A control or invisible character in a tracked text file (a backspace in a path, a bidirectional override in
   # source) is refused; the tool tests itself.
