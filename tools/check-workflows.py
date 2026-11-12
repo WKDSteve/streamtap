@@ -14,7 +14,8 @@ renamed file does not get around them:
   * all actions of appkit's release-kit use the same commit (streamtap has no appkit crate, so
     this takes the place of the Cargo.lock comparison that tasks-desktop's check-appkit-pin.py does);
   * every job of release.yml and rolling.yml runs on `[self-hosted, windows]`, every job of ci.yml on
-    the one expression that gives a pull request `windows-latest`, and every job has a timeout;
+    the one expression that gives a pull request `windows-latest` (except the jobs of HOSTED_CI_JOBS, which
+    run on a hosted VM for every event: a throwaway machine either way), and every job has a timeout;
   * only ci.yml reacts to a pull request, and only to `pull_request` (no `_target`: it would run with
     the rights of the repository); ci.yml reads no secret; no workflow reacts to a comment;
   * the token: `permissions: contents: read` for the whole workflow, `contents: write` only in the
@@ -57,6 +58,9 @@ OUTSIDE_EVENTS = {"pull_request", "pull_request_target", "pull_request_review", 
 ALLOWED_EVENTS = {"ci.yml": {"push", "workflow_dispatch", "pull_request"}, "release.yml": {"push"}, "rolling.yml": {"workflow_run"}}
 # The only way a job of ci.yml picks its runner: a pull request gets a throwaway VM, never the author's machine.
 CI_RUNS_ON = """${{ github.event_name == 'pull_request' && 'windows-latest' || fromJSON('["self-hosted","windows"]') }}"""
+# The jobs of ci.yml that run on a hosted VM for a push too, by name, each on its one runner: what the self-hosted
+# machine cannot run (the extension sheet needs Playwright's full Chromium, which does not start there).
+HOSTED_CI_JOBS = {"extension-sheet": "ubuntu-latest"}
 WRITERS = {"ci.yml": set(), "release.yml": {"publish"}, "rolling.yml": {"prepare", "publish"}}
 TIP_IF = "${{ steps.tip.outputs.current == 'true' }}"
 
@@ -325,7 +329,10 @@ def check_common(name, text, wf):
     for job, body in jobs.items():
         runs_on = body.get("runs-on")
         if name == "ci.yml":
-            if runs_on != CI_RUNS_ON:
+            if job in HOSTED_CI_JOBS:
+                if runs_on != HOSTED_CI_JOBS[job]:
+                    problems.append(f"{name}: job {job} runs on {runs_on or 'nothing named'}, not {HOSTED_CI_JOBS[job]}")
+            elif runs_on != CI_RUNS_ON:
                 problems.append(f"{name}: job {job} runs on {runs_on or 'nothing named'}, not the expression that keeps a pull request off the self-hosted runner")
         elif runs_on != ["self-hosted", "windows"]:
             problems.append(f"{name}: job {job} runs on {runs_on or 'nothing named'}, not [self-hosted, windows]")

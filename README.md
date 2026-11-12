@@ -152,7 +152,7 @@ node desktop/scripts/test-sink-link.mjs
 node desktop/scripts/test-app-ui.mjs
 python -m unittest discover tools
 python tools/check-control-chars.py
-python tools/check-workflows.py --online          # pins, self-hosted runner, drafts only
+python tools/check-workflows.py --online          # pins, runners, drafts only
 actionlint                                        # syntax and expressions; winget install rhysd.actionlint
 pnpm --dir tools/page-check install --frozen-lockfile; node tools/page-check.mjs tools/page-check/node_modules   # axe, light and dark
 pwsh -NoProfile -File scripts/test-install.ps1   # install/uninstall in a temp folder, fake registry root
@@ -162,6 +162,16 @@ Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Error, Warning   # PSScri
 
 The Rust toolchain is pinned in `desktop/rust-toolchain.toml` (rustup
 installs it on first use).
+
+The test sheets of testing.nvim (`TESTS/sheets/`, apps in `.testing.lua`) run
+with `testing sheets run --sheet <name>`. One of them, `mse-capture`, loads
+the extension itself into Playwright's full Chromium and checks that a real
+sink writes the repository's own MSE fixture (`TESTS/sheets/fixtures/`,
+generated with ffmpeg, VP9 in fragmented MP4) with the track id the hook read.
+Branded Chrome refuses an unpacked extension and Playwright's Chromium does
+not start on the self-hosted runner, so CI runs that sheet in the one job on a
+hosted Linux VM (`extension-sheet`; `tools/check-workflows.py` allows exactly
+that job off the self-hosted runner).
 
 ## Roadmap (short)
 

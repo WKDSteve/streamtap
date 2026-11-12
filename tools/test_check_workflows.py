@@ -122,6 +122,15 @@ class Rules(unittest.TestCase):
     def test_a_ci_job_with_another_expression_is_found(self):
         self.found(sabotaged("ci.yml", check.CI_RUNS_ON, "${{ github.event.inputs.runner }}"), "keeps a pull request off")
 
+    def test_another_ci_job_on_a_hosted_vm_for_a_push_is_found(self):
+        """Only the jobs of HOSTED_CI_JOBS leave the expression, and only by their name."""
+        page = "  page:\n    runs-on: "
+        self.found(sabotaged("ci.yml", page + check.CI_RUNS_ON, page + "ubuntu-latest"), "keeps a pull request off")
+
+    def test_the_hosted_job_on_another_runner_is_found(self):
+        job = "  extension-sheet:\n    runs-on: "
+        self.found(sabotaged("ci.yml", job + "ubuntu-latest", job + "[self-hosted, windows]"), "not ubuntu-latest")
+
     def test_a_secret_in_ci_is_found(self):
         self.found(sabotaged("ci.yml", "  CARGO_TERM_COLOR: always\n", "  CARGO_TERM_COLOR: always\n  X: ${{ secrets.X }}\n"), "reads a secret")
 

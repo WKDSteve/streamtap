@@ -141,7 +141,50 @@ jobs:
           path: .deps/lib.nvim
           persist-credentials: false
       - if: ${{ github.event_name != 'pull_request' }}
-        run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --all --root . --engine browser --strict
+        # by name: mse-capture loads the extension, which needs Playwright's full Chromium (job extension-sheet)
+        run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --sheet button-looks --root . --strict
+        env:
+          LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
+
+  # The extension itself in a browser: TESTS/sheets/mse-capture.sheet.lua loads extension/ unpacked into Playwright's
+  # full Chromium, against a real sink built here and the repository's own MSE fixture (tools/sheet-mse.mjs): never a
+  # page of somebody else, never DRM. That Chromium does not start on the maintainer's runner and branded Chrome refuses
+  # an unpacked extension, so this one job runs on a hosted Linux VM for every event (tools/check-workflows.py,
+  # HOSTED_CI_JOBS): a throwaway machine either way, nothing of the author's.
+  extension-sheet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 26.2.0
+      - run: npm install --global pnpm@10.29.2
+      - run: pnpm --dir tools/page-check install --frozen-lockfile
+      # playwright-core of tools/page-check installs the Chromium of its own version, with the libraries it needs
+      - run: tools/page-check/node_modules/.bin/playwright-core install --with-deps chromium
+      # The toolchain of desktop/rust-toolchain.toml; the sink itself is built by the app entry of .testing.lua.
+      - run: rustup show active-toolchain || rustup toolchain install
+        working-directory: desktop
+      - uses: rhysd/action-setup-vim@febef33995d6649302e9d88dda81e071b68f16a7 # v1.6.1
+        with:
+          neovim: true
+          version: v0.12.2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          repository: WKDSteve/testing.nvim
+          ref: 49de00d301e3165c019489bd73dfee8eedc5e9e7
+          path: .deps/testing.nvim
+          persist-credentials: false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
+        with:
+          repository: WKDSteve/lib.nvim
+          ref: 37bf8bd87858ca84b26cf271605fab0679ddaddb
+          path: .deps/lib.nvim
+          persist-credentials: false
+      - run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --sheet mse-capture --root . --strict
         env:
           LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
 
