@@ -467,7 +467,8 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
 
 // --- content.js: the tapping gate ----------------------------------------------------------
 {
-  const store = { sinkToken: SECRET };
+  // The source policy (on by default) is tested in test-source-policy.mjs.
+  const store = { sinkToken: SECRET, sourcePolicy: "off" };
   const posts = [];
   let listener = null;
   let runtimeListener = null;

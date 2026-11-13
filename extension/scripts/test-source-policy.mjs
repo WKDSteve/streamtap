@@ -63,13 +63,16 @@ const until = async (f, ms = 1000) => {
     const s = on({ sourceUnlocked: bad });
     check(s.unlocked.size === 0, `a broken unlock setting unlocks nothing (${JSON.stringify(bad)})`);
   }
-  check(spSettings({ sourcePolicy: true }).on === false && spSettings({ sourcePolicy: "ON" }).on === false && spSettings(null).on === false, "only the exact value \"on\" turns the policy on");
+  check(spSettings({ sourcePolicy: true }).on === true && spSettings({ sourcePolicy: "OFF" }).on === true && spSettings(null).on === true, "a broken or missing value keeps the policy on");
+  check(spSettings({ sourcePolicy: "off" }).on === false, "only the exact value \"off\" turns the policy off");
   check(spCleanHost("bad host") === "" && spCleanHost("a..b") === "" && spCleanHost("x".repeat(300)) === "" && spCleanHost(5) === "", "malformed hosts are dropped");
   check(spCleanHost(" HTTPS://Tv.Home.Lan:8096/web ") === "tv.home.lan", "a host is cleaned of scheme, port, path and case");
   check(spSettings({ sourceOwnHosts: Array.from({ length: 500 }, (_, i) => `h${i}.example`) }).own.length === 200, "user host lists are bounded");
 
   // The verdict for a frame.
-  check(spJudge(["https://www.youtube.com/"], spSettings({})).tap === true && spJudge([], spSettings({})).state === "off", "policy off: everything is tapped as before");
+  const offS = spSettings({ sourcePolicy: "off" });
+  check(spJudge(["https://www.youtube.com/"], offS).tap === true && spJudge([], offS).state === "off", "policy off: everything is tapped as before");
+  check(spJudge(["https://www.youtube.com/"], spSettings({})).tap === false, "nothing stored: on by default, YouTube is locked");
   check(spJudge(["https://www.ardmediathek.de/", "https://www.ardmediathek.de/player"], on()).state === "released", "all released: released, tapped");
   const embed = spJudge(["https://blog.example/post", "https://www.youtube-nocookie.com/embed/1"], on());
   check(embed.tap === false && embed.state === "locked", "a locked player embedded in an unlisted site is locked");
@@ -91,7 +94,7 @@ const until = async (f, ms = 1000) => {
   stored.sourcePolicy = "off";
   check((await spState({ frameId: 3, url: "https://x.example/" })).state === "off", "spState: policy off, no sub-frame rule");
   stored.sourcePolicy = "on";
-  check(spSettings({ sourcePolicy: "off" }).on === false && spSettings({}).on === false, "Chrome build: off by default and when stored off");
+  check(spSettings({ sourcePolicy: "off" }).on === false && spSettings({}).on === true, "Chrome build: on by default, off only when stored off");
 }
 
 // ---- the content script's gate --------------------------------------------------
@@ -187,9 +190,9 @@ const until = async (f, ms = 1000) => {
   check(lastTap() === false && answers.asked === askedBefore, "mode selected, tab not chosen: not tapped, the policy is not even asked");
 
   // Policy off: the old behaviour, the policy is never asked.
-  delete store.sourcePolicy;
+  store.sourcePolicy = "off";
   store.tapMode = "all";
-  storageListener({ sourcePolicy: { newValue: undefined } }, "local");
+  storageListener({ sourcePolicy: { newValue: "off" } }, "local");
   await until(() => lastTap() === true);
   const askedOff = answers.asked;
   runtimeListener({ kind: "vc-tap", on: true }, { id: "oggpddakdbffbjhkjmcakidgmhpgakia" });

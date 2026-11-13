@@ -4,7 +4,7 @@
 // The Chrome build has no flavour file and keeps its defaults.
 //
 // - sourcePolicyDefault "on": the source policy (source-policy.js) is on
-//   unless the user stored "off"; locked groups copy nothing.
+//   unless the user stored "off" (the same default as the Chrome build).
 // - nativePairing false: Firefox for Android has no native messaging, and the
 //   desktop app registers its host for Chrome, Edge and Brave only.
 "use strict";

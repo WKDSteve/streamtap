@@ -1,6 +1,6 @@
 // Source policy (loaded by background.js via importScripts): which sites may be
-// tapped. Off unless the setting `sourcePolicy` is "on" (the desktop default
-// stays as before; the mobile build turns it on). When on, the host of the
+// tapped. On unless the setting `sourcePolicy` is "off", in every build (the
+// author's decision of 2026-11-13). When on, the host of the
 // tab's top document and of the asking frame are sorted into groups:
 //
 // - released: tapped as before (own content, free licences, public
@@ -33,9 +33,9 @@ const SP_GROUPS = Object.freeze({
   },
 });
 
-// The default when nothing is stored: off in the Chrome build, on in the
-// Firefox build (flavor-firefox.js). A stored "on" or "off" wins.
-const SP_DEFAULT = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR && STREAMTAP_FLAVOR.sourcePolicyDefault === "on" ? "on" : "off";
+// The default when nothing (or something broken) is stored: on, unless a
+// build flavour says "off". A stored "on" or "off" wins.
+const SP_DEFAULT = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR && STREAMTAP_FLAVOR.sourcePolicyDefault === "off" ? "off" : "on";
 const spPolicyOn = (stored) => (stored === "on" || stored === "off" ? stored : SP_DEFAULT) === "on";
 
 const SP_MAX_USER_HOSTS = 200;

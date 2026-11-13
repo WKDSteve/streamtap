@@ -70,7 +70,8 @@ globalThis.chrome = {
     },
   },
   storage: {
-    local: { get: (d, cb) => setTimeout(() => cb({ ...d, sinkToken: "t" }), 5) },
+    // The source policy (on by default) is tested in test-source-policy.mjs.
+    local: { get: (d, cb) => setTimeout(() => cb({ ...d, sinkToken: "t", sourcePolicy: "off" }), 5) },
     onChanged: { addListener: () => {} },
   },
 };
@@ -206,7 +207,7 @@ const payloadLen = (m) => Buffer.from(m.payload.split(",")[1], "base64").length;
 // --- an init held before tapping started that did not fit -------------------------
 let release = null;
 chrome.storage.local.get = (d, cb) => {
-  release = () => cb({ ...d, sinkToken: "t" });
+  release = () => cb({ ...d, sinkToken: "t", sourcePolicy: "off" });
 };
 vm.runInThisContext(contentSrc, { filename: "content.js" }); // a second frame, still reading the token
 {
