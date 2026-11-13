@@ -80,7 +80,7 @@ content scripts report (`sender.tab`), so the extension needs no `tabs` permissi
 access to all sites for this; for the same reason there are **no page previews** (a screenshot
 needs `activeTab` on a click or host access to all sites), only the favicon (permission
 `favicon`) and the title. An open native port keeps the service worker alive while the app
-runs. Firefox is not supported.
+runs. The pairing needs Chrome, Edge or Brave; the Firefox build (below) does not pair.
 
 After editing a file, hit the reload icon on `chrome://extensions` and reload
 the page.
@@ -93,9 +93,36 @@ origin until then (the sink logs them as `origin rejected: https://…`).
 
 Chrome ≥ 116 (an open WebSocket keeps the service worker alive).
 
-Firefox: not supported yet. Its MV3 needs `background.scripts` instead of a
-service worker, so the sink link does not run there; it also ignores `key`
-(the sink would need `--allow-origin <moz-extension origin>`).
+## Firefox for Android (in progress)
+
+`node extension/scripts/build-firefox.mjs` builds the Firefox variant from the same sources into `extension/dist/`
+(ignored by git): `dist/firefox/` and `dist/streamtap-firefox-<version>.xpi`. The manifest is derived from
+`manifest.json`: an event page (`background.scripts`) instead of the service worker, the add-on id
+`streamtap@wkdsteve.github.io`, Firefox 128 or later (content scripts in the MAIN world), and none of the Chrome-only
+parts (`key`, `nativeMessaging`, `favicon`). `src/flavor-firefox.js` turns the [source policy](#source-policy-for-the-mobile-build)
+on by default and leaves the pairing with the desktop app off (Firefox for Android has no native messaging).
+`node extension/scripts/test-firefox.mjs` checks the build; `npx web-ext@8.3.0 lint --source-dir extension/dist/firefox`
+reports no errors or warnings.
+
+What works so far: the hook, the per-tab registry and badge, DRM detection and the source policy. **Nothing is saved
+yet on the phone**: there is no sink there. The two targets (a file on the device, the desktop sink over Tailscale) are
+the next steps.
+
+Install it on your own phone, for yourself only (no store, no listing):
+
+- **Unsigned, Firefox Nightly:** `about:config` → `xpinstall.signatures.required` = `false`; then, in Nightly's
+  settings, *About Firefox Nightly*, tap the logo five times to unlock the debug menu, and *Install add-on from file*
+  with the `.xpi`. Release and Beta builds of Firefox refuse unsigned add-ons.
+- **Temporary, over USB:** turn on USB debugging on the phone and *Remote debugging via USB* in Firefox, then
+  `npx web-ext@8.3.0 run -t firefox-android --adb-device <id> --source-dir extension/dist/firefox`. It is gone after
+  Firefox restarts.
+- **Signed (optional):** upload the `.xpi` to addons.mozilla.org as *unlisted* (on your own account, never listed);
+  the signed file installs in any Firefox.
+
+After installing, allow the add-on access to all sites in its permissions (Firefox asks per site otherwise, and the
+source policy does not tap a sub-frame whose page it cannot see).
+
+In the Chrome build nothing changes: the service worker, the pairing and the source policy (off) stay as above.
 
 ## What a successful run looks like
 

@@ -84,7 +84,14 @@ const until = async (f, ms = 1000) => {
   const st = await spState({ url: "https://www.youtube.com/embed/1", tabUrl: "https://www.ardmediathek.de/" });
   check(st.tap === false && st.groups.includes("obfuscated"), "spState: frame and top document are both judged");
   stored.sourceUnlocked = ["obfuscated"];
-  check((await spState({ url: "https://www.youtube.com/" })).tap === true, "spState: the stored unlock is read");
+  check((await spState({ frameId: 0, url: "https://www.youtube.com/" })).tap === true, "spState: the stored unlock is read");
+  const noTop = await spState({ frameId: 3, url: "https://www.ardmediathek.de/player" });
+  check(noTop.tap === false && noTop.state === "no-top", "spState: a sub-frame without the tab's URL is not tapped (Firefox without host access)");
+  check((await spState({ frameId: 0, url: "https://www.ardmediathek.de/" })).tap === true, "spState: a top frame is judged by its own URL");
+  stored.sourcePolicy = "off";
+  check((await spState({ frameId: 3, url: "https://x.example/" })).state === "off", "spState: policy off, no sub-frame rule");
+  stored.sourcePolicy = "on";
+  check(spSettings({ sourcePolicy: "off" }).on === false && spSettings({}).on === false, "Chrome build: off by default and when stored off");
 }
 
 // ---- the content script's gate --------------------------------------------------

@@ -6,7 +6,11 @@
 // (native messaging, tab list, per-tab capture) in native-pairing.js.
 "use strict";
 
-importScripts("sink-link.js", "native-pairing.js", "source-policy.js");
+// Chrome runs this as a service worker and loads the other scripts here; the
+// Firefox build (scripts/build-firefox.mjs) lists them in the manifest's
+// background.scripts, in front of this file, and has no importScripts.
+if (typeof importScripts === "function") importScripts("sink-link.js", "native-pairing.js", "source-policy.js");
+const FLAVOR = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR ? STREAMTAP_FLAVOR : { name: "chrome", sourcePolicyDefault: "", nativePairing: true };
 
 const tabs = new Map(); // tabId -> { url, frames: Set, ms: Map<msId, {...}>, drm: [] }
 
@@ -89,7 +93,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg && msg.kind === "vc-pair-now") {
-    npRetryNow();
+    if (FLAVOR.nativePairing !== false) npRetryNow();
     sendResponse(true);
     return false;
   }
@@ -102,7 +106,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // A content script asks whether the source policy lets its frame tap; the
   // URLs are the browser's (frame and top document), never the page's.
   if (msg && msg.kind === "vc-source-state") {
-    spState({ url: sender.url, tabUrl: sender.tab && sender.tab.url }).then(sendResponse, () => sendResponse({ tap: false, state: "error", groups: [] }));
+    spState({ frameId: sender.frameId, url: sender.url, tabUrl: sender.tab && sender.tab.url }).then(sendResponse, () => sendResponse({ tap: false, state: "error", groups: [] }));
     return true;
   }
   if (msg && msg.kind === "vc-clear" && typeof msg.tabId === "number") {
@@ -223,7 +227,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 // Pairing with the desktop app: the tabs that hold a MediaSource are what the
 // app lists. Frame URLs are not reported, only the tab's own URL host.
-npInit({
+// Firefox for Android has no native messaging: the pairing is not started,
+// and the popup says so instead of retrying a host that cannot exist.
+if (FLAVOR.nativePairing === false) np.status = { connected: false, pairing: null, error: "unsupported" };
+else npInit({
   mediaTabs: () =>
     [...tabs]
       .filter(([, t]) => t.ms.size > 0)

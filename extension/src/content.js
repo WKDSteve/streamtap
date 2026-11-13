@@ -407,7 +407,9 @@
       if (mine === question) setTapping(on);
     };
     chrome.storage.local.get({ sinkToken: "", tapMode: "all", sourcePolicy: "" }, (v) => {
-      sourcePolicyOn = v.sourcePolicy === "on";
+      // A stored "on"/"off" wins; otherwise the build's default (on in Firefox).
+      const flavorOn = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR && STREAMTAP_FLAVOR.sourcePolicyDefault === "on";
+      sourcePolicyOn = v.sourcePolicy === "on" || (v.sourcePolicy !== "off" && flavorOn);
       if (!v.sinkToken) return answer(false);
       if (v.tapMode !== "selected") return withPolicy(true, answer);
       chrome.runtime.sendMessage({ kind: "vc-tap-state" }, (r) => {

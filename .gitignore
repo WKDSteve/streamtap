@@ -24,6 +24,7 @@ captures/
 # Extension signing keys and packed builds: never in the repository.
 *.pem
 *.crx
+*.xpi
 !desktop/scripts/fixtures/frag.mp4
 # the MSE fixture of the extension sheet: a generated test pattern (ffmpeg testsrc, VP9), no captured media
 !TESTS/sheets/fixtures/vp9-frag.mp4

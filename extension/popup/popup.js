@@ -100,6 +100,11 @@ const load = async () => {
   const showPair = (s) => {
     void chrome.runtime.lastError;
     if (!s) return (pairLine.textContent = "app pairing: unavailable");
+    if (s.error === "unsupported") {
+      // Firefox (for Android): no native messaging, no desktop app to pair with.
+      document.getElementById("pair-now").hidden = true;
+      return (pairLine.textContent = "app pairing: not available in this browser");
+    }
     const how = !s.connected
       ? s.error === "host-unavailable"
         ? `the connector is not registered, or the app is not running (Connect browser in the app)${s.detail ? ` - browser says: ${s.detail}` : ""}`

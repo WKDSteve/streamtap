@@ -36,8 +36,9 @@ alone, by design. Respect the terms of the sites you use it on; see the
   in [desktop/README.md](desktop/README.md) and [extension/README.md](extension/README.md).
 - Mobile (Firefox for Android, in progress, own devices only, no store): the extension has a
   source policy, off on the desktop, that taps released sources only and keeps groups such as
-  obfuscated services and social media locked until you unlock them; never DRM. See "Source
-  policy" in [extension/README.md](extension/README.md).
+  obfuscated services and social media locked until you unlock them; never DRM. A build script
+  makes the Firefox variant and its `.xpi`; it does not save anything on the phone yet. See
+  "Source policy" and "Firefox for Android" in [extension/README.md](extension/README.md).
 
 Layout:
 

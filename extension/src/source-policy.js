@@ -33,6 +33,11 @@ const SP_GROUPS = Object.freeze({
   },
 });
 
+// The default when nothing is stored: off in the Chrome build, on in the
+// Firefox build (flavor-firefox.js). A stored "on" or "off" wins.
+const SP_DEFAULT = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR && STREAMTAP_FLAVOR.sourcePolicyDefault === "on" ? "on" : "off";
+const spPolicyOn = (stored) => (stored === "on" || stored === "off" ? stored : SP_DEFAULT) === "on";
+
 const SP_MAX_USER_HOSTS = 200;
 const SP_MAX_HOST_LEN = 253;
 
@@ -56,7 +61,7 @@ const spSettings = (v) => {
     ? o.sourceUnlocked.filter((g) => typeof g === "string" && Object.hasOwn(SP_GROUPS, g) && SP_GROUPS[g].state === "locked")
     : [];
   return {
-    on: o.sourcePolicy === "on",
+    on: spPolicyOn(o.sourcePolicy),
     unlocked: new Set(unlocked),
     own: hosts(o.sourceOwnHosts),
     learning: hosts(o.sourceLearningHosts),
@@ -111,14 +116,20 @@ const spJudge = (urls, settings) => {
 const SP_STORAGE_KEYS = ["sourcePolicy", "sourceUnlocked", "sourceOwnHosts", "sourceLearningHosts"];
 
 // What background.js answers a content script (vc-source-state): reads the
-// settings and judges the frame by the URLs the browser reports.
+// settings and judges the frame by the URLs the browser reports. A sub-frame
+// whose tab URL the browser does not report (Firefox without host access to
+// the top document) cannot be judged by its page and is not tapped.
 const spState = (frame) =>
   new Promise((resolve) => {
     chrome.storage.local.get(SP_STORAGE_KEYS, (v) => {
       void chrome.runtime.lastError;
+      const settings = spSettings(v);
+      if (settings.on && frame && frame.frameId !== 0 && typeof frame.tabUrl !== "string") {
+        return resolve({ tap: false, state: "no-top", groups: [] });
+      }
       const urls = [];
       if (frame && typeof frame.tabUrl === "string") urls.push(frame.tabUrl);
       if (frame && typeof frame.url === "string") urls.push(frame.url);
-      resolve(spJudge(urls, spSettings(v)));
+      resolve(spJudge(urls, settings));
     });
   });
