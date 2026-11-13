@@ -18,6 +18,8 @@ alone, by design. Respect the terms of the sites you use it on; see the
 
 ## Status
 
+**Status: alpha.** The first release is v0.1.0; verified in Chrome only so far.
+
 - Spike 1 (done): the extension logs what players feed into MSE. See
   [extension/README.md](extension/README.md).
 - Spike 2 (done, verified in Chrome on 2026-10-31): `desktop/streamtap-sink`
