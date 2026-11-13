@@ -388,32 +388,49 @@
 
   // Reads the setting and, in mode "selected", asks the service worker; a
   // later answer replaces an earlier one only if it is the latest question.
+  // With the source policy on (source-policy.js), the service worker also
+  // judges the site: a locked group is not tapped, and no answer means no tap.
   let question = 0;
+  // Whether the policy is on, from the latest read; null until the first one
+  // answered (then the service worker is asked, which knows).
+  let sourcePolicyOn = null;
+  const withPolicy = (on, answer) => {
+    if (!on || sourcePolicyOn === false) return answer(on);
+    chrome.runtime.sendMessage({ kind: "vc-source-state" }, (r) => {
+      void chrome.runtime.lastError;
+      answer(!!r && r.tap === true);
+    });
+  };
   const readTapping = () => {
     const mine = ++question;
     const answer = (on) => {
       if (mine === question) setTapping(on);
     };
-    chrome.storage.local.get({ sinkToken: "", tapMode: "all" }, (v) => {
+    chrome.storage.local.get({ sinkToken: "", tapMode: "all", sourcePolicy: "" }, (v) => {
+      sourcePolicyOn = v.sourcePolicy === "on";
       if (!v.sinkToken) return answer(false);
-      if (v.tapMode !== "selected") return answer(true);
+      if (v.tapMode !== "selected") return withPolicy(true, answer);
       chrome.runtime.sendMessage({ kind: "vc-tap-state" }, (r) => {
         void chrome.runtime.lastError;
-        answer(!!r && r.on === true);
+        withPolicy(!!r && r.on === true, answer);
       });
     });
   };
+  const SOURCE_KEYS = ["sourcePolicy", "sourceUnlocked", "sourceOwnHosts", "sourceLearningHosts"];
   if (inExtension) {
     try {
       readTapping();
       chrome.storage.onChanged.addListener((changes, area) => {
-        if (area === "local" && (changes.sinkToken || changes.tapMode)) readTapping();
+        if (area === "local" && (changes.sinkToken || changes.tapMode || SOURCE_KEYS.some((k) => changes[k]))) readTapping();
       });
       // The app switched this tab on or off.
       chrome.runtime.onMessage.addListener((msg, sender) => {
+        // Switching on goes through the source policy like any other start.
         if (sender.id === chrome.runtime.id && msg && msg.kind === "vc-tap" && typeof msg.on === "boolean") {
-          question++;
-          setTapping(msg.on);
+          const mine = ++question;
+          withPolicy(msg.on, (on) => {
+            if (mine === question) setTapping(on);
+          });
         }
         return false;
       });

@@ -96,6 +96,8 @@ jobs:
       - run: node extension/scripts/test-content.mjs
       # The pairing module (fake native port and storage) and the per-tab tapping gate of the content script.
       - run: node extension/scripts/test-pairing.mjs
+      # The source policy (groups, unlock, embeds) and the content script's gate with it on.
+      - run: node extension/scripts/test-source-policy.mjs
       # The popup in a fake DOM: forged values come out as text, never as markup.
       - run: node extension/scripts/test-popup.mjs
       # The sink link's lost-init and drain paths with a fake WebSocket (no arguments: mock mode, no sink).

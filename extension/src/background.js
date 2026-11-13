@@ -6,7 +6,7 @@
 // (native messaging, tab list, per-tab capture) in native-pairing.js.
 "use strict";
 
-importScripts("sink-link.js", "native-pairing.js");
+importScripts("sink-link.js", "native-pairing.js", "source-policy.js");
 
 const tabs = new Map(); // tabId -> { url, frames: Set, ms: Map<msId, {...}>, drm: [] }
 
@@ -97,6 +97,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.kind === "vc-tap-state") {
     const id = sender.tab && sender.tab.id;
     npTapState(id, { frameId: sender.frameId, url: sender.url, tabUrl: sender.tab && sender.tab.url }).then(sendResponse, () => sendResponse({ on: false }));
+    return true;
+  }
+  // A content script asks whether the source policy lets its frame tap; the
+  // URLs are the browser's (frame and top document), never the page's.
+  if (msg && msg.kind === "vc-source-state") {
+    spState({ url: sender.url, tabUrl: sender.tab && sender.tab.url }).then(sendResponse, () => sendResponse({ tap: false, state: "error", groups: [] }));
     return true;
   }
   if (msg && msg.kind === "vc-clear" && typeof msg.tabId === "number") {

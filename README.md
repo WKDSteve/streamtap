@@ -34,6 +34,10 @@ alone, by design. Respect the terms of the sites you use it on; see the
   the app after you approve it there and receives port and token by itself, and the app
   lists the tabs that hold a video so you pick the one to capture. See "Connect browser"
   in [desktop/README.md](desktop/README.md) and [extension/README.md](extension/README.md).
+- Mobile (Firefox for Android, in progress, own devices only, no store): the extension has a
+  source policy, off on the desktop, that taps released sources only and keeps groups such as
+  obfuscated services and social media locked until you unlock them; never DRM. See "Source
+  policy" in [extension/README.md](extension/README.md).
 
 Layout:
 
