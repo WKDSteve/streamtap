@@ -68,6 +68,9 @@ jobs:
       - run: cargo test --workspace --locked
       # The drivers against the real sink of that build, with a small fragmented fixture.
       - run: node scripts/test-sink-live.mjs
+      # A phone over the tailnet: the extension's own module pairs, logs in with its key and is revoked, against the sink
+      # of that build; a small proxy in the script plays Tailscale Serve.
+      - run: node scripts/test-tailnet-live.mjs
       # A recording as the extension saves it on a phone (target "file on the device"), read by the sink of this build.
       - run: node ../extension/scripts/test-file-target.mjs --write "$RUNNER_TEMP/rec.streamtap" && target/debug/streamtap-sink replay "$RUNNER_TEMP/rec.streamtap" --out "$RUNNER_TEMP/replayed"
       # The supply chain: known advisories, licenses, sources.
@@ -104,6 +107,8 @@ jobs:
       - run: node extension/scripts/test-firefox.mjs
       # The target "file on the device": the real sink link with a recorder, fake downloads API.
       - run: node extension/scripts/test-file-target.mjs
+      # The target "the sink over the tailnet": pairing, the login with a non-extractable key, every refusal, fake sink.
+      - run: node extension/scripts/test-tailnet.mjs
       # The popup in a fake DOM: forged values come out as text, never as markup.
       - run: node extension/scripts/test-popup.mjs
       # The sink link's lost-init and drain paths with a fake WebSocket (no arguments: mock mode, no sink).

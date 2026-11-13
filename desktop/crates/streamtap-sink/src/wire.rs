@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum Header {
     Hello {
+        /// The shared token of a local connection; a paired device (tailnet) sends none.
+        #[serde(default)]
         token: String,
         #[serde(default)]
         session: String,
@@ -20,6 +22,31 @@ pub(crate) enum Header {
         name: String,
         #[serde(default)]
         sb: Option<u32>,
+    },
+    /// A phone asks to be paired (tailnet only): the one-time code, its name and its public key.
+    Pair {
+        #[serde(default)]
+        v: u32,
+        code: String,
+        name: String,
+        key: String,
+    },
+    /// A paired device asks for a challenge (tailnet only).
+    Login {
+        #[serde(default)]
+        v: u32,
+        device: String,
+    },
+    /// The device's signature of the challenge.
+    Auth {
+        signature: String,
+    },
+    /// The sink's own command line asks the running sink (loopback only, with the token).
+    Control {
+        token: String,
+        op: String,
+        #[serde(default)]
+        device: String,
     },
 }
 

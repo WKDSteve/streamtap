@@ -23,6 +23,7 @@ to `oggpddakdbffbjhkjmcakidgmhpgakia` on every machine, so the origin is
 | `src/background.js` | service worker | Per-tab registry (in memory, bounded in entries and string sizes, frame URLs from the browser), badge with the number of SourceBuffers that received media (the rest of a split init counts with its init, not as media). SourceBuffer ids count per frame, so a `changetype` renames only the sending frame's SourceBuffer. Red badge when DRM was seen. Loads `sink-link.js`. |
 | `src/sink-link.js` | service worker | One WebSocket to `ws://127.0.0.1:<port>/` per port: `hello` with the token and the frame URL from the browser (not from the page), then one binary message per segment, header fields whitelisted. Every socket, the first one included, first sends the init segments in effect at that point of the stream (the init part only, with continuation chunks), because the sink starts a new capture directory. Queues at most 64 MiB per link and 128 MiB in all while connecting; at most 128 MiB of received payloads wait for decoding in the whole worker; on an open socket media is dropped beyond 64 MiB unsent; small init bytes may go to twice the decoding, the open-socket and the connecting-queue limits, and of an init+media append dropped on an open socket or while connecting the init part (at most 1 MiB) still goes out or is queued and is kept, so that rendition's next media is not lost. When init bytes are dropped anyway (here, also when too much waits for decoding, or in the content script, which says `lost` with `drop`), that SourceBuffer takes nothing until its next init (its media would be filed under the previous one), its kept init is not replayed, and the sink gets an `initlost` event (mux names the SourceBuffer): on an open socket at once, past the limit; while connecting behind what is already queued of that SourceBuffer, which still goes out under its own init; with nothing of it in flight (no socket yet, retry window) on the next socket. Only init bytes this worker decoded and then dropped with nothing of that SourceBuffer in flight are the init in effect: they are kept for the next socket instead. Kept init bytes are bounded worker-wide (64 MiB, parked links included); when full, the largest init of the frame that keeps the most bytes within the tab that keeps the most is dropped first, the keeping tab and frame counted with the init they are about to keep (never that init itself), so one page forging inits loses its own and cannot keep another tab's current init out, nor an ad frame the player frame's; a link whose init was dropped or not kept that way, or was too large to keep (over 1 MiB), tells the sink `initlost` on its next socket, drops what it had queued for that SourceBuffer up to the next queued init, and takes everything from that init on. A link whose port has gone keeps no new init; what it posted is still handled like before once decoded, and a socket that was still connecting or that such a late item starts (after the retry window) first replays the inits kept so far, then sends its queue and closes; those inits are dropped once no socket of the link is being set up. A link takes segments and `lost` messages of at most 32 SourceBuffer ids (as many as the registry keeps per MediaSource); those of further ids are dropped and counted, so forged ids cannot make it keep or announce (`initlost`) more. Backoff resets only after a socket stayed open 5 s (a wrong token is not hammered). At most 16 tapping links per worker: a port beyond that is parked without a socket (it keeps its init bytes, drops media) and admitted on a later segment once a slot frees up. Answers the popup's link status. |
 | `src/native-pairing.js` | service worker | Pairing with the desktop app over native messaging (`connectNative` to `io.github.wkdsteve.streamtap`, started by the app's *Connect browser*): says hello with a random per-profile instance id, stores the port and token the app sends **after you approved there** exactly like the popup does (plus `sinkPaired: true`, `tapMode: "selected"`), reports the tabs that hold a MediaSource (title cleaned and cut, host only, favicon as a small PNG data URL from the browser's `_favicon` service, DRM flag, whether tapped, whether visible) and switches capture per tab when the app asks (the tab is reloaded once when switched on, so the capture sees the init segment). Every message from the host is checked field by field; credentials are accepted only in the approved state; a denial or revocation pauses asking for ten minutes (the popup's *pair now* overrides), a revocation removes credentials the pairing gave (a token typed into the popup stays). Reconnects back off from 5 s to 5 min. The token is never logged and never in the status the popup reads. |
+| `src/tailnet-target.js` | service worker / background page | The target **the sink on the PC over the tailnet** (`sinkTarget: "tailnet"`): pairing with a one-time code (an ECDSA P-256 key pair, the private key non-extractable, kept in IndexedDB with the PC's name, the device id and the sink's id), and a socket for `sink-link.js` that counts as open only once the sink took the device's login (`login`, the sink's challenge with its id, `auth` with the signature, `ok`). `wss://<paired PC>/` only. Every wait ends after 15 s; what the sink says is parsed only up to 1 KiB; a stored pairing of another form reads as *not paired*. Keeps the state for the popup and stops trying after *revoked*, *another sink* and *another version*. See [the target's section](#target-the-sink-on-the-pc-over-the-tailnet-tailscale-or-headscale). |
 | `src/file-target.js` | background page (Firefox) | The target **file on the device** (`sinkTarget: "file"`): a link of `sink-link.js` gets a recorder in place of its WebSocket, which keeps exactly the messages the link would send to the sink (hello, the inits in effect, segments, `initlost` and other events) as one recording per MediaSource, each message with its 32-bit little-endian length behind the line `STREAMTAP-RECORDING/1`. When the link closes (the video or tab ends, or *save the recording now* in the popup) it is saved through the downloads API as `streamtap-<time>-<host>.streamtap`, without a dialog and never over an existing file; a recording without media is not saved. All open recordings hold at most 512 MiB together; beyond that media is dropped, a `recordfull` event is noted once and the popup says so. Needs a background page (a blob URL) and the `downloads` permission: the Firefox build has both, a Chrome service worker does not (there the target is not offered). |
 | `src/source-policy.js` | service worker | The source policy, **on unless `sourcePolicy` is `"off"`** in `chrome.storage.local`, in the Chrome and the Firefox build alike. When on, the hosts of the tab's top document and of the asking frame (from the browser, not the page) are sorted into groups: *released* (own hosts, free licences, ARD, ZDF/3sat/KiKA, learning platforms the user entered) is tapped; *locked* (YouTube and similarly obfuscated services, social media) copies nothing until the user unlocks that group (`sourceUnlocked`); *unknown* is tapped, with a hint to check the site's terms. One locked URL locks the frame, so a locked player embedded in another site is locked too, and a locked host stays locked when the user lists it as own. The content script asks before it taps (also when the app switches a tab on) and taps nothing without an answer. DRM is no group: the hook refuses EME in any case. |
 | `popup/` | action popup | Shows the registry for the current tab, the pairing state with *pair now* (in Firefox: not available), the *Sources* box of the source policy, and the manual port/token fields (fallback; saving them taps every tab as before). |
@@ -114,6 +115,38 @@ and token again (the settings belong to the old id). Reload the tabs that
 were open: the old build's content scripts keep knocking with the page
 origin until then (the sink logs them as `origin rejected: https://…`).
 
+## Target: the sink on the PC over the tailnet (Tailscale or Headscale)
+
+With the phone and the PC in one tailnet, the add-on sends straight to the sink on the PC, as on the desktop: no
+file to carry over. On the PC the sink runs with `--tailnet <pc name>` behind `tailscale serve` (see
+[desktop/README.md](../desktop/README.md), *Phones over the tailnet*; what Headscale needs for it is said there).
+On the phone the Tailscale app must be connected.
+
+Pair once:
+
+1. On the PC: `streamtap-sink devices pair` shows a QR code, good for one minute and one use.
+2. Scan it with the phone's camera and open the link in the Firefox that has the add-on. The page says to open the
+   add-on; its popup (menu, *Extensions*, streamtap) names the PC and offers **pair with this PC**. Or type the PC's
+   name and the code (or paste the whole link) into the popup's *Target* box and tap **pair this device**.
+3. The target switches to *the sink on the PC over the tailnet*. Reload the video page and play.
+
+What is on the phone: one key pair made at pairing. The private key is a WebCrypto key that cannot be exported (the
+add-on can sign with it, nothing can read it out); it lies in the add-on's IndexedDB with the PC's name, the device
+id and the id of the sink. No token, no password. **forget this pairing** (two taps) deletes it; revoke the device
+on the PC as well (`streamtap-sink devices revoke <id>`).
+
+The add-on connects to `wss://<the paired PC>/` and nowhere else on this target, and signs only for the sink it was
+paired with: when another sink answers on that name (a newly set up PC), nothing is sent and the popup asks for a
+new pairing. The popup's line under the target always says what is: *not paired*, *connecting*, *connected*, *the
+PC does not answer* (PC off, sink not running with `--tailnet`, `tailscale serve` off, phone not in the tailnet),
+*revoked on the PC*, *another sink answers*, *another version*. While the PC does not answer, segments are dropped
+and counted (the *dropped* number in the popup), never kept without a bound; the add-on tries again with the next
+segments. After *revoked* or *another sink* it does not try again until you pair anew.
+
+A pairing link counts only when it was opened as a page of its own over `https` on a plain host name; the add-on
+takes the host from the browser, shows it, and does nothing until you tap. Check the name in the popup: it must be
+your PC.
+
 Chrome ≥ 116 (an open WebSocket keeps the service worker alive).
 
 ## Firefox for Android (in progress)
@@ -127,9 +160,10 @@ on by default and leaves the pairing with the desktop app off (Firefox for Andro
 `node extension/scripts/test-firefox.mjs` checks the build; `npx web-ext@8.3.0 lint --source-dir extension/dist/firefox`
 reports no errors or warnings.
 
-What works so far: the hook, the per-tab registry and badge, DRM detection and the source policy. **Nothing is saved
-yet on the phone**: there is no sink there. The two targets (a file on the device, the desktop sink over Tailscale) are
-the next steps.
+What works: the hook, the per-tab registry and badge, DRM detection, the source policy, and two targets, chosen in
+the popup: [a file on the device](#target-a-file-on-the-device-firefox-for-android) and
+[the sink on the PC over the tailnet](#target-the-sink-on-the-pc-over-the-tailnet-tailscale-or-headscale). Neither has
+been tried on a real phone yet.
 
 Install it on your own phone, for yourself only (no store, no listing):
 

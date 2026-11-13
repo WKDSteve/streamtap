@@ -9,7 +9,7 @@
 // Chrome runs this as a service worker and loads the other scripts here; the
 // Firefox build (scripts/build-firefox.mjs) lists them in the manifest's
 // background.scripts, in front of this file, and has no importScripts.
-if (typeof importScripts === "function") importScripts("file-target.js", "sink-link.js", "native-pairing.js", "source-policy.js");
+if (typeof importScripts === "function") importScripts("file-target.js", "tailnet-target.js", "sink-link.js", "native-pairing.js", "source-policy.js");
 const FLAVOR = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR ? STREAMTAP_FLAVOR : { name: "chrome", sourcePolicyDefault: "", nativePairing: true };
 
 const tabs = new Map(); // tabId -> { url, frames: Set, ms: Map<msId, {...}>, drm: [] }
@@ -99,6 +99,31 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.kind === "vc-file-save" && typeof msg.tabId === "number") {
     sendResponse({ saved: fileSaveTab(msg.tabId) });
     return false;
+  }
+  // The target "the sink on the PC over the tailnet" (tailnet-target.js): its state for the popup, pairing with a
+  // typed code or with the code of a pairing link opened in this browser, and forgetting the pairing.
+  if (msg && msg.kind === "vc-tailnet-status") {
+    tnStatus().then(sendResponse, () => sendResponse(null));
+    return true;
+  }
+  if (msg && msg.kind === "vc-tailnet-offer") {
+    sendResponse(tnOffer(sender, msg.code));
+    return false;
+  }
+  if (msg && msg.kind === "vc-tailnet-pair") {
+    // Only the add-on's own pages (the popup) may pair: a content script runs beside a page.
+    if (!tnOwnPage(sender)) return false;
+    const offer = msg.offer === true ? tnOpenOffer() : null;
+    const [host, code] = offer ? [offer.host, offer.code] : [msg.host, msg.code];
+    tnPair(host, code, msg.name)
+      .then((r) => (r.ok ? new Promise((done) => chrome.storage.local.set({ sinkTarget: "tailnet" }, () => done(r))) : r))
+      .then(sendResponse, () => sendResponse({ ok: false, reason: "failed" }));
+    return true;
+  }
+  if (msg && msg.kind === "vc-tailnet-forget") {
+    if (!tnOwnPage(sender)) return false;
+    tnForget().then(sendResponse, () => sendResponse(false));
+    return true;
   }
   if (msg && msg.kind === "vc-pair-status") {
     sendResponse(npStatus());

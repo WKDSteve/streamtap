@@ -38,6 +38,8 @@ pub(crate) struct ServeConfig {
     pub(crate) per_session: u64,
     pub(crate) total_max: u64,
     pub(crate) limits: Limits,
+    /// `--tailnet`: phones through Tailscale Serve; `None`: local connections only.
+    pub(crate) tailnet: Option<TailnetConfig>,
 }
 
 /// The time and connection limits of `serve`.
@@ -59,6 +61,8 @@ pub(crate) struct Timed {
     /// Moment the session counts as idle; `None` until `hello`.
     pub(crate) idle_until: Option<Instant>,
     pub(crate) idle: Duration,
+    /// Moment the connection ends whatever it does (a device's connection, `--tailnet-session-hours`).
+    pub(crate) end_at: Option<Instant>,
     /// Set when a newer connection pushed this one out while it waited for `hello`.
     pub(crate) pushed_out: Arc<AtomicBool>,
 }
@@ -71,6 +75,7 @@ impl Timed {
             deadline: Some(Instant::now() + limits.hello),
             idle_until: None,
             idle: limits.idle,
+            end_at: None,
             pushed_out,
         }
     }
@@ -82,7 +87,11 @@ impl Timed {
     }
 
     pub(crate) fn arm(&self) -> io::Result<()> {
-        let Some(until) = self.deadline.or(self.idle_until) else {
+        let until = match (self.deadline.or(self.idle_until), self.end_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let Some(until) = until else {
             return self.inner.set_read_timeout(Some(self.idle));
         };
         let left = until.saturating_duration_since(Instant::now());
@@ -283,6 +292,27 @@ pub(crate) fn serve_config(args: &[String], stdin: impl Read) -> Result<ServeCon
             ))
         }
     };
+    let tailnet = match flag(args, "--tailnet")? {
+        Some(name) => Some(TailnetConfig {
+            name: tailnet_name(name)?,
+            // Beside the captures by default: the folder the sink already owns.
+            devices: flag(args, "--devices")?
+                .map_or_else(|| out.join("devices.json"), PathBuf::from),
+            max_session: secs(
+                "--tailnet-session-hours",
+                DEFAULT_TAILNET_SESSION_HOURS,
+                168,
+            )? * 3600,
+        }),
+        None if flag(args, "--devices")?.is_some()
+            || flag(args, "--tailnet-session-hours")?.is_some() =>
+        {
+            return Err(SinkError::Usage(
+                "--devices and --tailnet-session-hours need --tailnet".into(),
+            ))
+        }
+        None => None,
+    };
     let token = serve_token(args, stdin)?;
     Ok(ServeConfig {
         token,
@@ -296,6 +326,7 @@ pub(crate) fn serve_config(args: &[String], stdin: impl Read) -> Result<ServeCon
             idle,
             max_connections,
         },
+        tailnet,
     })
 }
 
@@ -309,6 +340,7 @@ pub(crate) fn run_serve(args: &[String]) -> Result<(), SinkError> {
         per_session,
         total_max,
         limits,
+        tailnet,
     } = serve_config(args, io::stdin().lock())?;
     let budget = Arc::new(Budget {
         per_session,
@@ -317,6 +349,8 @@ pub(crate) fn run_serve(args: &[String]) -> Result<(), SinkError> {
     });
     let refusals = Arc::new(Refusals::default());
     fs::create_dir_all(&out).map_err(|e| SinkError::io("cannot create", Some(out.clone()), e))?;
+    // Before the port is bound: a list of devices that cannot be read stops the start.
+    let tailnet = tailnet.as_ref().map(Tailnet::open).transpose()?;
 
     // Loopback only. Binding anything else is not an option, not a flag.
     let listener = TcpListener::bind(("127.0.0.1", port))
@@ -331,6 +365,13 @@ pub(crate) fn run_serve(args: &[String]) -> Result<(), SinkError> {
         "streamtap-sink listening on ws://127.0.0.1:{port}  out={}  origin={origin}",
         out.display()
     );
+    if let Some(t) = &tailnet {
+        println!(
+            "tailnet: https://{} for {} paired device(s); forward it with `tailscale serve --bg {port}` (never funnel)",
+            t.name,
+            t.paired()
+        );
+    }
 
     let active = Arc::new(AtomicUsize::new(0));
     let waiting = Arc::new(Waiting::default());
@@ -352,10 +393,19 @@ pub(crate) fn run_serve(args: &[String]) -> Result<(), SinkError> {
                 let origin = origin.clone();
                 let budget = Arc::clone(&budget);
                 let refusals = Arc::clone(&refusals);
+                let tailnet = tailnet.clone();
                 let spawned = std::thread::Builder::new().spawn(move || {
                     let _slot = slot;
                     if let Err(e) = handle_connection(
-                        s, &token, &origin, &out, &budget, &refusals, limits, entry,
+                        s,
+                        &token,
+                        &origin,
+                        &out,
+                        &budget,
+                        &refusals,
+                        limits,
+                        entry,
+                        tailnet.as_ref(),
                     ) {
                         eprintln!("connection ended with error: {e}");
                     }
@@ -441,8 +491,11 @@ pub(crate) fn next_binary(
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
                 ) =>
             {
-                let what = if ws.get_ref().deadline.is_some() {
+                let t = ws.get_ref();
+                let what = if t.deadline.is_some() {
                     "no hello in time"
+                } else if t.end_at.is_some_and(|end| end <= Instant::now()) {
+                    "the connection reached its time limit (--tailnet-session-hours)"
                 } else {
                     "idle too long"
                 };
@@ -466,7 +519,8 @@ pub(crate) fn accept_ws(
     origin: &str,
     limits: Limits,
     pushed_out: Arc<AtomicBool>,
-) -> Result<(tungstenite::WebSocket<Timed>, std::net::SocketAddr), SinkError> {
+    tailnet: Option<&Tailnet>,
+) -> Result<(tungstenite::WebSocket<Timed>, std::net::SocketAddr, Class), SinkError> {
     let io_err = |what: &'static str| move |e: io::Error| SinkError::io(what, None, e);
     let peer = stream.peer_addr().map_err(io_err("peer address"))?;
     stream
@@ -478,13 +532,31 @@ pub(crate) fn accept_ws(
     let config = tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE + MAX_HEADER + 4))
         .max_frame_size(Some(MAX_MESSAGE + MAX_HEADER + 4));
-    let ws = tungstenite::accept_hdr_with_config(
+    let mut class = Class::Local;
+    let mut ws = tungstenite::accept_hdr_with_config(
         stream,
-        |req: &_, resp| check_origin(origin, req, resp),
+        |req: &_, resp| match classify(tailnet, req) {
+            Ok(Class::Local) => check_origin(origin, req, resp),
+            Ok(Class::Remote) => {
+                class = Class::Remote;
+                check_remote_origin(req, resp)
+            }
+            Err(why) => {
+                eprintln!("{peer}: refused: {why}");
+                Err(forbidden(why))
+            }
+        },
         Some(config),
     )
     .map_err(|e| SinkError::Protocol(format!("{peer}: {e}")))?;
-    Ok((ws, peer))
+    // Until a device is logged in, its messages are a few hundred bytes.
+    if class == Class::Remote {
+        ws.set_config(|c| {
+            c.max_message_size = Some(MAX_GATE_MESSAGE);
+            c.max_frame_size = Some(MAX_GATE_MESSAGE);
+        });
+    }
+    Ok((ws, peer, class))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -497,8 +569,90 @@ pub(crate) fn handle_connection(
     refusals: &Arc<Refusals>,
     limits: Limits,
     waiting: WaitingEntry,
+    tailnet: Option<&Arc<Tailnet>>,
 ) -> Result<(), SinkError> {
-    let (mut ws, peer) = accept_ws(stream, origin, limits, Arc::clone(&waiting.pushed_out))?;
+    let mut stream = stream;
+    // The phone's browser opening the pairing link: a page, no WebSocket.
+    if let Some(t) = tailnet {
+        if answer_plain_get(&mut stream, t, limits.hello, &waiting.pushed_out) != Plain::Handshake {
+            return Ok(());
+        }
+    }
+    let (mut ws, peer, class) = accept_ws(
+        stream,
+        origin,
+        limits,
+        Arc::clone(&waiting.pushed_out),
+        tailnet.map(Arc::as_ref),
+    )?;
+    // A connection through the tailnet is a logged-in device from here on, or it is over.
+    let _device = match (class, tailnet) {
+        (Class::Local, _) => None,
+        (Class::Remote, Some(t)) => {
+            let Some(live) = t.gate(&mut ws, peer) else {
+                return Ok(());
+            };
+            println!("{peer}: device {} logged in", live.device);
+            ws.set_config(|c| {
+                c.max_message_size = Some(MAX_MESSAGE + MAX_HEADER + 4);
+                c.max_frame_size = Some(MAX_MESSAGE + MAX_HEADER + 4);
+            });
+            ws.get_mut().end_at = Some(Instant::now() + t.max_session);
+            Some(live)
+        }
+        (Class::Remote, None) => return Ok(()),
+    };
+    let local = class == Class::Local;
+    let door = Door {
+        token,
+        local,
+        tailnet,
+    };
+    run_session(ws, peer, &door, out, budget, refusals, waiting)
+}
+
+/// Who may say what on a connection that passed the handshake.
+pub(crate) struct Door<'a> {
+    pub(crate) token: &'a Secret,
+    /// From this machine: `hello` needs the token, and the command line may ask. Otherwise a logged-in device.
+    pub(crate) local: bool,
+    pub(crate) tailnet: Option<&'a Arc<Tailnet>>,
+}
+
+/// A first message that is not `hello`. The sink's own command line (`devices`) is answered: from this machine
+/// only, with the token. Everything else ends the connection (a device pairs and logs in before the read loop).
+fn before_hello(
+    ws: &mut tungstenite::WebSocket<Timed>,
+    peer: std::net::SocketAddr,
+    door: &Door<'_>,
+    header: Header,
+) {
+    match header {
+        Header::Control { token, op, device } if door.local => {
+            if door.token.matches(token.as_bytes()) {
+                tell(ws, &control(door.tailnet, &op, &device));
+            } else {
+                eprintln!("{peer}: wrong token, closing");
+            }
+        }
+        Header::Segment(_) | Header::Event { .. } => {
+            eprintln!("{peer}: message before hello, closing");
+        }
+        _ => eprintln!("{peer}: a device message out of place, closing"),
+    }
+}
+
+/// The read loop of a connection: `hello`, then segments and events until it ends.
+pub(crate) fn run_session(
+    mut ws: tungstenite::WebSocket<Timed>,
+    peer: std::net::SocketAddr,
+    door: &Door<'_>,
+    out: &Path,
+    budget: &Arc<Budget>,
+    refusals: &Arc<Refusals>,
+    waiting: WaitingEntry,
+) -> Result<(), SinkError> {
+    let token = door.token;
     let mut session: Option<Session> = None;
     let mut waiting = Some(waiting);
     let mut bad_messages = 0u32;
@@ -542,7 +696,8 @@ pub(crate) fn handle_connection(
                 },
                 None,
             ) => {
-                if !token.matches(t.as_bytes()) {
+                // A device proved itself with its key; everything else needs the shared token.
+                if door.local && !token.matches(t.as_bytes()) {
                     eprintln!("{peer}: wrong token, closing");
                     break;
                 }
@@ -567,8 +722,8 @@ pub(crate) fn handle_connection(
             (Header::Hello { .. }, Some(_)) => {
                 eprintln!("{peer}: second hello, ignoring");
             }
-            (_, None) => {
-                eprintln!("{peer}: message before hello, closing");
+            (h, None) => {
+                before_hello(&mut ws, peer, door, h);
                 break;
             }
             (Header::Segment(h), Some(s)) => {
@@ -591,6 +746,10 @@ pub(crate) fn handle_connection(
                     s.finish();
                     s.summary();
                 }
+            }
+            (_, Some(_)) => {
+                eprintln!("{peer}: a device message out of place, closing");
+                break;
             }
         }
     }

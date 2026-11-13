@@ -21,6 +21,8 @@
       .policy, .target { margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
       .target label { display: block; margin: 4px 0; }
       #file-state { white-space: pre-line; }
+      .tailnet { margin: 4px 0 6px 20px; }
+      .tailnet input { width: 230px; }
       .policy label { display: block; margin: 4px 0; }
       .policy textarea { width: 100%; box-sizing: border-box; min-height: 3em; font: inherit; }
       .locked { color: #8a0012; }
@@ -34,7 +36,8 @@
         input[type="checkbox"] { width: 24px; height: 24px; vertical-align: middle; }
         .policy label, .target label { min-height: 44px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
         input[type="radio"] { width: 24px; height: 24px; }
-        .sink input { width: 100%; box-sizing: border-box; min-height: 44px; }
+        .sink input, .tailnet input { width: 100%; box-sizing: border-box; min-height: 44px; }
+        .tailnet { margin-left: 0; }
         th, td { white-space: normal; }
       }
       @media (prefers-color-scheme: dark) {
@@ -71,6 +74,20 @@
       <legend>Target</legend>
       <label><input type="radio" name="target" value="sink" id="target-sink" /> the sink on the PC (port and token below, or a paired app)</label>
       <label><input type="radio" name="target" value="file" id="target-file" /> a file on this device (a recording; on the PC: <code>streamtap-sink replay</code>, then <code>mux</code>)</label>
+      <label><input type="radio" name="target" value="tailnet" id="target-tailnet" /> the sink on the PC over the tailnet (Tailscale or Headscale; this device paired with the PC)</label>
+      <div class="tailnet">
+        <div id="tailnet-state" class="muted" role="status"></div>
+        <div id="tailnet-offer" hidden>
+          <span id="tailnet-offer-text"></span>
+          <button id="tailnet-offer-pair">pair with this PC</button>
+        </div>
+        <label>PC in the tailnet <input id="tailnet-host" type="text" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="pc.example.ts.net" /></label>
+        <label>pairing code (or the whole link) <input id="tailnet-code" type="text" autocapitalize="none" autocomplete="off" spellcheck="false" maxlength="400" /></label>
+        <label>name of this device <input id="tailnet-name" type="text" maxlength="40" placeholder="phone" /></label>
+        <button id="tailnet-pair">pair this device</button>
+        <button id="tailnet-forget" hidden>forget this pairing</button>
+        <div id="tailnet-result" class="muted" role="status"></div>
+      </div>
       <label class="muted"><input type="radio" name="target" value="video" id="target-video" disabled /> a video on this device (MP4, made here; not yet)</label>
       <div id="file-state" class="muted"></div>
       <button id="file-save" hidden>save the recording now</button>

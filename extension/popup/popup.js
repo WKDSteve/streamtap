@@ -120,6 +120,47 @@ const hostLines = (v) =>
     .filter(Boolean)
     .slice(0, 200);
 
+// The state of the tailnet target as [class, text]: what is, and the next step (never a silent failure).
+const tailnetText = (s) => {
+  const pc = String(s.host);
+  const id = String(s.device).slice(0, 8);
+  switch (s.state) {
+    case "not-paired":
+      return ["", "over the tailnet: not paired. On the PC: streamtap-sink devices pair, then scan its QR code with this phone or type the code below."];
+    case "connected":
+      return ["released", `over the tailnet: connected to ${pc} (device ${id})`];
+    case "connecting":
+      return ["", `over the tailnet: connecting to ${pc}…`];
+    case "unreachable":
+      return ["locked", `over the tailnet: ${pc} does not answer, nothing is sent. Is the PC on, the sink running with --tailnet, tailscale serve on, and this phone in the tailnet?`];
+    case "lost":
+      return ["locked", `over the tailnet: the connection to ${pc} ended; the next segment tries again`];
+    case "revoked":
+      return ["locked", `over the tailnet: ${pc} no longer knows this device (revoked there): nothing is sent and its key was deleted here. Pair again.`];
+    case "hub-changed":
+      return ["locked", `over the tailnet: another sink answers as ${pc} than the one this device was paired with; nothing was sent to it. Pair again if that is your PC.`];
+    case "version":
+      return ["locked", `over the tailnet: the sink on ${pc} speaks another version. Update the add-on or the sink.`];
+    case "refused":
+      return ["locked", `over the tailnet: ${pc} refused the login; the next segment tries again`];
+    default:
+      return ["", `over the tailnet: paired with ${pc} (device ${id}); nothing sent yet`];
+  }
+};
+
+const PAIR_ERRORS = {
+  host: "not a name in the tailnet (like pc.example.ts.net, no port)",
+  code: "the code is wrong, was used, or is older than a minute: make a new one on the PC",
+  unreachable: "the PC does not answer: is the sink running with --tailnet, tailscale serve on, and this phone in the tailnet?",
+  busy: "too many pairing attempts: wait a minute",
+  full: "the PC has its 16 devices: revoke one there first",
+  known: "this key is already paired there",
+  name: "the PC did not take this device name",
+  version: "the sink on the PC speaks another version: update the add-on or the sink",
+  storage: "this browser could not keep the key (private window?)",
+  unsupported: "pairing is not available in this browser",
+};
+
 const fmtLink = (s) =>
   !s || !s.links
     ? "sink: no segments tapped in this tab yet"
@@ -228,18 +269,86 @@ const load = async () => {
       document.getElementById("link").textContent = fmtLink(s);
       showFile(s && s.file, target);
     });
-  chrome.storage.local.get({ sinkTarget: "" }, (v) => {
-    const target = v.sinkTarget === "file" ? "file" : "sink";
-    document.getElementById(`target-${target}`).checked = true;
-    askLink(target);
-  });
-  for (const value of ["sink", "file"]) {
+  const showTarget = () =>
+    chrome.storage.local.get({ sinkTarget: "" }, (v) => {
+      const target = v.sinkTarget === "file" || v.sinkTarget === "tailnet" ? v.sinkTarget : "sink";
+      document.getElementById(`target-${target}`).checked = true;
+      askLink(target);
+    });
+  showTarget();
+  for (const value of ["sink", "file", "tailnet"]) {
     document.getElementById(`target-${value}`).onchange = () =>
-      chrome.storage.local.set({ sinkTarget: value === "file" ? "file" : "" }, () => {
+      chrome.storage.local.set({ sinkTarget: value === "sink" ? "" : value }, () => {
         document.getElementById("target-saved").textContent = "saved; reload the video page";
         askLink(value);
       });
   }
+
+  // The target "the sink on the PC over the tailnet": its state with the next step, and the pairing.
+  const tailnetState = document.getElementById("tailnet-state");
+  const tailnetResult = document.getElementById("tailnet-result");
+  const tailnetForget = document.getElementById("tailnet-forget");
+  const showTailnet = (s) => {
+    void chrome.runtime.lastError;
+    const usable = Boolean(s && s.available);
+    document.getElementById("target-tailnet").disabled = !usable;
+    document.getElementById("tailnet-pair").disabled = !usable;
+    document.getElementById("tailnet-offer").hidden = !(usable && s.offer);
+    tailnetForget.hidden = !(usable && s.paired);
+    if (!usable) {
+      tailnetState.className = "muted";
+      tailnetState.textContent = "over the tailnet: not available in this browser";
+      return;
+    }
+    if (s.offer) document.getElementById("tailnet-offer-text").textContent = `A pairing link of ${s.offer} was opened in this browser.`;
+    if (s.paired && !document.getElementById("tailnet-host").value) document.getElementById("tailnet-host").value = s.host;
+    const [cls, what] = tailnetText(s);
+    tailnetState.className = cls || "muted";
+    tailnetState.textContent = what;
+  };
+  const askTailnet = () => chrome.runtime.sendMessage({ kind: "vc-tailnet-status" }, showTailnet);
+  askTailnet();
+  const paired = (r) => {
+    void chrome.runtime.lastError;
+    const ok = Boolean(r && r.ok);
+    tailnetResult.className = ok ? "released" : "locked";
+    tailnetResult.textContent = ok
+      ? `paired with ${r.host}; the target is now the sink over the tailnet (reload the video page)`
+      : PAIR_ERRORS[r && r.reason] || "pairing failed";
+    if (ok) document.getElementById("tailnet-code").value = "";
+    askTailnet();
+    showTarget();
+  };
+  const pairWith = (msg) => {
+    tailnetResult.className = "muted";
+    tailnetResult.textContent = "pairing…";
+    chrome.runtime.sendMessage({ kind: "vc-tailnet-pair", name: document.getElementById("tailnet-name").value, ...msg }, paired);
+  };
+  document.getElementById("tailnet-offer-pair").onclick = () => pairWith({ offer: true });
+  document.getElementById("tailnet-pair").onclick = () => {
+    // The code alone, or the whole pairing link (it names the PC too).
+    const typed = String(document.getElementById("tailnet-code").value).trim();
+    const link = /^https:\/\/([^/#?]+)\/?#streamtap-pair=1&code=([0-9a-f]{32})$/.exec(typed);
+    if (link) document.getElementById("tailnet-host").value = link[1];
+    pairWith({ host: document.getElementById("tailnet-host").value, code: link ? link[2] : typed.toLowerCase() });
+  };
+  // Forgetting needs a second tap: captures to the PC stop with it.
+  let forgetArmed = false;
+  tailnetForget.onclick = () => {
+    if (!forgetArmed) {
+      forgetArmed = true;
+      tailnetForget.textContent = "tap again to forget (then revoke it on the PC too)";
+      return;
+    }
+    forgetArmed = false;
+    tailnetForget.textContent = "forget this pairing";
+    chrome.runtime.sendMessage({ kind: "vc-tailnet-forget" }, (ok) => {
+      void chrome.runtime.lastError;
+      tailnetResult.className = ok ? "muted" : "locked";
+      tailnetResult.textContent = ok ? "forgotten on this device; on the PC: streamtap-sink devices revoke <id>" : "could not forget the pairing";
+      askTailnet();
+    });
+  };
   fileSave.onclick = () =>
     chrome.runtime.sendMessage({ kind: "vc-file-save", tabId: tab.id }, () => {
       void chrome.runtime.lastError;

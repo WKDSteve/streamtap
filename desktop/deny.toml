@@ -30,6 +30,8 @@ allow = [
     "BSD-3-Clause",
     "Zlib",
     "MPL-2.0",
+    # notify (a file watcher appkit-hub brings; the sink does not use it) is CC0-1.0, a public domain dedication.
+    "CC0-1.0",
 ]
 
 [bans]
@@ -44,4 +46,5 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# The shared foundation of the app families (appkit), by tag; Cargo.lock pins the commit.
+allow-git = ["https://github.com/WKDSteve/appkit"]

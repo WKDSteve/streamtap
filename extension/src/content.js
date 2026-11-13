@@ -21,6 +21,20 @@
   const TAG = "[vc-content]";
   const inExtension = typeof chrome !== "undefined" && !!(chrome.runtime && chrome.runtime.id);
 
+  // The sink's pairing link (`https://<pc>/#streamtap-pair=1&code=...`, a QR code on the PC) opened in this browser:
+  // the one-time code goes to the service worker, which names the PC in the popup and waits for a tap there, and
+  // leaves the address at once (MSEC-02). The service worker takes the host from the browser, not from here.
+  const pairHash = inExtension && typeof location.hash === "string" ? location.hash : "";
+  if (pairHash.startsWith("#streamtap-pair=1&") && window === window.top && location.protocol === "https:") {
+    const code = new URLSearchParams(pairHash.slice(1)).get("code") || "";
+    try {
+      history.replaceState(null, "", location.pathname + location.search);
+    } catch (e) {
+      // The address stays; the code is good for one use and one minute.
+    }
+    if (/^[0-9a-f]{32}$/.test(code)) chrome.runtime.sendMessage({ kind: "vc-tailnet-offer", code }, () => void chrome.runtime.lastError);
+  }
+
   // ---------------------------------------------------------------------------
   // Validation of the forgeable records
   // ---------------------------------------------------------------------------

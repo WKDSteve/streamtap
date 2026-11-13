@@ -32,6 +32,8 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
     [--allow-origin chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia]
     [--max-session-gib 16] [--max-total-gib 64]
     [--hello-timeout-secs 10] [--idle-timeout-secs 3600] [--max-connections 16]
+    [--tailnet <pc.example.ts.net> [--devices <devices.json>] [--tailnet-session-hours 12]]
+target/release/streamtap-sink devices [pair | revoke <id>] (--token-stdin | --token <secret>) [--port 17650]
 ```
 
 ```
@@ -39,7 +41,8 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
 '<secret>' | target/release/streamtap-sink serve --token-stdin
 ```
 
-- Binds **127.0.0.1 only**; there is no flag to bind anything else.
+- Binds **127.0.0.1 only**; there is no flag to bind anything else. A phone comes in through Tailscale Serve
+  on the same machine (`--tailnet`, see [Phones over the tailnet](#phones-over-the-tailnet-tailscale-or-headscale)).
 - The handshake's `Origin` must equal the allowed origin exactly (default:
   the streamtap extension, whose id the manifest `key` fixes). A web page,
   another extension or a client without `Origin` gets `403` before anything
@@ -166,6 +169,77 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
   re-append after a seek is dropped, a new period kept.
 - The untimed continuation chunks (no `moof`) of a skipped duplicate are
   skipped too, or they would land as orphan bytes.
+
+## Phones over the tailnet (Tailscale or Headscale)
+
+A phone has no sink. With `--tailnet` the sink on the PC also takes captures from the streamtap add-on on your own
+phones, through [Tailscale Serve](https://tailscale.com/kb/1312/serve). Nothing about the bind changes: the sink
+still listens on `127.0.0.1` only. `tailscale serve` on the same PC ends TLS for the PC's name in your tailnet and
+forwards to that port, so only devices of your tailnet get there, and each of them only as a **paired device with a
+key of its own** (the shared token opens nothing on this way). Never use `tailscale funnel` for it: that is the
+public internet.
+
+```
+tailscale serve --bg 17650                                   # https://<pc>.<tailnet>.ts.net -> 127.0.0.1:17650
+'<secret>' | streamtap-sink serve --token-stdin --tailnet <pc>.<tailnet>.ts.net
+'<secret>' | streamtap-sink devices pair --token-stdin       # a one-time link, as a QR code
+'<secret>' | streamtap-sink devices --token-stdin            # the paired phones
+'<secret>' | streamtap-sink devices revoke <id> --token-stdin
+```
+
+- `--tailnet <name>` is the PC's name exactly as the tailnet has it (`tailscale status`, MagicDNS): lower case, no
+  `https://`, no port; another form is a usage error. The sink then prints a second line with the address and the
+  number of paired devices.
+- **Which connection is which.** A request Tailscale Serve forwarded carries the tailnet name as `Host` and the
+  proxy's `X-Forwarded-*` headers. Such a connection is a device's: its `Origin` must be an extension's
+  (`moz-extension://…`, `chrome-extension://…`; a web page open on the phone stops at the handshake with `403`),
+  and its first message must be `pair` or `login`. A forwarded request for any other host is refused, also when the
+  sink runs without `--tailnet`. Everything else is local and works as before (exact origin, token).
+- **Pairing** (`devices pair`, asked of the running sink over loopback with the token): a code of 128 bit, good for
+  60 seconds and one use, shown as `https://<name>/#streamtap-pair=1&code=…` (the code is in the fragment, which a
+  browser sends to no server), as a QR code of that link, and as plain text to type. Scan it with the phone's
+  camera and open it in the browser that has the add-on: the sink answers that address with a small page without
+  scripts, the add-on takes the code out of the address and asks in its popup; or type the PC's name and the code
+  into the popup. The phone sends the code with a name and the public half of an ECDSA P-256 key whose private half
+  never leaves it (WebCrypto, non-extractable).
+- **The list of devices** is `devices.json` in the capture folder (`--devices <file>` puts it elsewhere): ids,
+  names, public keys, times and the id of this sink. Nothing in it is secret. At most 16 devices. A list that cannot
+  be read stops the start. The list, the code and the check of the signature are
+  [appkit](https://github.com/WKDSteve/appkit)'s, as in the other apps of the family.
+- **Login.** Every connection of a phone: `login` with its id, the sink answers with a challenge and its own id,
+  the phone signs the challenge together with `https://<name>` and its id, and only then says `hello`. A challenge
+  is good for one answer and 60 seconds. The phone compares the sink's id with the one of its pairing first: a
+  newly set up PC on the same name gets no signature, the popup asks for a new pairing.
+- **Revoking** (`devices revoke <id>`) forgets one device and closes its open connections at once; the others are
+  untouched. A lost phone: revoke it here, then remove it from the tailnet (Tailscale: the admin console; Headscale:
+  `headscale nodes delete`).
+- **Limits per connection.** Before the login a phone may send 4 KiB per message and has `--hello-timeout-secs`
+  for pairing or login and `hello` together; at most 10 pairing attempts per minute are looked at. After it the
+  limits of every connection apply (`--max-session-gib`, `--idle-timeout-secs`, 64 MiB per message), and one
+  connection lasts at most `--tailnet-session-hours` (default 12, up to 168); the add-on then logs in again and the
+  capture goes on in a new folder.
+- **Whatever is refused is said to the phone** before the close (`refused` with a reason: `code`, `device`,
+  `version`, `busy`, `full`, …), so the popup can show what happened instead of a silent failure.
+
+**Tailscale.** Enable HTTPS certificates for the tailnet once (admin console, DNS); the certificate is Let's
+Encrypt's for `<pc>.<tailnet>.ts.net`, so the machine name appears in the public certificate transparency log.
+`tailscale serve status` shows what is forwarded, `tailscale serve --https=443 off` ends it. Use the tailnet's
+access rules to let only your own phones reach the PC on port 443.
+
+**Headscale** (your own coordination server in place of tailscale.com). The sink and the add-on do not care who
+coordinates; two things differ:
+
+- The name is `<pc>.<base_domain>` with the `dns.base_domain` of your Headscale configuration (MagicDNS on), not
+  `…ts.net`. That is the value of `--tailnet`.
+- `tailscale serve` needs a certificate for that name, and the node gets it through the coordination server
+  (`tailscale cert`). Headscale 0.29 (stable when this was written, 2026-11) does not hand one out: `tailscale serve`
+  works there with `--http` only, which is plain HTTP inside the tunnel. The add-on speaks `wss://` and nothing else
+  (no plain text, no own certificate authority to install), so with such a Headscale this target is not available:
+  use the target *a file on this device*. Support for `tailscale cert` (Headscale answers the node's DNS challenge
+  through a DNS provider for your own domain) is tracked in
+  [headscale#1921](https://github.com/juanfont/headscale/issues/1921) and marked done for a later release; on a
+  version that has it, `tailscale serve --bg 17650` and everything above work unchanged. Check with
+  `tailscale cert <pc>.<base_domain>` on the PC: when that writes a certificate, Serve can.
 
 ## Mux
 
@@ -324,6 +398,13 @@ Headers:
 | `hello` | `token`, `session`, `url`, `title` | none; must be the first message |
 | `segment` | `sb`, `seq`, `ms`, `mime`, `isInit`, `initCont`, `kind`, `tfdt` (number, or decimal string above 2^53), `timescale` (u32), `track` (track ID of the first fragment: the track `tfdt` and `dur` belong to; optional, older extensions send none), `dur` (ticks of the first track), `tso` (seconds), `seqMode`, `tsoSet` (`timestampOffset` set since the previous append that carried samples; an init, boxes in front of samples, a short head or a piece cut inside the head boxes, appended without samples do not use it up; the piece with the `moof`/`mdat` takes it) | the segment bytes exactly as passed to `appendBuffer` |
 | `event` | `name` (`endofstream`, `changetype`, `initlost`), `sb` | none |
+| `pair` | `v` (1), `code`, `name`, `key` (the public key, SEC1 uncompressed, hex) | none; a phone over the tailnet, in place of `hello` |
+| `login` | `v` (1), `device` | none; a paired phone, first message |
+| `auth` | `signature` (ECDSA P-256 over SHA-256, r and s, hex) of `appkit-device-login/1\nhttps://<name>\n<device>\n<challenge>` | none; then `hello` without a token |
+| `control` | `token`, `op` (`pair`, `devices`, `revoke`), `device` | none; the sink's own command line, loopback only |
+
+What the sink says (to a phone and to its command line only) are WebSocket **text** messages, JSON:
+`paired` (`device`, `hub`), `challenge` (`hub`, `challenge`), `ok`, `refused` (`reason`), each with `v`.
 ## Test without a browser
 
 `cargo test --release` runs the unit tests (dedupe, split inits, ABR

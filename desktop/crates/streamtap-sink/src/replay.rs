@@ -106,6 +106,14 @@ pub(crate) fn replay_from(
                     "the recording does not start with a hello".into(),
                 ));
             }
+            // Messages of a live connection (pairing, login, the command line): a recording holds none.
+            (
+                Header::Pair { .. }
+                | Header::Login { .. }
+                | Header::Auth { .. }
+                | Header::Control { .. },
+                Some(_),
+            ) => eprintln!("a message of a live connection in the recording, ignoring"),
             (Header::Segment(h), Some(s)) => s
                 .write_segment(&h, payload)
                 .map_err(|e| SinkError::io("write", Some(s.dir.clone()), e))?,

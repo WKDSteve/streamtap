@@ -157,11 +157,18 @@ const sinkFrame = (header, payload) => {
   return payload ? new Blob([len, h, payload]) : new Blob([len, h]);
 };
 
-// The target: the sink over a WebSocket (a port and a token), or a file on the device (file-target.js, where this
-// browser can save one). Without either the extension stays in metadata-only mode.
+// The target: the sink over a WebSocket (a port and a token), a file on the device (file-target.js, where this
+// browser can save one), or the sink on the PC over the tailnet (tailnet-target.js, as a paired device: no token).
+// Without any of them the extension stays in metadata-only mode.
 const sinkSettings = () =>
   new Promise((resolve) => {
     chrome.storage.local.get({ sinkPort: 17650, sinkToken: "", sinkTarget: "" }, (v) => {
+      if (v.sinkTarget === "tailnet") {
+        // Never the local sink in its place: a phone that is not paired sends nothing, and the popup says so.
+        if (typeof tnSettings !== "function") return resolve(null);
+        tnSettings().then((p) => resolve(p ? { tailnet: p, token: "" } : null), () => resolve(null));
+        return;
+      }
       if (v.sinkTarget === "file" && typeof fileTargetAvailable === "function" && fileTargetAvailable()) {
         resolve({ file: true, token: "" });
         return;
@@ -282,6 +289,9 @@ const linkConnect = async (link) => {
   let ws = null;
   if (settings && settings.file) {
     ws = new FileRecorder(link.tabId, link.hello.url);
+  } else if (settings && settings.tailnet) {
+    // Open for the link only once the sink took this device's login.
+    ws = new TailnetSocket(settings.tailnet);
   } else if (settings) {
     try {
       ws = new WebSocket(`ws://127.0.0.1:${settings.port}/`);

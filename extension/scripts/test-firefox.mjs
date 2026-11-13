@@ -42,7 +42,7 @@ try {
   check(m.permissions.includes("downloads"), "permissions: downloads, to save a recording on the device");
   check(!m.background.service_worker && Array.isArray(m.background.scripts), "an event page (background.scripts), no service worker");
   check(m.background.scripts[0] === "src/flavor-firefox.js" && m.background.scripts.at(-1) === "src/background.js", "background: the flavour first, background.js last");
-  check(["src/sink-link.js", "src/native-pairing.js", "src/source-policy.js"].every((s) => m.background.scripts.includes(s)), "background: every script background.js imports");
+  check(["src/file-target.js", "src/tailnet-target.js", "src/sink-link.js", "src/native-pairing.js", "src/source-policy.js"].every((s) => m.background.scripts.includes(s)), "background: every script background.js imports");
   check(m.browser_specific_settings.gecko.id === GECKO_ID && m.browser_specific_settings.gecko_android.strict_min_version === "128.0", "gecko id and Firefox 128 for Android (MAIN world)");
   const [hook, content] = m.content_scripts;
   check(hook.world === "MAIN" && hook.js.length === 1 && hook.js[0] === "src/hook.js", "the hook runs alone in the MAIN world (no flavour there)");

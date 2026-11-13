@@ -38,8 +38,12 @@ alone, by design. Respect the terms of the sites you use it on; see the
   source policy, on by default on the desktop too, that taps released sources and unlisted sites
   and keeps groups such as obfuscated services and social media locked until you unlock them
   (popup, *Sources*); never DRM. A build script
-  makes the Firefox variant and its `.xpi`; it does not save anything on the phone yet. See
-  "Source policy" and "Firefox for Android" in [extension/README.md](extension/README.md).
+  makes the Firefox variant and its `.xpi`. Two targets on the phone (code done, hand run on a phone pending): a
+  recording saved on the device (`streamtap-sink replay` reads it on the PC), and the sink on the PC over your
+  tailnet (Tailscale Serve, or a Headscale that issues certificates): the sink stays on loopback, each phone is
+  paired with a one-time code and a key of its own and can be revoked alone. See
+  "Source policy", "Firefox for Android" and the two "Target" sections in [extension/README.md](extension/README.md),
+  and "Phones over the tailnet" in [desktop/README.md](desktop/README.md).
 
 Layout:
 

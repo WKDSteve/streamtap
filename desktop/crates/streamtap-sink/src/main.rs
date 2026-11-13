@@ -5,6 +5,8 @@
 //!          segment to disk, one file per `SourceBuffer` (and per init-segment
 //!          "part"), plus an `index.jsonl` with the segment metadata.
 //! `mux`    turns a capture directory into a playable MP4 with `ffmpeg -c copy`.
+//! `devices` asks a running `serve --tailnet` for a phone's pairing link or the paired phones, or revokes
+//!          one (tailnet.rs: phones reach the sink through Tailscale Serve, each with a key of its own).
 //! `replay` turns a recording saved on a phone (the extension's target "file on the device") into a
 //!          capture directory, through the same session code as `serve`.
 //!
@@ -34,6 +36,7 @@ mod proc;
 mod replay;
 mod serve;
 mod session;
+mod tailnet;
 #[cfg(test)]
 mod tests;
 mod wire;
@@ -45,6 +48,7 @@ use proc::{Spec, Tool, Tools};
 use replay::*;
 use serve::*;
 use session::*;
+use tailnet::*;
 use wire::*;
 
 /// Deadline of `ffmpeg -version`.
@@ -107,10 +111,11 @@ fn main() {
         Some("serve") => ("serve", run_serve(&args[1..])),
         Some("mux") => ("mux", run_mux(&args[1..], &Tools::default())),
         Some("replay") => ("replay", run_replay(&args[1..])),
+        Some("devices") => ("devices", run_devices(&args[1..])),
         _ => (
             "streamtap-sink",
             Err(SinkError::Usage(format!(
-                "usage:\n  streamtap-sink serve (--token-stdin | --token <token>) [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}] [--hello-timeout-secs {DEFAULT_HELLO_TIMEOUT_SECS}] [--idle-timeout-secs {DEFAULT_IDLE_TIMEOUT_SECS}] [--max-connections {DEFAULT_MAX_CONNECTIONS}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}] [--verbose]
+                "usage:\n  streamtap-sink serve (--token-stdin | --token <token>) [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}] [--hello-timeout-secs {DEFAULT_HELLO_TIMEOUT_SECS}] [--idle-timeout-secs {DEFAULT_IDLE_TIMEOUT_SECS}] [--max-connections {DEFAULT_MAX_CONNECTIONS}] [--tailnet <pc.example.ts.net> [--devices <devices.json>] [--tailnet-session-hours {DEFAULT_TAILNET_SESSION_HOURS}]]\n  streamtap-sink devices [pair | revoke <id>] (--token-stdin | --token <token>) [--port {DEFAULT_PORT}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}] [--verbose]
   streamtap-sink replay <recording.streamtap> [--out captures]"
             ))),
         ),
