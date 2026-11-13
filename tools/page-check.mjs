@@ -1,5 +1,5 @@
 // The app's page in a real Chrome with a stand-in for the Tauri bridge: axe in light and dark, also with a button hovered
-// and focused, and with a hint and a capture on the page. streamtap itself has no Node dependency: Playwright and axe come
+// and focused, and with a hint and a capture on the page; then the phones panel with a pairing code and a paired phone. streamtap itself has no Node dependency: Playwright and axe come
 // at fixed versions from the folder tools/page-check, which nothing else reads.
 //
 //   pnpm --dir tools/page-check install --frozen-lockfile
@@ -57,7 +57,7 @@ try {
 
   // The panels a click opens are part of the page.
   await page.evaluate(() => {
-    for (const id of ["browser", "settings"]) document.getElementById(id).hidden = false;
+    for (const id of ["browser", "settings", "phones"]) document.getElementById(id).hidden = false;
   });
 
   for (const theme of ["light", "dark"]) {
@@ -81,6 +81,41 @@ try {
     await primary.focus();
     await axe(page, `${theme}, a filled button hovered and focused`);
     await page.mouse.move(0, 0);
+  }
+
+  // The phones panel while the sink runs: the paired phone and a pairing code with its QR code. The stand-in's
+  // snapshot is the object the page holds, so the sink is "started" by changing it.
+  // Axe reads the style sheets of a file:// page itself and logs that it may not; only what the panel adds counts.
+  const before = problems.length;
+  await page.evaluate(async () => {
+    state.snap.sink.state = "running";
+    state.phonesOpen = true;
+    await pairPhone();
+  });
+  const shown = await page.evaluate(() => ({
+    qr: document.querySelectorAll("#pairing-qr svg.qr path").length,
+    box: !document.getElementById("pairing-box").hidden,
+    phone: document.getElementById("phones-list").innerText,
+    command: document.getElementById("serve-cmd").innerText,
+  }));
+  check("the phones panel draws without a console error", problems.length === before, problems.slice(before).join("; "));
+  check("the phones panel shows the pairing code as a QR code", shown.box && shown.qr === 1);
+  check("the phones panel lists the paired phone", shown.phone.includes("A phone"), shown.phone);
+  check("the phones panel shows the command for Tailscale Serve", shown.command === "tailscale serve --bg 17650", shown.command);
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate((name) => {
+      document.documentElement.dataset.theme = name;
+    }, theme);
+    await axe(page, `${theme}, phones with a pairing code`);
+    // A QR code is dark on light in both themes (a scanner may not read an inverted one).
+    const lightness = await page.evaluate(() => {
+      const of = (selector) => {
+        const [r, g, b] = getComputedStyle(document.querySelector(selector)).fill.match(/[\d.]+/g).map(Number);
+        return r + g + b;
+      };
+      return { dark: of("#pairing-qr .qr-dark"), light: of("#pairing-qr .qr-light") };
+    });
+    check(`${theme}: the QR code is dark on light`, lightness.dark < 200 && lightness.light > 650, JSON.stringify(lightness));
   }
 } finally {
   await browser.close();

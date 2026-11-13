@@ -1,6 +1,6 @@
 //! The app's settings (`config.json` in the app config dir): sink port,
-//! the shared token, the captures directory and the UI preferences
-//! (language and theme).
+//! the shared token, the captures directory, the PC's name in the tailnet
+//! (for phones) and the UI preferences (language and theme).
 
 use std::collections::hash_map::RandomState;
 use std::fmt::Write as _;
@@ -28,6 +28,11 @@ pub(crate) struct Settings {
     pub(crate) port: u16,
     pub(crate) token: Token,
     pub(crate) captures_dir: PathBuf,
+    /// The name of this PC in the tailnet (`pc.example.ts.net`): the sink then also takes paired phones through
+    /// Tailscale Serve. Empty: local connections only. Missing in configs written before it existed.
+    /// Not written while it is empty, so a config without phones stays the file it was.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) tailnet: String,
     /// UI language; missing in configs written before it existed.
     #[serde(default, deserialize_with = "lenient")]
     pub(crate) language: Language,
@@ -126,6 +131,7 @@ impl Settings {
             port: DEFAULT_PORT,
             token: Token::generate(),
             captures_dir: data_dir.join("captures"),
+            tailnet: String::new(),
             language: Language::default(),
             theme: Theme::default(),
         }
@@ -159,6 +165,12 @@ impl Settings {
         if self.captures_dir.to_string_lossy().starts_with('-') {
             return Err("captures directory must not start with '-'".into());
         }
+        if !self.tailnet.is_empty() && !crate::phones::tailnet_name_ok(&self.tailnet) {
+            return Err(
+                "the name in the tailnet must be a plain host name: lower case, no https://, no port (pc.example.ts.net)"
+                    .into(),
+            );
+        }
         Ok(())
     }
 
@@ -169,6 +181,7 @@ impl Settings {
         self.port == other.port
             && self.token.matches(other.token.expose().as_bytes())
             && self.captures_dir == other.captures_dir
+            && self.tailnet == other.tailnet
             && self.language == other.language
             && self.theme == other.theme
     }
@@ -219,6 +232,7 @@ mod tests {
             port: 17650,
             token: "0123456789abcdef0123".into(),
             captures_dir: dir,
+            tailnet: String::new(),
             language: Language::System,
             theme: Theme::System,
         }
@@ -302,6 +316,28 @@ mod tests {
         let want: serde_json::Value = serde_json::from_str(old).unwrap();
         assert_eq!(back, want);
         assert!(!format!("{s:?}").contains("0123456789abcdef0123"));
+    }
+
+    #[test]
+    fn the_tailnet_name_is_kept_checked_and_absent_when_empty() {
+        let mut s = base();
+        assert!(serde_json::to_value(&s).unwrap().get("tailnet").is_none());
+        s.tailnet = "pc.example.ts.net".into();
+        assert!(s.validate().is_ok());
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["tailnet"], "pc.example.ts.net");
+        let back: Settings = serde_json::from_value(json).unwrap();
+        assert!(back.same_as(&s));
+        for bad in [
+            "https://pc.example.ts.net",
+            "PC.example.ts.net",
+            "pc.example.ts.net:443",
+            "pc",
+            "--out",
+        ] {
+            s.tailnet = bad.into();
+            assert!(s.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

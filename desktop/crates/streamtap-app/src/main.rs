@@ -13,6 +13,7 @@ mod hub;
 mod jobs;
 mod pairings;
 mod paths;
+mod phones;
 mod registration;
 mod secret;
 mod sink;
@@ -66,7 +67,7 @@ struct Inner {
     /// Counts sink starts: output of an earlier sink process (its reader
     /// threads may still be draining) is not mixed into the new log.
     log_gen: u64,
-    /// The app's config directory (`config.json`, `pairings.json`, `bridge.json`, the host manifests).
+    /// The app's config directory (`config.json`, `pairings.json`, `bridge.json`, `devices.json`, the host manifests).
     config_dir: PathBuf,
     /// Pairing and tab lists of the browsers (see `hub`); has its own lock.
     hub: Arc<Hub>,
@@ -323,12 +324,14 @@ async fn save_settings(
     state: State<'_, AppState>,
     port: u16,
     captures_dir: String,
+    tailnet: String,
 ) -> CmdResult<Settings> {
     let mut g = state.lock();
     require_stopped(&mut g)?;
     let new = Settings {
         port,
         captures_dir: PathBuf::from(captures_dir.trim()),
+        tailnet: tailnet.trim().to_owned(),
         ..g.settings.clone()
     };
     apply_settings(&mut g, new)?;
@@ -395,12 +398,19 @@ fn launch_sink_locked(shared: &AppState, g: &mut Inner, exe: &Path) -> CmdResult
     let root = g.settings.captures_dir.clone();
     fs::create_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
     let token = g.settings.token.clone();
+    let devices_file = g.config_dir.join("devices.json");
     // Taken before the spawn: every capture of this sink begins at or after it.
     let since = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let mut child = sink::command(exe)
-        .args(sink::serve_args(g.settings.port, &root))
+        .args(sink::serve_args(
+            g.settings.port,
+            &root,
+            // The paired phones are kept with the app's settings, not among the captures.
+            (!g.settings.tailnet.is_empty())
+                .then_some((g.settings.tailnet.as_str(), devices_file.as_path())),
+        ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -639,6 +649,72 @@ async fn browser_tap(state: State<'_, AppState>, conn: u64, tab: u32, on: bool) 
     hub.request_tap(conn, tab, on)
 }
 
+/// What a question about the phones needs: the sink must run, and with a tailnet name. The lock is not held while
+/// the sink is asked.
+fn phone_target(shared: &AppState) -> CmdResult<(u16, secret::Token, String)> {
+    let mut g = shared.lock();
+    g.refresh_sink();
+    if g.settings.tailnet.is_empty() {
+        return Err("set the name of this PC in the tailnet first".into());
+    }
+    if !g.sink_running() {
+        return Err("start the sink first".into());
+    }
+    Ok((
+        g.settings.port,
+        g.settings.token.clone(),
+        g.settings.tailnet.clone(),
+    ))
+}
+
+/// A one-time pairing code of the running sink, as a link, its QR code and the code to type.
+fn phone_pairing(shared: &AppState, exe: &Path) -> CmdResult<phones::Pairing> {
+    let (port, token, tailnet) = phone_target(shared)?;
+    phones::pairing_of(
+        &phones::ask(exe, port, &token, &phones::Op::Pair)?,
+        &tailnet,
+    )
+}
+
+/// The phones paired with the running sink.
+fn phone_list(shared: &AppState, exe: &Path) -> CmdResult<Vec<phones::Phone>> {
+    let (port, token, _) = phone_target(shared)?;
+    phones::phones_of(&phones::ask(exe, port, &token, &phones::Op::List)?)
+}
+
+/// Revokes one phone: the sink forgets it and closes its connections; the others and the token stay.
+fn phone_revoked(shared: &AppState, exe: &Path, id: &str) -> CmdResult<()> {
+    let (port, token, _) = phone_target(shared)?;
+    phones::ask(exe, port, &token, &phones::Op::Revoke(id.to_owned())).map(|_| ())
+}
+
+/// Runs a question to the sink off the async runtime: it waits for a child process.
+async fn phone_job<T: Send + 'static>(
+    state: State<'_, AppState>,
+    job: impl FnOnce(&AppState, &Path) -> CmdResult<T> + Send + 'static,
+) -> CmdResult<T> {
+    let exe = sink::find_sink().ok_or("streamtap-sink was not found next to the app")?;
+    let shared = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || job(&shared, &exe))
+        .await
+        .map_err(|e| format!("the question to the sink was interrupted: {e}"))?
+}
+
+#[tauri::command]
+async fn phone_pair(state: State<'_, AppState>) -> CmdResult<phones::Pairing> {
+    phone_job(state, phone_pairing).await
+}
+
+#[tauri::command]
+async fn phone_devices(state: State<'_, AppState>) -> CmdResult<Vec<phones::Phone>> {
+    phone_job(state, phone_list).await
+}
+
+#[tauri::command]
+async fn phone_revoke(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    phone_job(state, move |shared, exe| phone_revoked(shared, exe, &id)).await
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .setup(|app| {
@@ -676,6 +752,9 @@ fn main() {
             browser_decide,
             browser_revoke,
             browser_tap,
+            phone_pair,
+            phone_devices,
+            phone_revoke,
         ])
         .build(tauri::generate_context!())
         .expect("cannot build the app");
@@ -1180,6 +1259,91 @@ mod tests {
         assert!(err.contains("cannot be started again"), "{err}");
         assert!(!st.lock().sink_running());
         st.shutdown();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The phones of the running sink through the app's own functions: a pairing code with its link and QR code, a
+    /// phone that pairs with it (a WebSocket as Tailscale Serve forwards one), the list, and the revocation of that
+    /// one phone. The list of devices lies with the app's settings, not among the captures.
+    #[test]
+    fn end_to_end_a_phone_is_paired_listed_and_revoked_through_the_real_sink() {
+        use tungstenite::client::IntoClientRequest;
+        const NAME: &str = "pc.example.ts.net";
+        let sink = built_sink();
+        let (st, dir) = state("e2e-phones");
+        assert!(phone_list(&st, &sink).unwrap_err().contains("tailnet"));
+        {
+            let mut g = st.lock();
+            g.settings.port = free_port();
+            g.settings.captures_dir = dir.join("captures");
+            g.settings.tailnet = NAME.into();
+        }
+        assert_eq!(phone_list(&st, &sink).unwrap_err(), "start the sink first");
+        launch_sink(&st, &sink).expect("start the sink");
+        let pairing = wait_for("a pairing code of the sink", || {
+            phone_pairing(&st, &sink).ok()
+        });
+        assert_eq!(pairing.tailnet, NAME);
+        assert_eq!(
+            pairing.link,
+            format!("https://{NAME}/#streamtap-pair=1&code={}", pairing.code)
+        );
+        assert!(pairing.qr.len() >= 21 && pairing.qr.iter().all(|r| r.len() == pairing.qr.len()));
+        assert_eq!(phone_list(&st, &sink).unwrap(), Vec::new());
+
+        // A phone: the tailnet name as Host, the proxy's header, an add-on's origin; its key is the curve's base point.
+        let port = st.lock().settings.port;
+        let mut request = format!("ws://127.0.0.1:{port}/")
+            .into_client_request()
+            .unwrap();
+        for (name, value) in [
+            ("host", NAME),
+            (
+                "origin",
+                "moz-extension://0f3c1a52-7b1e-4d0c-9a3e-2f6f1f0e9c11",
+            ),
+            ("x-forwarded-for", "100.64.0.7"),
+        ] {
+            request.headers_mut().insert(name, value.parse().unwrap());
+        }
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut ws, _) = tungstenite::client(request, stream).expect("the phone's handshake");
+        let pair = serde_json::json!({
+            "type": "pair", "v": 1, "code": pairing.code, "name": "e2e phone",
+            "key": "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+        });
+        ws.send(tungstenite::Message::binary(frame(&pair, b"")))
+            .unwrap();
+        let said: serde_json::Value = loop {
+            if let tungstenite::Message::Text(t) = ws.read().expect("the sink's answer") {
+                break serde_json::from_str(t.as_str()).unwrap();
+            }
+        };
+        assert_eq!(said["type"], "paired", "{said}");
+        let id = said["device"].as_str().unwrap().to_owned();
+
+        let list = phone_list(&st, &sink).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].id.as_str(), list[0].name.as_str()),
+            (id.as_str(), "e2e phone")
+        );
+        assert!(dir.join("devices.json").is_file());
+        assert!(!dir.join("captures").join("devices.json").exists());
+        // The token never appears in what the sink printed.
+        let token = st.lock().settings.token.expose().to_owned();
+        assert!(st.lock().log.iter().all(|l| !l.contains(&token)));
+
+        phone_revoked(&st, &sink, &id).expect("revoke");
+        assert_eq!(phone_list(&st, &sink).unwrap(), Vec::new());
+        let again = phone_revoked(&st, &sink, &id).unwrap_err();
+        assert!(again.contains("no paired device"), "{again}");
+        assert_eq!(
+            phone_revoked(&st, &sink, "--port").unwrap_err(),
+            "not a device id"
+        );
+        st.shutdown();
+        assert_eq!(phone_list(&st, &sink).unwrap_err(), "start the sink first");
         fs::remove_dir_all(&dir).unwrap();
     }
 

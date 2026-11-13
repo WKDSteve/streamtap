@@ -18,6 +18,9 @@ serde_json = "1"
 # (MOB-11), by tag; Cargo.lock pins the commit. appkit-hub brings an async server the sink does not use.
 appkit-core = { git = "https://github.com/WKDSteve/appkit", tag = "v0.49.0" }
 appkit-hub = { git = "https://github.com/WKDSteve/appkit", tag = "v0.49.0" }
+# The modules of the pairing link's QR code for a program that draws it itself (`devices pair --json`, the desktop
+# app): the encoder only, the version appkit-hub brings for its terminal QR code.
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 # A device's key in the tests (tests/tailnet.rs): signs the sink's challenge as WebCrypto would. The version appkit brings.

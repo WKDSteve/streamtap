@@ -19,6 +19,9 @@ const state = {
   tokenShown: false,
   settingsOpen: false,
   browserOpen: false,
+  phonesOpen: false,
+  // The phones panel: the paired phones (null: not known), the pairing code on show, why the sink could not be asked.
+  phones: { list: null, pairing: null, expired: false, error: "", ticks: 0 },
   signature: "",
   busy: false,
   // Language and theme as stored ("system" follows the webview / the OS).
@@ -412,8 +415,143 @@ const renderBrowser = (snap) => {
   );
 };
 
+// ---- phones (the sink through the tailnet) -----------------------------------
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const svgEl = (tag, attrs) => {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  return node;
+};
+
+// The QR code of the pairing link from its modules (rows of "1" and "0"), with the quiet zone a scanner needs.
+// Its two colours are fixed in style.css: dark on light in both themes.
+const QR_QUIET = 4;
+const qrSvg = (rows) => {
+  const size = rows.length + 2 * QR_QUIET;
+  let d = "";
+  rows.forEach((row, y) => {
+    for (let x = 0; x < row.length; x++) if (row[x] === "1") d += `M${x + QR_QUIET} ${y + QR_QUIET}h1v1h-1z`;
+  });
+  const svg = svgEl("svg", { class: "qr", viewBox: `0 0 ${size} ${size}`, role: "img", "aria-label": t("qrLabel"), "shape-rendering": "crispEdges" });
+  svg.append(svgEl("rect", { class: "qr-light", width: size, height: size }), svgEl("path", { class: "qr-dark", d }));
+  return svg;
+};
+
+const tailnetOf = () => state.settings?.tailnet ?? "";
+const phonesUsable = () => Boolean(tailnetOf()) && state.snap?.sink.state === "running";
+
+// The name as the sink takes it: a pasted address loses its https:// and its last slash.
+const cleanTailnet = (value) => String(value).trim().toLowerCase().replace(/^https:\/\//, "").replace(/\/$/, "");
+
+const renderPhones = (snap) => {
+  const running = snap.sink.state === "running";
+  const name = tailnetOf();
+  const p = state.phones;
+  $("tailnet-lock").hidden = !running;
+  $("tailnet").disabled = running;
+  $("tailnet-save").disabled = running;
+  if (document.activeElement !== $("tailnet")) $("tailnet").value = name;
+  $("serve-box").hidden = !name;
+  $("serve-cmd").textContent = `tailscale serve --bg ${state.settings?.port ?? ""}`;
+
+  const line = $("phones-state");
+  line.className = p.error ? "hint bad" : "hint";
+  line.textContent = !name ? t("phonesNoName") : !running ? t("phonesStopped") : p.error ? t("phonesError", { error: p.error }) : p.expired ? t("pairingExpired") : t("phonesReady", { name });
+  $("phone-pair").disabled = !phonesUsable() || state.busy;
+  $("phone-pair").textContent = p.pairing ? t("newPairingCode") : t("showPairingCode");
+  $("phones-refresh").disabled = !phonesUsable();
+
+  const open = Boolean(p.pairing) && phonesUsable();
+  $("pairing-box").hidden = !open;
+  if (open) {
+    $("pairing-qr").replaceChildren(qrSvg(p.pairing.qr));
+    $("pairing-pc").textContent = p.pairing.tailnet;
+    $("pairing-code").textContent = p.pairing.code;
+    $("pairing-link").textContent = p.pairing.link;
+    $("pairing-until").textContent = t("pairingUntil", { time: new Date(p.pairing.until).toLocaleTimeString(I18N.lang) });
+  } else {
+    // A code that is not shown is not kept on the page either.
+    $("pairing-qr").replaceChildren();
+    for (const id of ["pairing-pc", "pairing-code", "pairing-link", "pairing-until"]) $(id).textContent = "";
+  }
+
+  const list = $("phones-list");
+  if (!phonesUsable() || !p.list) {
+    list.replaceChildren(el("li", { class: "muted", text: t("phonesUnknown") }));
+    return;
+  }
+  list.replaceChildren(
+    ...(p.list.length
+      ? p.list.map((phone) =>
+          el("li", { class: "regrow" },
+            el("strong", { text: phone.name || t("phoneUnnamed") }),
+            el("span", { class: "muted", text: phone.id.slice(0, 8) }),
+            phone.open > 0 ? badge(t("phoneOpen"), "live") : null,
+            el("span", { class: "muted", text: t("phoneMeta", { paired: fmtDate(phone.paired), used: phone.last_used ? fmtDate(phone.last_used) : t("phoneNever") }) }),
+            el("span", { class: "grow" }),
+            el("button", { type: "button", class: "danger", "data-fid": `phone:${phone.id}`, text: t("revoke"), onclick: () => askRevokePhone(phone) })))
+      : [el("li", { class: "muted", text: t("noPhones") })]),
+  );
+};
+
+// Asks the sink for the paired phones. A phone that appeared while a pairing code was shown is the one that just
+// paired: the code is used up and leaves the page.
+const loadPhones = async () => {
+  const p = state.phones;
+  if (!phonesUsable()) {
+    p.list = null;
+    p.pairing = null;
+    p.error = "";
+    return;
+  }
+  try {
+    const list = await invoke("phone_devices");
+    const known = new Set((p.list ?? []).map((phone) => phone.id));
+    const added = p.pairing && p.list ? list.find((phone) => !known.has(phone.id)) : null;
+    p.list = list;
+    p.error = "";
+    if (added) {
+      p.pairing = null;
+      toast(t("phonePaired", { name: added.name || t("phoneUnnamed") }));
+    }
+  } catch (e) {
+    p.list = null;
+    p.error = String(e);
+  }
+};
+
+const pairPhone = async () => {
+  const p = state.phones;
+  try {
+    // The list first: the phone that pairs is told apart from the ones already there.
+    if (!p.list) await loadPhones();
+    const pairing = await invoke("phone_pair");
+    p.pairing = { ...pairing, until: Date.now() + pairing.ttl * 1000 };
+    p.expired = false;
+    p.error = "";
+  } catch (e) {
+    p.pairing = null;
+    p.error = String(e);
+  }
+  if (state.snap) render(state.snap);
+};
+
+// Every poll while the panel is open: a code past its minute leaves the page, and the list is read again while a
+// code is shown (the phone that pairs appears) and every fifth time otherwise (who is connected).
+const tickPhones = async () => {
+  const p = state.phones;
+  if (p.pairing && Date.now() >= p.pairing.until) {
+    p.pairing = null;
+    p.expired = true;
+  }
+  if (!state.phonesOpen) return;
+  p.ticks = (p.ticks + 1) % 5;
+  if (!phonesUsable() || p.pairing || p.ticks === 0 || !p.list) await loadPhones();
+};
+
 const render = (snap) => {
-  const sig = JSON.stringify([snap, state.settings, state.tokenShown, state.busy, I18N.lang]);
+  const sig = JSON.stringify([snap, state.settings, state.tokenShown, state.busy, I18N.lang, state.phones]);
   if (sig === state.signature) return;
   state.signature = sig;
   const focusId = document.activeElement?.dataset?.fid;
@@ -425,6 +563,7 @@ const render = (snap) => {
   renderLog(snap);
   renderPairing(snap);
   renderBrowser(snap);
+  renderPhones(snap);
   if (focusId) document.querySelector(`[data-fid="${CSS.escape(focusId)}"]`)?.focus();
 };
 
@@ -438,6 +577,9 @@ const refresh = async () => {
       applyPrefs();
     }
     state.snap = await invoke("snapshot");
+    // Drawn first: asking the sink about the phones may take a while when it does not answer.
+    render(state.snap);
+    await tickPhones();
     render(state.snap);
   } catch (e) {
     $("sink-text").textContent = t("appError", { error: e });
@@ -491,6 +633,23 @@ const askRevoke = (a) =>
       }),
   });
 
+// Revoking a phone touches nothing else: no new token, no restart.
+const askRevokePhone = (phone) =>
+  ask({
+    heading: "revokePhoneQ",
+    ok: "revoke",
+    text: () => t("revokePhoneText", { name: phone.name || phone.id.slice(0, 8) }),
+    action: () =>
+      run(t("revoke"), async () => {
+        try {
+          await invoke("phone_revoke", { id: phone.id });
+          toast(t("phoneRevoked"));
+        } finally {
+          await loadPhones();
+        }
+      }),
+  });
+
 $("confirm").addEventListener("close", () => {
   const question = pendingConfirm;
   pendingConfirm = null;
@@ -518,10 +677,49 @@ $("browser-toggle").addEventListener("click", () => {
   $("browser-toggle").setAttribute("aria-expanded", String(state.browserOpen));
 });
 
+$("phones-toggle").addEventListener("click", async () => {
+  state.phonesOpen = !state.phonesOpen;
+  $("phones").hidden = !state.phonesOpen;
+  $("phones-toggle").setAttribute("aria-expanded", String(state.phonesOpen));
+  if (!state.phonesOpen) {
+    // A closed panel shows no code.
+    state.phones.pairing = null;
+    return;
+  }
+  await loadPhones();
+  if (state.snap) render(state.snap);
+});
+
+$("tailnet-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  run(t("saveTailnet"), async () => {
+    if (!state.settings) return;
+    const tailnet = cleanTailnet($("tailnet").value);
+    state.settings = await invoke("save_settings", { port: state.settings.port, capturesDir: state.settings.captures_dir, tailnet });
+    $("tailnet").value = state.settings.tailnet;
+    toast(state.settings.tailnet ? t("tailnetSaved") : t("tailnetCleared"));
+  });
+});
+
+$("serve-copy").addEventListener("click", async () => {
+  const ok = await navigator.clipboard.writeText($("serve-cmd").textContent).then(() => true, () => false);
+  toast(ok ? t("commandCopied") : t("copyFailed"));
+});
+
+$("phone-pair").addEventListener("click", () => pairPhone());
+$("pairing-close").addEventListener("click", () => {
+  state.phones.pairing = null;
+  if (state.snap) render(state.snap);
+});
+$("phones-refresh").addEventListener("click", async () => {
+  await loadPhones();
+  if (state.snap) render(state.snap);
+});
+
 $("settings-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   run(t("saveSettings"), async () => {
-    state.settings = await invoke("save_settings", { port: Number($("port").value), capturesDir: $("dir").value });
+    state.settings = await invoke("save_settings", { port: Number($("port").value), capturesDir: $("dir").value, tailnet: state.settings?.tailnet ?? "" });
     toast(t("settingsSaved"));
   });
 });

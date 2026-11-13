@@ -200,7 +200,7 @@ try {
     $webView = Join-Path $localDataDir 'EBWebView'
     New-Item -ItemType Directory -Force -Path $capture, $webView | Out-Null
     Set-Content -LiteralPath $config -Value '{"token":"keep-me"}'
-    foreach ($name in 'pairings.json', 'bridge.json') { Set-Content -LiteralPath (Join-Path $dataDir $name) -Value '{}' }
+    foreach ($name in 'pairings.json', 'bridge.json', 'devices.json') { Set-Content -LiteralPath (Join-Path $dataDir $name) -Value '{}' }
     Set-Content -LiteralPath (Join-Path $capture 'out.mp4') -Value 'video'
     Set-Content -LiteralPath (Join-Path $dataDir 'notes.txt') -Value 'mine'
     Set-Content -LiteralPath (Join-Path $webView 'cache.dat') -Value 'x'
@@ -453,8 +453,8 @@ try {
     $r = Invoke-Script $uninstallSrc ($places + $dataPlaces + @('-RemoveData'))
     Write-Check ($r.Code -eq 0) 'uninstall -RemoveData'
     if ($r.Code -ne 0) { Write-Output $r.Text }
-    $appFiles = @('config.json', 'pairings.json', 'bridge.json', 'native-messaging') | Where-Object { Test-Path -LiteralPath (Join-Path $dataDir $_) }
-    Write-Check (-not $appFiles) 'the settings, pairings, bridge file and host manifests are gone'
+    $appFiles = @('config.json', 'pairings.json', 'bridge.json', 'devices.json', 'native-messaging') | Where-Object { Test-Path -LiteralPath (Join-Path $dataDir $_) }
+    Write-Check (-not $appFiles) 'the settings, pairings, bridge file, paired phones and host manifests are gone'
     Write-Check (-not (Test-Path -LiteralPath $localDataDir)) 'the WebView data is gone'
     $video = Join-Path $capture 'out.mp4'
     Write-Check ((Test-Path -LiteralPath $video) -and (Get-Content -LiteralPath $video -Raw) -match 'video') 'the capture in the default captures folder stays'

@@ -41,7 +41,8 @@ alone, by design. Respect the terms of the sites you use it on; see the
   makes the Firefox variant and its `.xpi`. Two targets on the phone (code done, hand run on a phone pending): a
   recording saved on the device (`streamtap-sink replay` reads it on the PC), and the sink on the PC over your
   tailnet (Tailscale Serve, or a Headscale that issues certificates): the sink stays on loopback, each phone is
-  paired with a one-time code and a key of its own and can be revoked alone. See
+  paired with a one-time code and a key of its own and can be revoked alone; the desktop app's *Phones* panel
+  sets the tailnet name, shows the pairing code as a QR code and lists and revokes the phones. See
   "Source policy", "Firefox for Android" and the two "Target" sections in [extension/README.md](extension/README.md),
   and "Phones over the tailnet" in [desktop/README.md](desktop/README.md).
 

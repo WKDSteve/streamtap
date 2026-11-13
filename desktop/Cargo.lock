@@ -3546,6 +3546,7 @@ dependencies = [
  "appkit-core",
  "appkit-hub",
  "p256",
+ "qrcode",
  "serde",
  "serde_json",
  "tungstenite",

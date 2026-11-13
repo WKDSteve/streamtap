@@ -16,6 +16,9 @@ const COMMANDS: &[&str] = &[
     "browser_decide",
     "browser_revoke",
     "browser_tap",
+    "phone_pair",
+    "phone_devices",
+    "phone_revoke",
 ];
 
 fn main() {

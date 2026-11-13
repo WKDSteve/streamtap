@@ -296,6 +296,50 @@ fn a_paired_phone_logs_in_with_its_key_and_captures_without_the_token() {
     assert!(list.contains("open connections 1"), "{list}");
 }
 
+/// `--json` is what the desktop app reads: one line, the pairing with its link and a square QR code.
+#[test]
+fn the_command_line_answers_a_program_in_json() {
+    let sink = Sink::tailnet("json");
+    let (status, text) = sink.devices(&["pair", "--json"], TOKEN);
+    assert_eq!(status, 0, "{text}");
+    assert_eq!(text.trim().lines().count(), 1, "{text}");
+    let pairing: Value = serde_json::from_str(&text).expect("JSON");
+    let code = pairing["code"].as_str().expect("code");
+    assert_eq!(pairing["tailnet"], NAME);
+    assert_eq!(pairing["ttl"], 60);
+    assert_eq!(
+        pairing["link"],
+        format!("https://{NAME}/#streamtap-pair=1&code={code}").as_str()
+    );
+    let rows = pairing["qr"].as_array().expect("qr");
+    assert!(rows.len() >= 21, "a QR code has at least 21 modules a side");
+    for row in rows {
+        let row = row.as_str().expect("a row");
+        assert_eq!(row.len(), rows.len(), "the code is square");
+        assert!(row.bytes().all(|c| c == b'0' || c == b'1'));
+    }
+    // The code of that answer pairs a phone, and the list names it.
+    let (_, public) = Device::key(11);
+    let mut ws = sink.phone();
+    ws.say(
+        &json!({ "type": "pair", "v": 1, "code": code, "name": "json phone", "key": public }),
+        b"",
+    );
+    let id = ws.hear()["device"].as_str().expect("paired").to_owned();
+    let (status, text) = sink.devices(&["--json"], TOKEN);
+    assert_eq!(status, 0);
+    let list: Value = serde_json::from_str(&text).expect("JSON");
+    let device = &list["devices"][0];
+    assert_eq!(device["id"], id.as_str());
+    assert_eq!(device["name"], "json phone");
+    assert_eq!(device["level"], "create");
+    assert_eq!(device["open"], 0);
+    assert!(device["paired"].as_u64().is_some() && device["last_used"].is_null());
+    assert_eq!(sink.devices(&["revoke", &id, "--json"], TOKEN).0, 0);
+    assert_eq!(sink.devices(&["revoke", &id, "--json"], TOKEN).0, 2, "gone");
+    assert_eq!(sink.devices(&["--json"], "wrong-token").0, 1);
+}
+
 #[test]
 fn the_list_of_devices_holds_no_secret() {
     let sink = Sink::tailnet("file");

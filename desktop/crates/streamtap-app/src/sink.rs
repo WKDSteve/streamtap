@@ -112,15 +112,30 @@ fn find_in_path(path: &OsStr, file: &str) -> Option<PathBuf> {
 /// Arguments of `streamtap-sink serve`. The token is not among them: every
 /// process of the user can read a command line, so the sink reads the token
 /// from its stdin instead (`--token-stdin`, see [`hand_over_token`]).
-pub(crate) fn serve_args(port: u16, out: &Path) -> Vec<std::ffi::OsString> {
-    vec![
+/// `tailnet` is this PC's name in the tailnet and the file of the paired phones: the sink then also takes phones
+/// that come through Tailscale Serve (it still binds loopback only).
+pub(crate) fn serve_args(
+    port: u16,
+    out: &Path,
+    tailnet: Option<(&str, &Path)>,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
         "serve".into(),
         "--token-stdin".into(),
         "--port".into(),
         port.to_string().into(),
         "--out".into(),
         out.as_os_str().to_owned(),
-    ]
+    ];
+    if let Some((name, devices)) = tailnet {
+        args.extend([
+            "--tailnet".into(),
+            name.into(),
+            "--devices".into(),
+            devices.as_os_str().to_owned(),
+        ]);
+    }
+    args
 }
 
 /// Writes the token and a line break to the sink's stdin (its only use) and
@@ -545,7 +560,21 @@ pub(crate) mod tests {
     /// sink is told to read it from stdin, where it arrives as one line.
     #[test]
     fn serve_args_carry_port_and_dir_and_the_token_goes_to_stdin() {
-        let a = serve_args(17650, Path::new("/c"));
+        let with = serve_args(
+            17650,
+            Path::new("/c"),
+            Some(("pc.example.ts.net", Path::new("/cfg/devices.json"))),
+        );
+        assert_eq!(
+            with[6..],
+            [
+                "--tailnet",
+                "pc.example.ts.net",
+                "--devices",
+                "/cfg/devices.json"
+            ]
+        );
+        let a = serve_args(17650, Path::new("/c"), None);
         let s: Vec<String> = a.iter().map(|x| x.to_string_lossy().into_owned()).collect();
         assert_eq!(
             s,

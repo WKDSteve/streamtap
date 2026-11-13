@@ -12,7 +12,7 @@ host inside the install folder; a registration of another copy (a checkout) stay
 
 Your data stays unless you ask: -RemoveData also removes the files the app makes in its settings
 folder %APPDATA%\io.github.wkdsteve.streamtap (config.json with the token, pairings.json,
-bridge.json, the host manifests in native-messaging\) and its WebView cache
+bridge.json, devices.json with the paired phones, the host manifests in native-messaging\) and its WebView cache
 (%LOCALAPPDATA%\io.github.wkdsteve.streamtap\EBWebView), and then also the browser keys that lead to
 a manifest in there. Nothing else is removed: the captures (by default the folder captures\ inside
 the settings folder) stay, and so does a folder that still holds anything. A second run finds
@@ -282,7 +282,7 @@ if ($entry) {
 # 5. The data, only when asked, and only the files the app makes. The default captures folder is
 # DataDir\captures: it and anything else in there stay, and so does the folder that holds them.
 if ($RemoveData) {
-    $appFiles = @('config.json', 'pairings.json', 'bridge.json') | ForEach-Object { $_; ($_ -replace '\.json$', '.json.tmp') }
+    $appFiles = @('config.json', 'pairings.json', 'bridge.json', 'devices.json') | ForEach-Object { $_; ($_ -replace '\.json$', '.json.tmp') }
     foreach ($name in $appFiles) {
         $file = Join-Path $DataDir $name
         if (Test-Path -LiteralPath $file -PathType Leaf) {

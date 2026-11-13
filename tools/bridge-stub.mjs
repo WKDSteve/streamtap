@@ -4,7 +4,7 @@
 
 /** Sets `window.__TAURI__` before the page's scripts run. */
 export function bridge() {
-  const settings = { port: 17650, token: "a-token", captures_dir: "C:/captures", language: "en", theme: "system" };
+  const settings = { port: 17650, token: "a-token", captures_dir: "C:/captures", tailnet: "pc.example.ts.net", language: "en", theme: "system" };
   const snapshot = {
     sink: { state: "stopped" },
     sink_path: "C:/sink.exe",
@@ -36,9 +36,21 @@ export function bridge() {
       link: { connections: [], approvals: [{ instance: "p-1", browser: "chrome", profile: "Default", connected: true }], store_error: null },
     },
   };
+  // The phones of the sink (the panel asks only while the sink runs): one paired phone, and a pairing code whose QR
+  // code is a pattern, not a real code.
+  const phones = [{ id: "0123456789abcdef0123456789abcdef", name: "A phone", paired: 1700000000, last_used: 1700000100, open: 1 }];
+  const code = "00112233445566778899aabbccddeeff";
+  const pairing = {
+    tailnet: settings.tailnet,
+    link: `https://${settings.tailnet}/#streamtap-pair=1&code=${code}`,
+    code,
+    ttl: 60,
+    qr: Array.from({ length: 25 }, (_, y) => Array.from({ length: 25 }, (_, x) => ((x * 7 + y * 3) % 5 < 2 ? "1" : "0")).join("")),
+  };
+  const answers = { snapshot, get_settings: settings, phone_devices: phones, phone_pair: pairing };
   window.__TAURI__ = {
     core: {
-      invoke: async (cmd) => (cmd === "snapshot" ? snapshot : cmd === "get_settings" ? settings : null),
+      invoke: async (cmd) => answers[cmd] ?? null,
     },
   };
 }

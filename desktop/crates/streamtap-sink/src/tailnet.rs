@@ -569,10 +569,47 @@ pub(crate) fn pair_link(tailnet: &str, code: &str) -> String {
     format!("https://{tailnet}/#streamtap-pair=1&code={code}")
 }
 
+/// The modules of the QR code of `text`, one string of `1` (dark) and `0` per row, without a quiet zone; empty when
+/// the text is too long for a code.
+fn qr_rows(text: &str) -> Vec<String> {
+    let Ok(code) = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M)
+    else {
+        return Vec::new();
+    };
+    code.to_colors()
+        .chunks(code.width())
+        .map(|row| {
+            row.iter()
+                .map(|c| if *c == qrcode::Color::Dark { '1' } else { '0' })
+                .collect()
+        })
+        .collect()
+}
+
+/// `--json`: the sink's answer as one line of JSON on stdout, for a program (the desktop app) in place of the
+/// text for a person. A pairing also carries its link and the modules of the link's QR code (`qr`).
+fn print_json(op: &str, device: &str, mut answer: serde_json::Value) -> Result<(), SinkError> {
+    if op == "pair" {
+        let link = pair_link(
+            answer["tailnet"].as_str().unwrap_or(""),
+            answer["code"].as_str().unwrap_or(""),
+        );
+        answer["qr"] = qr_rows(&link).into();
+        answer["link"] = link.into();
+    }
+    if op == "revoke" && answer["revoked"] != true {
+        return Err(SinkError::Usage(format!(
+            "no paired device has the id {device}"
+        )));
+    }
+    println!("{answer}");
+    Ok(())
+}
+
 pub(crate) fn run_devices(args: &[String]) -> Result<(), SinkError> {
     let usage = || {
         SinkError::Usage(
-            "usage:\n  streamtap-sink devices (--token-stdin | --token <token>) [--port <port>]            the paired phones\n  streamtap-sink devices pair (--token-stdin | --token <token>) [--port <port>]       a one-time pairing link\n  streamtap-sink devices revoke <id> (--token-stdin | --token <token>) [--port <port>]"
+            "usage:\n  streamtap-sink devices (--token-stdin | --token <token>) [--port <port>]            the paired phones\n  streamtap-sink devices pair (--token-stdin | --token <token>) [--port <port>]       a one-time pairing link\n  streamtap-sink devices revoke <id> (--token-stdin | --token <token>) [--port <port>]\n  --json prints the sink's answer as one line of JSON (a pairing with its link and the modules of its QR code)"
                 .into(),
         )
     };
@@ -605,6 +642,9 @@ pub(crate) fn run_devices(args: &[String]) -> Result<(), SinkError> {
                 .unwrap_or("the sink refused")
                 .to_owned(),
         ));
+    }
+    if rest.iter().any(|a| a == "--json") {
+        return print_json(op, device, answer);
     }
     let name = answer["tailnet"].as_str().unwrap_or("");
     match op {

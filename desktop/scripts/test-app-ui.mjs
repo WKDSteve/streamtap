@@ -2,7 +2,7 @@
 // placeholders in English and German, t() and the language choice), that every key
 // index.html and app.js use exists, and that both themes in style.css keep readable
 // contrast (WCAG ratios) for every text and control colour pair the UI uses. Then
-// app.js runs against a fake DOM and fake commands (the revoke flow).
+// app.js runs against a fake DOM and fake commands (the revoke flow, the config warning, the phones panel).
 //
 //   node desktop/scripts/test-app-ui.mjs
 
@@ -256,6 +256,7 @@ const loadApp = (commands) => {
       activeElement: null,
       getElementById: byId,
       createElement: () => new FakeEl(),
+      createElementNS: () => new FakeEl(),
       querySelectorAll: () => [],
       querySelector: () => null,
     },
@@ -324,6 +325,162 @@ for (const [language, access, want] of [
   const [title, body] = texts(box.children[0]);
   check(title === want[0], `${what}: title ${title}`);
   check(typeof body === "string" && body.includes(want[1]), `${what}: body ${body}`);
+}
+
+// ---- the phones panel -------------------------------------------------------
+
+// The QR code keeps its two fixed colours in both themes, far apart.
+{
+  const fixed = Object.fromEntries([...palette.matchAll(/--(accent-\d+):\s*(#[0-9a-fA-F]{6});/g)].map((m) => [m[1], m[2]]));
+  check(/\.qr-light \{ fill: var\(--accent-50\); \}/.test(css) && /\.qr-dark \{ fill: var\(--accent-900\); \}/.test(css), "the QR code takes the palette's fixed accent steps");
+  check(fixed["accent-50"] && fixed["accent-900"] && ratio(fixed["accent-900"], fixed["accent-50"]) >= 7, "the QR code's dark on its light has 7 or more");
+}
+
+const EVIL = `<img src=x onerror=alert(1)>`;
+const PHONE = { id: "ab".repeat(16), name: EVIL, paired: 1700000000, last_used: null, open: 1 };
+const PAIRING = { tailnet: "pc.example.ts.net", link: "https://pc.example.ts.net/#streamtap-pair=1&code=" + "0f".repeat(16), code: "0f".repeat(16), ttl: 60, qr: ["101", "010", "111"] };
+const allText = (node) => [node.textContent, ...(node.children ?? []).map(allText)].join(" ");
+
+// Without a tailnet name, and with the sink stopped: said, and nothing is asked of the sink.
+for (const [tailnet, running, want] of [
+  ["", true, "Enter the name of this PC in the tailnet above"],
+  ["pc.example.ts.net", false, "Start the sink (header) to pair a phone"],
+]) {
+  const asked = [];
+  const app = loadApp({
+    get_settings: () => ({ ...SETTINGS, tailnet }),
+    snapshot: () => ({ ...SNAPSHOT, sink: { state: running ? "running" : "stopped" } }),
+    phone_devices: () => (asked.push("devices"), []),
+  });
+  await settle();
+  app.byId("phones-toggle").fire("click");
+  await settle();
+  const what = `phones (${tailnet || "no name"}, ${running ? "running" : "stopped"})`;
+  check(app.byId("phones-state").textContent.startsWith(want), `${what}: ${app.byId("phones-state").textContent}`);
+  check(app.byId("phone-pair").disabled === true && app.byId("phones-refresh").disabled === true, `${what}: pairing and refresh are off`);
+  check(asked.length === 0, `${what}: the sink is not asked`);
+  check(app.byId("serve-box").hidden === !tailnet, `${what}: the Serve command shows only with a name`);
+  check(app.byId("tailnet").disabled === running, `${what}: the name can only change while the sink is stopped`);
+  if (tailnet) check(app.byId("serve-cmd").textContent === "tailscale serve --bg 17650", `${what}: the command carries the port`);
+}
+
+// The whole flow while the sink runs.
+{
+  const backend = { list: [], pairs: 0, revoked: [], saved: [] };
+  const app = loadApp({
+    get_settings: () => ({ ...SETTINGS, tailnet: "pc.example.ts.net" }),
+    snapshot: () => ({ ...SNAPSHOT, sink: { state: "running" } }),
+    phone_devices: () => backend.list,
+    phone_pair: () => (backend.pairs++, PAIRING),
+    phone_revoke: ({ id }) => {
+      backend.revoked.push(id);
+      backend.list = backend.list.filter((p) => p.id !== id);
+      return null;
+    },
+    save_settings: (args) => (backend.saved.push(args), { ...SETTINGS, tailnet: args.tailnet }),
+  });
+  await settle();
+  app.byId("phones-toggle").fire("click");
+  await settle();
+  check(app.byId("phones-state").textContent === "Phones reach this sink as https://pc.example.ts.net, once Tailscale Serve forwards it.", "phones: the ready line names the address");
+  check(allText(app.byId("phones-list")).includes("No phone is paired yet."), "phones: an empty list says so");
+  check(app.byId("pairing-box").hidden === true, "phones: no code before it is asked for");
+
+  app.byId("phone-pair").fire("click");
+  await settle();
+  check(backend.pairs === 1 && app.byId("pairing-box").hidden === false, "phones: the pairing code is shown");
+  const qr = app.byId("pairing-qr").children[0];
+  check(qr?.attrs.role === "img" && qr.attrs["aria-label"] === "QR code of the pairing link", "phones: the QR code is an image with a name");
+  check(qr?.attrs.viewBox === "0 0 11 11", "phones: the QR code has its quiet zone of four modules");
+  check(qr?.children[1]?.attrs.d === "M4 4h1v1h-1zM6 4h1v1h-1zM5 5h1v1h-1zM4 6h1v1h-1zM5 6h1v1h-1zM6 6h1v1h-1z", `phones: the QR code draws the dark modules (${qr?.children[1]?.attrs.d})`);
+  check(app.byId("pairing-code").textContent === PAIRING.code && app.byId("pairing-link").textContent === PAIRING.link && app.byId("pairing-pc").textContent === "pc.example.ts.net", "phones: the code, the link and the PC are on the page as text");
+
+  // The phone pairs: at the next poll it is in the list, the code leaves the page.
+  backend.list = [PHONE];
+  await app.page("tick()");
+  await settle();
+  check(app.byId("pairing-box").hidden === true && app.byId("pairing-code").textContent === "" && app.byId("pairing-qr").children.length === 0, "phones: a used code leaves the page");
+  check(app.byId("toast").textContent.startsWith("Phone paired:"), "phones: the new phone is announced");
+  const row = app.byId("phones-list").children[0];
+  check(row.children[0].textContent === EVIL, "phones: a phone's name is text, whatever it holds");
+  check(allText(row).includes("connected") && allText(row).includes("last used never"), "phones: the row says connected and never used");
+
+  // A code that runs out leaves the page and is said.
+  app.byId("phone-pair").fire("click");
+  await settle();
+  check(app.byId("pairing-box").hidden === false, "phones: a second code is shown");
+  app.page("state.phones.pairing.until = Date.now() - 1");
+  await app.page("tick()");
+  await settle();
+  check(app.byId("pairing-box").hidden === true && app.byId("pairing-link").textContent === "", "phones: a code past its minute leaves the page");
+  check(app.byId("phones-state").textContent === "The pairing code has run out. Show a new one.", "phones: the expiry is said");
+
+  // Closing the panel drops a code on show.
+  app.byId("phone-pair").fire("click");
+  await settle();
+  app.byId("phones-toggle").fire("click");
+  await settle();
+  check(app.page("state.phones.pairing") === null, "phones: closing the panel drops the code");
+  app.byId("phones-toggle").fire("click");
+  await settle();
+
+  // Revoking asks first, names the phone, and touches only that phone.
+  row.children.at(-1).fire("click");
+  const dialog = app.byId("confirm");
+  check(dialog.open === true && app.byId("confirm-text").textContent.includes(EVIL), "phones: the revoke asks first and names the phone");
+  check(backend.revoked.length === 0, "phones: nothing is revoked before the answer");
+  dialog.returnValue = "ok";
+  dialog.fire("close");
+  await settle();
+  check(backend.revoked.join() === PHONE.id, "phones: the revoke carries the phone's id");
+  check(allText(app.byId("phones-list")).includes("No phone is paired yet."), "phones: the list is read again after the revoke");
+
+  // Saving the settings form keeps the tailnet name.
+  app.byId("port").value = "17651";
+  app.byId("dir").value = "C:/c";
+  app.byId("settings-form").fire("submit");
+  await settle();
+  check(backend.saved.at(-1)?.tailnet === "pc.example.ts.net" && backend.saved.at(-1)?.port === 17651, "phones: saving port and folder keeps the tailnet name");
+}
+
+// The name is saved as the sink takes it, with port and folder as they are.
+{
+  const saved = [];
+  const app = loadApp({
+    get_settings: () => ({ ...SETTINGS, tailnet: "" }),
+    snapshot: () => SNAPSHOT,
+    save_settings: (args) => (saved.push(args), { ...SETTINGS, tailnet: args.tailnet }),
+  });
+  await settle();
+  app.byId("tailnet").value = "  HTTPS://PC.Example.ts.net/ ";
+  app.byId("tailnet-form").fire("submit");
+  await settle();
+  check(JSON.stringify(saved[0]) === JSON.stringify({ port: 17650, capturesDir: "C:/c", tailnet: "pc.example.ts.net" }), `phones: the name is saved cleaned (${JSON.stringify(saved[0])})`);
+  check(app.byId("toast").textContent.startsWith("Tailnet name saved"), "phones: saving the name is confirmed");
+  check(app.byId("serve-box").hidden === false, "phones: the Serve command appears with the name");
+}
+
+// A sink that cannot be asked is said in the panel, not only in a toast.
+{
+  const app = loadApp({
+    get_settings: () => ({ ...SETTINGS, tailnet: "pc.example.ts.net", language: "de" }),
+    snapshot: () => ({ ...SNAPSHOT, sink: { state: "running" } }),
+    phone_devices: () => {
+      throw "the sink did not answer in time";
+    },
+    phone_pair: () => {
+      throw "the sink did not answer in time";
+    },
+  });
+  await settle();
+  app.byId("phones-toggle").fire("click");
+  await settle();
+  const line = app.byId("phones-state");
+  check(line.textContent === "Der Sink ließ sich nicht fragen: the sink did not answer in time" && line.className === "hint bad", `phones: an error is said in the panel (${line.textContent})`);
+  check(allText(app.byId("phones-list")).includes("solange der Sink läuft"), "phones: an unknown list is not shown as an empty one");
+  app.byId("phone-pair").fire("click");
+  await settle();
+  check(app.byId("pairing-box").hidden === true && line.className === "hint bad", "phones: a failed pairing shows no code");
 }
 
 if (failures) {

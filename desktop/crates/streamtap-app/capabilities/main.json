@@ -19,6 +19,9 @@
     "allow-browser-unregister",
     "allow-browser-decide",
     "allow-browser-revoke",
-    "allow-browser-tap"
+    "allow-browser-tap",
+    "allow-phone-pair",
+    "allow-phone-devices",
+    "allow-phone-revoke"
   ]
 }

@@ -230,6 +230,17 @@ ul.plain { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
 .regrow, .tabrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .regrow .grow { flex: 1; }
 .ok { color: var(--ok); }
+.hint.bad { color: var(--bad); }
+/* Phones: the command to copy and the pairing code. A QR code is dark on light whatever the theme: a scanner
+   may not read an inverted one. Both come from the palette's fixed accent steps. */
+.cmd { flex: 1 1 24ch; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); overflow-wrap: anywhere; user-select: all; }
+.pairing { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; margin-top: 10px; }
+.pairing[hidden] { display: none; }
+.pairing-text { flex: 1 1 28ch; }
+.pairing-text p { margin: 0; }
+.qr { display: block; width: 232px; height: 232px; border-radius: 6px; }
+.qr-light { fill: var(--accent-50); }
+.qr-dark { fill: var(--accent-900); }
 .muted { color: var(--muted); }
 .tabrow { padding: 6px 0; border-top: 1px solid var(--line); }
 .tabrow .tabtext { display: flex; flex-direction: column; min-width: 0; flex: 1; }

@@ -33,7 +33,7 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
     [--max-session-gib 16] [--max-total-gib 64]
     [--hello-timeout-secs 10] [--idle-timeout-secs 3600] [--max-connections 16]
     [--tailnet <pc.example.ts.net> [--devices <devices.json>] [--tailnet-session-hours 12]]
-target/release/streamtap-sink devices [pair | revoke <id>] (--token-stdin | --token <secret>) [--port 17650]
+target/release/streamtap-sink devices [pair | revoke <id>] (--token-stdin | --token <secret>) [--port 17650] [--json]
 ```
 
 ```
@@ -218,6 +218,9 @@ tailscale serve --bg 17650                                   # https://<pc>.<tai
   limits of every connection apply (`--max-session-gib`, `--idle-timeout-secs`, 64 MiB per message), and one
   connection lasts at most `--tailnet-session-hours` (default 12, up to 168); the add-on then logs in again and the
   capture goes on in a new folder.
+- **`--json`** (what the desktop app uses): `devices`, `devices pair` and `devices revoke <id>` print the sink's
+  answer as one line of JSON in place of the text; a pairing carries `code`, `tailnet`, `ttl`, its `link` and
+  `qr`, the modules of the link's QR code as one string of `1` (dark) and `0` per row, without a quiet zone.
 - **Whatever is refused is said to the phone** before the close (`refused` with a reason: `code`, `device`,
   `version`, `busy`, `full`, …), so the popup can show what happened instead of a silent failure.
 
@@ -504,7 +507,7 @@ machine); `-BuildOnly` builds anywhere.
 | Start menu entry `streamtap.lnk` | the user's Start menu programs folder | removed when it starts the installed app |
 | *Settings > Apps* entry (runs the installed `uninstall.ps1` with the places of this install) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\streamtap` | removed last, when its `InstallLocation` is this folder |
 | browser registrations (`NativeMessagingHosts`) | written by the app, not by the script | removed when the manifest names a host in the install folder; another copy's stays |
-| settings, token, pairings, host manifests | `%APPDATA%\io.github.wkdsteve.streamtap` | kept; `-RemoveData` removes `config.json`, `pairings.json`, `bridge.json` and `native-messaging\*.json` |
+| settings, token, pairings, host manifests | `%APPDATA%\io.github.wkdsteve.streamtap` | kept; `-RemoveData` removes `config.json`, `pairings.json`, `bridge.json`, `devices.json` and `native-messaging\*.json` |
 | WebView cache | `%LOCALAPPDATA%\io.github.wkdsteve.streamtap\EBWebView` | kept; `-RemoveData` removes it |
 | captures (default `captures\` in the settings folder) | wherever you set them | never touched |
 
@@ -727,6 +730,44 @@ Security:
   app cannot clean it up; the next mux overwrites it). If the job cannot be set
   up, the sink log says so (for a mux too, with the capture's id). Other platforms have no such guard (Windows-only
   for now).
+
+## Phones (the sink through the tailnet)
+
+The header's **Phones** panel is the app's side of
+[Phones over the tailnet](#phones-over-the-tailnet-tailscale-or-headscale): it starts the sink with `--tailnet`,
+shows a phone's pairing code and lists and revokes the paired phones. The sink does the work; the app asks it.
+
+- **Name of this PC in the tailnet** (`tailnet` in `config.json`; absent while empty, the default): a plain host name, lower case,
+  no `https://`, no port (`pc.example.ts.net`; with Headscale `pc.<base_domain>`). A pasted address is cut down to
+  it; anything else is refused. Like port and folder it can only change while the sink is stopped. With a name
+  the app starts the sink with `--tailnet <name> --devices <settings folder>\devices.json`, so the list of paired
+  phones lies with the app's settings and not among the captures (`-RemoveData` of the uninstaller removes it).
+  Without a name nothing changes: no phone gets in. A phone is paired for the name it was paired under: after
+  a change of the name the phones pair again.
+- **Tailscale Serve is yours to start.** The panel shows the command for the port in use
+  (`tailscale serve --bg <port>`) with a Copy button, and says never to use `tailscale funnel`. The app starts no
+  program of Tailscale and reads nothing from it; whether Serve runs shows on the phone (its popup says when the PC
+  does not answer). What Headscale needs is said in the section linked above.
+- **Show pairing code** (while the sink runs): the app runs `streamtap-sink devices pair --json`, which asks the
+  running sink over loopback; the token goes to that child's stdin, never into a command line. The panel shows the
+  link as a QR code (dark on light in both themes), the PC, the code and the link as text, and until when it is
+  good (one minute, one phone). The code leaves the page when a phone paired with it (the panel says which), when
+  the minute is over, when you hide it or close the panel, and when the sink stops. It is never copied to the
+  clipboard and never written to the log.
+- **Paired phones**: name (the phone chose it; shown as text, one line, at most 60 characters), the start of its
+  id, whether it is connected now, when it was paired and last used. The list is read when the panel opens, on
+  *Refresh*, every two seconds while a code is on show and every ten otherwise; it is only known while the sink
+  runs, and the panel says so instead of showing an empty list.
+- **Revoke** asks first and then revokes that one phone (`devices revoke <id> --json`): the sink forgets it and
+  closes its connections at once. Nothing else changes: no new token, no restart, the other phones and the paired
+  browsers stay. (Revoking a *browser* still gives the sink a new token and restarts it; the phones then log in
+  again by themselves, their captures in progress continue in a new folder.)
+- **When the sink cannot be asked** (it stopped, it does not answer within 15 s, its answer is not what the app
+  expects) the panel says why, in place of the hint, and shows no code. What the sink answers is read up to 64 KiB
+  and checked field by field (ids, the code, a square QR code of at most 177 modules); the pairing link is put
+  together by the app from the checked parts.
+
+The commands behind it are `phone_pair`, `phone_devices` and `phone_revoke`; `save_settings` takes the name.
 
 ## Connect browser (native messaging)
 
