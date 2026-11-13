@@ -69,6 +69,57 @@ const render = (state) => {
   out.replaceChildren(...parts);
 };
 
+const GROUP_LABELS = {
+  own: "own server",
+  free: "free licence",
+  ard: "ARD",
+  zdf: "ZDF / 3sat / KiKA",
+  learning: "learning platform",
+  obfuscated: "obfuscated service",
+  social: "social media",
+};
+const STATE_TEXT = {
+  off: ["", "source policy off: every site without DRM is captured"],
+  released: ["released", "released: captured"],
+  unlocked: ["", "unlocked by you: captured"],
+  locked: ["locked", "locked: nothing is copied (unlock below)"],
+  unknown: ["", "not in the list: captured, check the site's terms"],
+};
+
+// The source line and the settings form; every value is set as text or as a
+// form value, never parsed as markup.
+const showSources = (o) => {
+  void chrome.runtime.lastError;
+  const line = document.getElementById("source");
+  if (!o) {
+    line.textContent = "source: unavailable";
+    return;
+  }
+  const v = o.verdict;
+  if (!v) {
+    line.textContent = "source: no page seen in this tab yet";
+  } else {
+    const [cls, what] = STATE_TEXT[v.state] || ["", String(v.state)];
+    const groups = (Array.isArray(v.groups) ? v.groups : []).map((g) => GROUP_LABELS[g] || String(g));
+    line.className = cls || "muted";
+    line.textContent = `source: ${groups.length ? groups.join(", ") + " · " : ""}${what}`;
+  }
+  document.getElementById("policy-on").checked = o.on === true;
+  const unlocked = new Set(Array.isArray(o.unlocked) ? o.unlocked : []);
+  document.getElementById("unlock-obfuscated").checked = unlocked.has("obfuscated");
+  document.getElementById("unlock-social").checked = unlocked.has("social");
+  document.getElementById("own-hosts").value = (Array.isArray(o.own) ? o.own : []).join("\n");
+  document.getElementById("learning-hosts").value = (Array.isArray(o.learning) ? o.learning : []).join("\n");
+};
+
+// One host per line; the service worker cleans and bounds them again.
+const hostLines = (v) =>
+  String(v)
+    .split(/[\s,]+/)
+    .map((h) => h.trim())
+    .filter(Boolean)
+    .slice(0, 200);
+
 const fmtLink = (s) =>
   !s
     ? "sink: no segments tapped in this tab yet"
@@ -128,6 +179,26 @@ const load = async () => {
       void chrome.runtime.lastError;
       setTimeout(() => chrome.runtime.sendMessage({ kind: "vc-pair-status" }, showPair), 800);
     });
+
+  const askSources = () => chrome.runtime.sendMessage({ kind: "vc-source-of", tabId: tab.id }, showSources);
+  askSources();
+  document.getElementById("policy-save").onclick = () => {
+    const unlocked = [];
+    if (document.getElementById("unlock-obfuscated").checked) unlocked.push("obfuscated");
+    if (document.getElementById("unlock-social").checked) unlocked.push("social");
+    chrome.storage.local.set(
+      {
+        sourcePolicy: document.getElementById("policy-on").checked ? "on" : "off",
+        sourceUnlocked: unlocked,
+        sourceOwnHosts: hostLines(document.getElementById("own-hosts").value),
+        sourceLearningHosts: hostLines(document.getElementById("learning-hosts").value),
+      },
+      () => {
+        document.getElementById("policy-saved").textContent = "saved; open tabs follow at once";
+        askSources();
+      }
+    );
+  };
 
   // The service worker owns the sink sockets; ask it about this tab.
   chrome.runtime.sendMessage({ kind: "vc-link-status", tabId: tab.id }, (s) => {

@@ -18,6 +18,30 @@
       .sink { margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
       .sink label { margin-right: 8px; }
       .sink input { width: 110px; }
+      .policy { margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
+      .policy label { display: block; margin: 4px 0; }
+      .policy textarea { width: 100%; box-sizing: border-box; min-height: 3em; font: inherit; }
+      .locked { color: #8a0012; }
+      .released { color: #1b5e20; }
+      /* A phone (Firefox for Android shows the popup as a page): full width, larger text, touch targets. */
+      @media (pointer: coarse) {
+        body { width: auto; font-size: 16px; padding: 12px; }
+        h1 { font-size: 18px; }
+        button { min-height: 44px; min-width: 44px; padding: 0 12px; font-size: 16px; }
+        input, textarea { font-size: 16px; }
+        input[type="checkbox"] { width: 24px; height: 24px; vertical-align: middle; }
+        .policy label { min-height: 44px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .sink input { width: 100%; box-sizing: border-box; min-height: 44px; }
+        th, td { white-space: normal; }
+      }
+      @media (prefers-color-scheme: dark) {
+        body { background: #1e1e1e; color: #e6e6e6; }
+        th, .muted { color: #b0b0b0; }
+        .ms, .sink, .policy { border-color: #444; }
+        .drm { background: #4a1219; color: #ffd7dc; }
+        .locked { color: #ff9aa5; }
+        .released { color: #9be3a1; }
+      }
     </style>
   </head>
   <body>
@@ -28,6 +52,18 @@
       <span id="pair">app pairing: …</span>
       <button id="pair-now">pair now</button>
     </div>
+    <fieldset class="policy">
+      <legend>Sources</legend>
+      <div id="source" class="muted">source: …</div>
+      <label><input id="policy-on" type="checkbox" /> only allowed sources (source policy)</label>
+      <label><input id="unlock-obfuscated" type="checkbox" /> unlock: obfuscated services (YouTube and alike)</label>
+      <label><input id="unlock-social" type="checkbox" /> unlock: social media</label>
+      <div class="muted">Unlock a group only where capturing it is allowed for you. DRM is never captured.</div>
+      <label>own servers (one host per line) <textarea id="own-hosts" rows="2"></textarea></label>
+      <label>learning platforms that allow downloads (one host per line) <textarea id="learning-hosts" rows="2"></textarea></label>
+      <button id="policy-save">save sources</button>
+      <span id="policy-saved" class="muted"></span>
+    </fieldset>
     <fieldset class="sink">
       <legend>Sink (manual fallback; a paired app fills this in)</legend>
       <label>port <input id="port" type="number" min="1" max="65535" size="6" /></label>

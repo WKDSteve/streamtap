@@ -115,6 +115,24 @@ const spJudge = (urls, settings) => {
 
 const SP_STORAGE_KEYS = ["sourcePolicy", "sourceUnlocked", "sourceOwnHosts", "sourceLearningHosts"];
 
+// For the popup (vc-source-of): the verdict on a tab's top document (null
+// when no page was seen) and the settings in effect, the default included.
+const spOverview = (tabUrl) =>
+  new Promise((resolve) => {
+    chrome.storage.local.get(SP_STORAGE_KEYS, (v) => {
+      void chrome.runtime.lastError;
+      const s = spSettings(v);
+      resolve({
+        verdict: typeof tabUrl === "string" ? spJudge([tabUrl], s) : null,
+        on: s.on,
+        unlocked: [...s.unlocked],
+        own: s.own,
+        learning: s.learning,
+        lockable: Object.keys(SP_GROUPS).filter((g) => SP_GROUPS[g].state === "locked"),
+      });
+    });
+  });
+
 // What background.js answers a content script (vc-source-state): reads the
 // settings and judges the frame by the URLs the browser reports. A sub-frame
 // whose tab URL the browser does not report (Firefox without host access to

@@ -135,6 +135,8 @@ try {
   check(yt && yt.tap === false && yt.state === "locked", "the source policy is on by default: YouTube is locked");
   const ard = await ask({ kind: "vc-source-state" }, { frameId: 0, url: "https://www.ardmediathek.de/", tab: { id: 1, url: "https://www.ardmediathek.de/" } });
   check(ard && ard.tap === true && ard.state === "released", "a released source is tapped");
+  const ov = await ask({ kind: "vc-source-of", tabId: 99 });
+  check(ov && ov.on === true && ov.verdict === null && ov.lockable.includes("obfuscated") && ov.lockable.includes("social"), "the popup sees the policy on by default and the lockable groups");
   stored.sourcePolicy = "off";
   const off = await ask({ kind: "vc-source-state" }, { frameId: 0, url: "https://www.youtube.com/", tab: { id: 1, url: "https://www.youtube.com/" } });
   check(off && off.state === "off", "a stored \"off\" turns it off");

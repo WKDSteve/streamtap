@@ -53,7 +53,7 @@ class FakeText {
   }
 }
 
-const run = async (state) => {
+const run = async (state, overview = null, sets = []) => {
   const ids = {};
   const document = {
     getElementById: (id) => (ids[id] ??= new FakeNode(`#${id}`)),
@@ -63,13 +63,14 @@ const run = async (state) => {
   const chrome = {
     runtime: {
       lastError: undefined,
-      sendMessage: (msg, cb) => cb?.(msg.kind === "vc-get" ? state : undefined),
+      sendMessage: (msg, cb) => cb?.(msg.kind === "vc-get" ? state : msg.kind === "vc-source-of" ? overview : undefined),
     },
     tabs: { query: async () => [{ id: 1 }] },
-    storage: { local: { get: (d, cb) => cb(d), set: (_o, cb) => cb?.() } },
+    storage: { local: { get: (d, cb) => cb(d), set: (o, cb) => (sets.push(o), cb?.()) } },
   };
-  vm.runInNewContext(source, { document, chrome, setTimeout, String, Number });
+  vm.runInNewContext(source, { document, chrome, setTimeout, String, Number, Array, Set });
   await flush();
+  run.ids = ids;
   return ids.out;
 };
 
@@ -107,6 +108,31 @@ check(empty.textContent.startsWith("No MSE activity"), "no state shows the hint"
 const none = await run({ drm: [], events: 3, frames: [], mediaSources: [] });
 check(none.textContent.includes("No MediaSource created yet.") && none.textContent.includes("3 events"), "an empty registry says so");
 check(innerHtmlWrites === 0, "still no innerHTML after the other states");
+
+// The source section: forged overview values come out as text and form values.
+{
+  const sets = [];
+  await run(null, { verdict: { state: "locked", groups: ["obfuscated", EVIL] }, on: true, unlocked: ["social"], own: [EVIL], learning: ["lms.example"] }, sets);
+  const ids = run.ids;
+  check(ids.source.textContent.includes("obfuscated service") && ids.source.textContent.includes(EVIL) && ids.source.textContent.includes("locked: nothing is copied"), "the source line names the group and the state as text");
+  check(ids.source.children.every((c) => c instanceof FakeText), "the source line holds text only");
+  check(ids["policy-on"].checked === true && ids["unlock-social"].checked === true && ids["unlock-obfuscated"].checked === false, "the checkboxes show the settings in effect");
+  check(ids["own-hosts"].value === EVIL && ids["learning-hosts"].value === "lms.example", "user hosts come back as form values");
+  ids["unlock-obfuscated"].checked = true;
+  ids["policy-on"].checked = false;
+  ids["own-hosts"].value = "tv.home.lan\n  nas.lan , \n";
+  ids["policy-save"].onclick();
+  const w = sets.at(-1);
+  check(
+    w && w.sourcePolicy === "off" && JSON.stringify(w.sourceUnlocked) === JSON.stringify(["obfuscated", "social"]) && JSON.stringify(w.sourceOwnHosts) === JSON.stringify(["tv.home.lan", "nas.lan"]),
+    "save writes the policy, the unlocked groups and the cleaned host lines"
+  );
+  await run(null, { verdict: null, on: false, unlocked: [], own: [], learning: [] });
+  check(run.ids.source.textContent.includes("no page seen"), "a tab without a page says so");
+  await run(null, null);
+  check(run.ids.source.textContent === "source: unavailable", "no answer from the service worker says unavailable");
+  check(innerHtmlWrites === 0, "the source section writes no innerHTML either");
+}
 
 if (failures.length) {
   console.log(`\n${failures.length} check(s) failed`);

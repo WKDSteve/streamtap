@@ -84,6 +84,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse(serialize(tabs.get(msg.tabId)));
     return false;
   }
+  // The popup asks how the source policy judges a tab (by the URL the browser
+  // reported for it, never one the popup passes) and what is set.
+  if (msg && msg.kind === "vc-source-of" && typeof msg.tabId === "number") {
+    const t = tabs.get(msg.tabId);
+    spOverview(t ? t.url : null).then(sendResponse, () => sendResponse(null));
+    return true;
+  }
   if (msg && msg.kind === "vc-link-status" && typeof msg.tabId === "number") {
     sendResponse(sinkLinkStatus(msg.tabId));
     return false;
