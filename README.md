@@ -2,6 +2,8 @@
 
 # streamtap
 
+[![wkd](https://img.shields.io/badge/wkd-family-c6ff3d)](https://wkdsteve.github.io/wkd/apps/streamtap/)
+
 Save videos that play in your browser, tapped at the point where they are
 already in the clear: a browser extension hooks `SourceBuffer.appendBuffer()`
 (Media Source Extensions) and hands the segments to a desktop app that writes
