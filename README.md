@@ -208,3 +208,14 @@ EU 2001/29/EC Art. 6). Respect the terms of the sites you use it on.
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+<!-- connections:begin (written by the app-icons tool of the workshop; change integrations.json there, not this block) -->
+## Connections
+
+![streamtap: what it uses and what uses it](assets/graphs/streamtap.png)
+
+**Used by**
+
+- [hub-desktop](https://github.com/WKDSteve/hub-desktop): hub-desktop shows streamtap as a tile; it is a program with a window of its own. ([picture](assets/graphs/pair/hub-desktop--streamtap.png))
+- [takt](https://github.com/WKDSteve/takt): takt documents a protocol for external sources (`docs/SOURCES.md`) that providers such as streamtap are to deliver through. ([picture](assets/graphs/pair/takt--streamtap.png))
+<!-- connections:end -->
