@@ -3054,3 +3054,109 @@ fn open_inits_of_many_tracks_stay_under_the_session_cap() {
     assert!(total > 0, "the inits must still be pending");
     assert!(total <= MAX_PENDING_SESSION, "{total}");
 }
+
+// --- replay (a recording saved on a phone, extension/src/file-target.js) ---------------------------------------
+
+/// One message as the extension sends it: header length, JSON header, payload.
+fn wire_message(header: &serde_json::Value, payload: &[u8]) -> Vec<u8> {
+    let h = serde_json::to_vec(header).expect("json");
+    let mut v = u32::try_from(h.len())
+        .expect("small")
+        .to_le_bytes()
+        .to_vec();
+    v.extend(h);
+    v.extend_from_slice(payload);
+    v
+}
+
+/// A recording of `messages`, as file-target.js saves it.
+fn recording(messages: &[Vec<u8>]) -> Vec<u8> {
+    let mut v = RECORDING_MAGIC.to_vec();
+    for m in messages {
+        v.extend(u32::try_from(m.len()).expect("small").to_le_bytes());
+        v.extend(m);
+    }
+    v
+}
+
+fn rec_segment(seq: u64, is_init: bool, tfdt: Option<u64>, bytes: &[u8]) -> Vec<u8> {
+    wire_message(
+        &serde_json::json!({ "type": "segment", "sb": 1, "seq": seq, "ms": 1, "mime": "video/mp4",
+            "isInit": is_init, "kind": "mp4", "tfdt": tfdt, "timescale": 1000 }),
+        bytes,
+    )
+}
+
+fn rec_hello() -> Vec<u8> {
+    wire_message(
+        &serde_json::json!({ "type": "hello", "token": "", "session": "phone",
+            "url": "https://www.ardmediathek.de/video/x", "title": "On the phone" }),
+        &[],
+    )
+}
+
+#[test]
+fn a_recording_is_replayed_into_a_capture_directory_as_a_live_connection_writes_it() {
+    let dir = temp_dir("replay");
+    let init = init_with_traks(1);
+    let (m1, m2) = (moof(0), moof(1000));
+    let rec = recording(&[
+        rec_hello(),
+        rec_segment(1, true, None, &init),
+        rec_segment(2, false, Some(0), &m1),
+        rec_segment(3, false, Some(1000), &m2),
+        wire_message(
+            &serde_json::json!({ "type": "event", "name": "recordfull", "sb": null }),
+            &[],
+        ),
+    ]);
+    let done =
+        replay_from(&rec[..], &dir, &budget(16 * GIB, 64 * GIB), &refusals()).expect("replayed");
+    assert_eq!((done.bad, done.cut), (0, false));
+    let bin = fs::read(done.dir.join("sb1.p0.bin")).expect("part");
+    assert_eq!(bin, [init.clone(), m1, m2].concat());
+    assert_eq!(index_lines(&done.dir), 3);
+    let session = fs::read_to_string(done.dir.join("session.json")).expect("session");
+    assert!(
+        session.contains("ardmediathek") && session.contains("On the phone"),
+        "{session}"
+    );
+}
+
+#[test]
+fn a_recording_cut_short_keeps_what_came_before() {
+    let dir = temp_dir("replay-cut");
+    let init = init_with_traks(1);
+    let mut rec = recording(&[
+        rec_hello(),
+        rec_segment(1, true, None, &init),
+        rec_segment(2, false, Some(0), &moof(0)),
+    ]);
+    // The last message loses its tail (a save cut short).
+    rec.truncate(rec.len() - 3);
+    let done =
+        replay_from(&rec[..], &dir, &budget(16 * GIB, 64 * GIB), &refusals()).expect("replayed");
+    assert!(done.cut);
+    assert_eq!(fs::read(done.dir.join("sb1.p0.bin")).expect("part"), init);
+}
+
+#[test]
+fn what_is_no_recording_is_refused_and_writes_nothing() {
+    let dir = temp_dir("replay-bad");
+    let not_magic = b"STREAMTAP-RECORDING/2\n".to_vec();
+    let no_hello = recording(&[rec_segment(1, true, None, &init_with_traks(1))]);
+    let empty = recording(&[]);
+    for (name, bytes) in [
+        ("magic", not_magic),
+        ("no hello", no_hello),
+        ("empty", empty),
+    ] {
+        let got = replay_from(&bytes[..], &dir, &budget(16 * GIB, 64 * GIB), &refusals());
+        assert!(got.is_err(), "{name}");
+    }
+    assert_eq!(
+        fs::read_dir(&*dir).expect("dir").count(),
+        0,
+        "nothing written"
+    );
+}

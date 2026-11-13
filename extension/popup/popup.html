@@ -18,7 +18,9 @@
       .sink { margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
       .sink label { margin-right: 8px; }
       .sink input { width: 110px; }
-      .policy { margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
+      .policy, .target { margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
+      .target label { display: block; margin: 4px 0; }
+      #file-state { white-space: pre-line; }
       .policy label { display: block; margin: 4px 0; }
       .policy textarea { width: 100%; box-sizing: border-box; min-height: 3em; font: inherit; }
       .locked { color: #8a0012; }
@@ -30,14 +32,15 @@
         button { min-height: 44px; min-width: 44px; padding: 0 12px; font-size: 16px; }
         input, textarea { font-size: 16px; }
         input[type="checkbox"] { width: 24px; height: 24px; vertical-align: middle; }
-        .policy label { min-height: 44px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .policy label, .target label { min-height: 44px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        input[type="radio"] { width: 24px; height: 24px; }
         .sink input { width: 100%; box-sizing: border-box; min-height: 44px; }
         th, td { white-space: normal; }
       }
       @media (prefers-color-scheme: dark) {
         body { background: #1e1e1e; color: #e6e6e6; }
         th, .muted { color: #b0b0b0; }
-        .ms, .sink, .policy { border-color: #444; }
+        .ms, .sink, .policy, .target { border-color: #444; }
         .drm { background: #4a1219; color: #ffd7dc; }
         .locked { color: #ff9aa5; }
         .released { color: #9be3a1; }
@@ -63,6 +66,15 @@
       <label>learning platforms that allow downloads (one host per line) <textarea id="learning-hosts" rows="2"></textarea></label>
       <button id="policy-save">save sources</button>
       <span id="policy-saved" class="muted"></span>
+    </fieldset>
+    <fieldset class="target">
+      <legend>Target</legend>
+      <label><input type="radio" name="target" value="sink" id="target-sink" /> the sink on the PC (port and token below, or a paired app)</label>
+      <label><input type="radio" name="target" value="file" id="target-file" /> a file on this device (a recording; on the PC: <code>streamtap-sink replay</code>, then <code>mux</code>)</label>
+      <label class="muted"><input type="radio" name="target" value="video" id="target-video" disabled /> a video on this device (MP4, made here; not yet)</label>
+      <div id="file-state" class="muted"></div>
+      <button id="file-save" hidden>save the recording now</button>
+      <span id="target-saved" class="muted"></span>
     </fieldset>
     <fieldset class="sink">
       <legend>Sink (manual fallback; a paired app fills this in)</legend>

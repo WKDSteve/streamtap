@@ -157,11 +157,17 @@ const sinkFrame = (header, payload) => {
   return payload ? new Blob([len, h, payload]) : new Blob([len, h]);
 };
 
+// The target: the sink over a WebSocket (a port and a token), or a file on the device (file-target.js, where this
+// browser can save one). Without either the extension stays in metadata-only mode.
 const sinkSettings = () =>
   new Promise((resolve) => {
-    chrome.storage.local.get({ sinkPort: 17650, sinkToken: "" }, (v) =>
-      resolve(v.sinkToken ? { port: Number(v.sinkPort) || 17650, token: v.sinkToken } : null)
-    );
+    chrome.storage.local.get({ sinkPort: 17650, sinkToken: "", sinkTarget: "" }, (v) => {
+      if (v.sinkTarget === "file" && typeof fileTargetAvailable === "function" && fileTargetAvailable()) {
+        resolve({ file: true, token: "" });
+        return;
+      }
+      resolve(v.sinkToken ? { port: Number(v.sinkPort) || 17650, token: v.sinkToken } : null);
+    });
   });
 
 // An item leaves the stream (sent or dropped). Init segments are remembered
@@ -202,7 +208,8 @@ const linkDropPending = (link) => {
 };
 
 const linkWrite = (link, ws, item) => {
-  ws.send(item.blob);
+  // A recorder (file-target.js) counts media to know whether a recording is worth saving; a WebSocket ignores it.
+  ws.send(item.blob, !item.isInit && !item.initCont && Number.isSafeInteger(item.sb));
   link.sent++;
   link.sentBytes += item.blob.size;
   linkConsumed(link, item);
@@ -273,7 +280,9 @@ const linkConnect = async (link) => {
   link.connecting = true;
   const settings = await sinkSettings();
   let ws = null;
-  if (settings) {
+  if (settings && settings.file) {
+    ws = new FileRecorder(link.tabId, link.hello.url);
+  } else if (settings) {
     try {
       ws = new WebSocket(`ws://127.0.0.1:${settings.port}/`);
     } catch (e) {
@@ -356,6 +365,12 @@ const linkConnect = async (link) => {
     if (link.ws === ws) link.ws = null;
     linkDropPending(link);
     linkRelease(link);
+    // A recording closed to be saved (file-target.js) refuses nothing: the next segment starts a new one at once.
+    if (ws.restartAtOnce === true) {
+      link.retryDelay = SINK_RETRY_MIN_MS;
+      link.nextRetryAt = 0;
+      return;
+    }
     // A sink that closes right after the hello (wrong token, refused) must
     // not be hammered: only a socket that stayed open resets the backoff.
     scheduleRetry(link, Boolean(openedAt) && Date.now() - openedAt >= SINK_STABLE_MS);

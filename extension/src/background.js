@@ -9,7 +9,7 @@
 // Chrome runs this as a service worker and loads the other scripts here; the
 // Firefox build (scripts/build-firefox.mjs) lists them in the manifest's
 // background.scripts, in front of this file, and has no importScripts.
-if (typeof importScripts === "function") importScripts("sink-link.js", "native-pairing.js", "source-policy.js");
+if (typeof importScripts === "function") importScripts("file-target.js", "sink-link.js", "native-pairing.js", "source-policy.js");
 const FLAVOR = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR ? STREAMTAP_FLAVOR : { name: "chrome", sourcePolicyDefault: "", nativePairing: true };
 
 const tabs = new Map(); // tabId -> { url, frames: Set, ms: Map<msId, {...}>, drm: [] }
@@ -92,7 +92,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg && msg.kind === "vc-link-status" && typeof msg.tabId === "number") {
-    sendResponse(sinkLinkStatus(msg.tabId));
+    sendResponse({ ...(sinkLinkStatus(msg.tabId) || {}), file: fileStatus(msg.tabId) });
+    return false;
+  }
+  // The popup saves the recordings of the tab now (target "file on the device").
+  if (msg && msg.kind === "vc-file-save" && typeof msg.tabId === "number") {
+    sendResponse({ saved: fileSaveTab(msg.tabId) });
     return false;
   }
   if (msg && msg.kind === "vc-pair-status") {

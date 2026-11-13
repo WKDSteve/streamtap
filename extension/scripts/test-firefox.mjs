@@ -39,6 +39,7 @@ try {
   check(m.manifest_version === 3 && m.version === chrome.version && m.name === chrome.name, "same name, version and manifest version as the Chrome build");
   check(!("key" in m) && !("minimum_chrome_version" in m), "no Chrome key or minimum Chrome version");
   check(!m.permissions.includes("nativeMessaging") && !m.permissions.includes("favicon") && m.permissions.includes("storage"), "permissions: storage, without nativeMessaging and favicon");
+  check(m.permissions.includes("downloads"), "permissions: downloads, to save a recording on the device");
   check(!m.background.service_worker && Array.isArray(m.background.scripts), "an event page (background.scripts), no service worker");
   check(m.background.scripts[0] === "src/flavor-firefox.js" && m.background.scripts.at(-1) === "src/background.js", "background: the flavour first, background.js last");
   check(["src/sink-link.js", "src/native-pairing.js", "src/source-policy.js"].every((s) => m.background.scripts.includes(s)), "background: every script background.js imports");

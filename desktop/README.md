@@ -171,7 +171,14 @@ target/release/streamtap-sink serve (--token-stdin | --token <secret>)
 
 ```
 target/release/streamtap-sink mux captures/<dir> [--out file.mp4] [--timeout-secs 3600] [--verbose]
+target/release/streamtap-sink replay <recording.streamtap> [--out captures]
 ```
+
+`replay` reads a recording the extension saved on a phone (target *a file on the device*, see the extension's README)
+and writes the capture directory a live connection would have written: the same session code, so DRM is refused,
+inits are assembled and duplicates dropped here, not on the phone. The hello's token is not checked (the file is the
+person's own). A recording cut short keeps what came before its last whole message; one that does not start with
+`STREAMTAP-RECORDING/1` and a hello writes nothing. Then `mux` the directory it names.
 
 Runs `ffmpeg -nostats -loglevel error -f mp4 -protocol_whitelist file [-itsoffset <s>] -i <part> … -map 0 -map 1 … -c copy -movflags +faststart`.
 

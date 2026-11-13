@@ -5,6 +5,8 @@
 //!          segment to disk, one file per `SourceBuffer` (and per init-segment
 //!          "part"), plus an `index.jsonl` with the segment metadata.
 //! `mux`    turns a capture directory into a playable MP4 with `ffmpeg -c copy`.
+//! `replay` turns a recording saved on a phone (the extension's target "file on the device") into a
+//!          capture directory, through the same session code as `serve`.
 //!
 //! Wire format (every WebSocket binary message):
 //!   u32 little-endian header length | JSON header | payload bytes
@@ -29,6 +31,7 @@ mod error;
 mod init;
 mod mux;
 mod proc;
+mod replay;
 mod serve;
 mod session;
 #[cfg(test)]
@@ -39,6 +42,7 @@ use error::SinkError;
 use init::*;
 use mux::*;
 use proc::{Spec, Tool, Tools};
+use replay::*;
 use serve::*;
 use session::*;
 use wire::*;
@@ -102,10 +106,12 @@ fn main() {
     let (cmd, result) = match args.first().map(String::as_str) {
         Some("serve") => ("serve", run_serve(&args[1..])),
         Some("mux") => ("mux", run_mux(&args[1..], &Tools::default())),
+        Some("replay") => ("replay", run_replay(&args[1..])),
         _ => (
             "streamtap-sink",
             Err(SinkError::Usage(format!(
-                "usage:\n  streamtap-sink serve (--token-stdin | --token <token>) [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}] [--hello-timeout-secs {DEFAULT_HELLO_TIMEOUT_SECS}] [--idle-timeout-secs {DEFAULT_IDLE_TIMEOUT_SECS}] [--max-connections {DEFAULT_MAX_CONNECTIONS}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}] [--verbose]"
+                "usage:\n  streamtap-sink serve (--token-stdin | --token <token>) [--port {DEFAULT_PORT}] [--out captures] [--allow-origin {DEFAULT_ORIGIN}] [--hello-timeout-secs {DEFAULT_HELLO_TIMEOUT_SECS}] [--idle-timeout-secs {DEFAULT_IDLE_TIMEOUT_SECS}] [--max-connections {DEFAULT_MAX_CONNECTIONS}]\n  streamtap-sink mux <capture-dir> [--out <file.mp4>] [--timeout-secs {DEFAULT_MUX_TIMEOUT_SECS}] [--verbose]
+  streamtap-sink replay <recording.streamtap> [--out captures]"
             ))),
         ),
     };

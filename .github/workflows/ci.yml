@@ -68,6 +68,8 @@ jobs:
       - run: cargo test --workspace --locked
       # The drivers against the real sink of that build, with a small fragmented fixture.
       - run: node scripts/test-sink-live.mjs
+      # A recording as the extension saves it on a phone (target "file on the device"), read by the sink of this build.
+      - run: node ../extension/scripts/test-file-target.mjs --write "$RUNNER_TEMP/rec.streamtap" && target/debug/streamtap-sink replay "$RUNNER_TEMP/rec.streamtap" --out "$RUNNER_TEMP/replayed"
       # The supply chain: known advisories, licenses, sources.
       - run: cargo audit --deny warnings
       - run: cargo deny check
@@ -100,6 +102,8 @@ jobs:
       - run: node extension/scripts/test-source-policy.mjs
       # The Firefox (for Android) build: derived manifest, the xpi read back, the background page without importScripts.
       - run: node extension/scripts/test-firefox.mjs
+      # The target "file on the device": the real sink link with a recorder, fake downloads API.
+      - run: node extension/scripts/test-file-target.mjs
       # The popup in a fake DOM: forged values come out as text, never as markup.
       - run: node extension/scripts/test-popup.mjs
       # The sink link's lost-init and drain paths with a fake WebSocket (no arguments: mock mode, no sink).

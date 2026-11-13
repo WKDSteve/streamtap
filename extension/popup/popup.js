@@ -121,7 +121,7 @@ const hostLines = (v) =>
     .slice(0, 200);
 
 const fmtLink = (s) =>
-  !s
+  !s || !s.links
     ? "sink: no segments tapped in this tab yet"
     : `sink: ${s.connected ? "connected" : "not connected"} · ${s.sent} msgs / ${fmtBytes(s.sentBytes)} sent · ${s.dropped} dropped`;
 
@@ -200,11 +200,51 @@ const load = async () => {
     );
   };
 
-  // The service worker owns the sink sockets; ask it about this tab.
-  chrome.runtime.sendMessage({ kind: "vc-link-status", tabId: tab.id }, (s) => {
-    void chrome.runtime.lastError;
-    document.getElementById("link").textContent = fmtLink(s);
+  // The target: the sink on the PC, or a recording saved on this device.
+  const fileState = document.getElementById("file-state");
+  const fileSave = document.getElementById("file-save");
+  const showFile = (f, target) => {
+    const lines = [];
+    if (!f || !f.available) {
+      document.getElementById("target-file").disabled = true;
+      lines.push("a file on this device: not available in this browser");
+    } else if (target === "file") {
+      lines.push(
+        f.recording
+          ? `recording: ${f.media} media segments, ${fmtBytes(f.bytes)}${f.full ? " · memory full: newer media is not kept (said in the file)" : ""}`
+          : "recording: nothing in this tab yet (play the video; reload it after switching the target)"
+      );
+      for (const s of f.saved || []) {
+        lines.push(s.error ? `not saved (${s.error})${s.name ? `: ${s.name}` : ""}` : `saved: ${s.name}, ${fmtBytes(s.bytes)}${s.full ? " (memory was full)" : ""}`);
+      }
+    }
+    fileState.textContent = lines.join("\n");
+    fileSave.hidden = !(f && f.available && target === "file" && f.recording > 0);
+  };
+  const askLink = (target) =>
+    // The background owns the sink sockets and the recordings; ask it about this tab.
+    chrome.runtime.sendMessage({ kind: "vc-link-status", tabId: tab.id }, (s) => {
+      void chrome.runtime.lastError;
+      document.getElementById("link").textContent = fmtLink(s);
+      showFile(s && s.file, target);
+    });
+  chrome.storage.local.get({ sinkTarget: "" }, (v) => {
+    const target = v.sinkTarget === "file" ? "file" : "sink";
+    document.getElementById(`target-${target}`).checked = true;
+    askLink(target);
   });
+  for (const value of ["sink", "file"]) {
+    document.getElementById(`target-${value}`).onchange = () =>
+      chrome.storage.local.set({ sinkTarget: value === "file" ? "file" : "" }, () => {
+        document.getElementById("target-saved").textContent = "saved; reload the video page";
+        askLink(value);
+      });
+  }
+  fileSave.onclick = () =>
+    chrome.runtime.sendMessage({ kind: "vc-file-save", tabId: tab.id }, () => {
+      void chrome.runtime.lastError;
+      setTimeout(() => askLink("file"), 500);
+    });
 };
 
 load();

@@ -34,7 +34,8 @@ export const firefoxManifest = (chrome) => {
   const m = structuredClone(chrome);
   delete m.key;
   delete m.minimum_chrome_version;
-  m.permissions = (m.permissions || []).filter((p) => p !== "nativeMessaging" && p !== "favicon");
+  // No native messaging on Android; the downloads API saves a recording (target "file on the device").
+  m.permissions = [...(m.permissions || []).filter((p) => p !== "nativeMessaging" && p !== "favicon"), "downloads"];
   // background.js loads these with importScripts in Chrome; keep it the single source.
   const bg = readFileSync(join(root, "src", "background.js"), "utf8");
   const imp = /importScripts\(([^)]*)\)/.exec(bg);
