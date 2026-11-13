@@ -406,20 +406,12 @@
     const answer = (on) => {
       if (mine === question) setTapping(on);
     };
-<<<<<<< Updated upstream
-    chrome.storage.local.get({ sinkToken: "", tapMode: "all", sourcePolicy: "" }, (v) => {
+    chrome.storage.local.get({ sinkToken: "", sinkTarget: "", tapMode: "all", sourcePolicy: "" }, (v) => {
       // A stored "on"/"off" wins; otherwise on, unless the build's flavour says "off".
       const flavorOff = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR && STREAMTAP_FLAVOR.sourcePolicyDefault === "off";
       sourcePolicyOn = v.sourcePolicy === "on" || (v.sourcePolicy !== "off" && !flavorOff);
-      if (!v.sinkToken) return answer(false);
-=======
-    chrome.storage.local.get({ sinkToken: "", sinkTarget: "", tapMode: "all", sourcePolicy: "" }, (v) => {
-      // A stored "on"/"off" wins; otherwise the build's default (on in Firefox).
-      const flavorOn = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR && STREAMTAP_FLAVOR.sourcePolicyDefault === "on";
-      sourcePolicyOn = v.sourcePolicy === "on" || (v.sourcePolicy !== "off" && flavorOn);
       // A target is set: the sink (a token) or a file on the device.
       if (!v.sinkToken && v.sinkTarget !== "file") return answer(false);
->>>>>>> Stashed changes
       if (v.tapMode !== "selected") return withPolicy(true, answer);
       chrome.runtime.sendMessage({ kind: "vc-tap-state" }, (r) => {
         void chrome.runtime.lastError;
