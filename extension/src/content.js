@@ -424,8 +424,8 @@
       // A stored "on"/"off" wins; otherwise on, unless the build's flavour says "off".
       const flavorOff = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR && STREAMTAP_FLAVOR.sourcePolicyDefault === "off";
       sourcePolicyOn = v.sourcePolicy === "on" || (v.sourcePolicy !== "off" && !flavorOff);
-      // A target is set: the sink (a token) or a file on the device.
-      if (!v.sinkToken && v.sinkTarget !== "file") return answer(false);
+      // A target is set: the sink (a token), or a file or a video on the device.
+      if (!v.sinkToken && v.sinkTarget !== "file" && v.sinkTarget !== "video") return answer(false);
       if (v.tapMode !== "selected") return withPolicy(true, answer);
       chrome.runtime.sendMessage({ kind: "vc-tap-state" }, (r) => {
         void chrome.runtime.lastError;

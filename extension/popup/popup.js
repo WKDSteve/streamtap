@@ -161,6 +161,21 @@ const PAIR_ERRORS = {
   unsupported: "pairing is not available in this browser",
 };
 
+// One saved file in words: a video with what it holds (gaps, repeats dropped), or a recording, also why a wanted
+// video became one. Every value comes from the background and is put in as text.
+const savedLine = (s) => {
+  const r = s.report || {};
+  const notes = [];
+  if (s.full) notes.push("memory was full");
+  if (r.gaps) notes.push(`${r.gaps} gap(s), ${Number(r.gapSeconds || 0).toFixed(1)} s missing`);
+  if (r.dupes) notes.push(`${r.dupes} repeated part(s) kept once`);
+  if (r.overlaps) notes.push(`${r.overlaps} overlapping part(s) dropped`);
+  if (r.cut) notes.push(`${r.cut} cut part(s) lost`);
+  const what = s.video ? "video" : "recording";
+  const why = s.fallback ? ` - no video: ${s.fallback}; on the PC: streamtap-sink replay, then mux` : "";
+  return `saved ${what}: ${s.name}, ${fmtBytes(s.bytes)}${notes.length ? ` (${notes.join("; ")})` : ""}${why}`;
+};
+
 const fmtLink = (s) =>
   !s || !s.links
     ? "sink: no segments tapped in this tab yet"
@@ -241,26 +256,28 @@ const load = async () => {
     );
   };
 
-  // The target: the sink on the PC, or a recording saved on this device.
+  // The target: the sink on the PC, or a recording or a video saved on this device.
   const fileState = document.getElementById("file-state");
   const fileSave = document.getElementById("file-save");
   const showFile = (f, target) => {
     const lines = [];
+    const onDevice = target === "file" || target === "video";
     if (!f || !f.available) {
       document.getElementById("target-file").disabled = true;
-      lines.push("a file on this device: not available in this browser");
-    } else if (target === "file") {
+      document.getElementById("target-video").disabled = true;
+      lines.push("a file or a video on this device: not available in this browser");
+    } else if (onDevice) {
       lines.push(
         f.recording
           ? `recording: ${f.media} media segments, ${fmtBytes(f.bytes)}${f.full ? " · memory full: newer media is not kept (said in the file)" : ""}`
           : "recording: nothing in this tab yet (play the video; reload it after switching the target)"
       );
       for (const s of f.saved || []) {
-        lines.push(s.error ? `not saved (${s.error})${s.name ? `: ${s.name}` : ""}` : `saved: ${s.name}, ${fmtBytes(s.bytes)}${s.full ? " (memory was full)" : ""}`);
+        lines.push(s.error ? `not saved (${s.error})${s.name ? `: ${s.name}` : ""}` : savedLine(s));
       }
     }
     fileState.textContent = lines.join("\n");
-    fileSave.hidden = !(f && f.available && target === "file" && f.recording > 0);
+    fileSave.hidden = !(f && f.available && onDevice && f.recording > 0);
   };
   const askLink = (target) =>
     // The background owns the sink sockets and the recordings; ask it about this tab.
@@ -271,12 +288,12 @@ const load = async () => {
     });
   const showTarget = () =>
     chrome.storage.local.get({ sinkTarget: "" }, (v) => {
-      const target = v.sinkTarget === "file" || v.sinkTarget === "tailnet" ? v.sinkTarget : "sink";
+      const target = ["file", "video", "tailnet"].includes(v.sinkTarget) ? v.sinkTarget : "sink";
       document.getElementById(`target-${target}`).checked = true;
       askLink(target);
     });
   showTarget();
-  for (const value of ["sink", "file", "tailnet"]) {
+  for (const value of ["sink", "file", "video", "tailnet"]) {
     document.getElementById(`target-${value}`).onchange = () =>
       chrome.storage.local.set({ sinkTarget: value === "sink" ? "" : value }, () => {
         document.getElementById("target-saved").textContent = "saved; reload the video page";

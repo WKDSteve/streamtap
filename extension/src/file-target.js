@@ -42,7 +42,7 @@ const fileStamp = (d) => {
 };
 
 // A file name from the page's host (the browser's URL, not the page's word): letters, digits, dots and dashes only.
-const fileNameFor = (url, at) => {
+const fileNameFor = (url, at, ext = "streamtap") => {
   let host = "";
   try {
     host = new URL(url).hostname;
@@ -50,13 +50,15 @@ const fileNameFor = (url, at) => {
     host = "";
   }
   host = host.toLowerCase().replace(/[^a-z0-9.-]/g, "").replace(/^[.-]+|[.-]+$/g, "").slice(0, 64) || "video";
-  return `streamtap-${fileStamp(at)}-${host}.streamtap`;
+  return `streamtap-${fileStamp(at)}-${host}.${ext}`;
 };
 
 const fileLengthOf = (part) => (typeof part.size === "number" ? part.size : part.byteLength);
 
 class FileRecorder {
-  constructor(tabId, url) {
+  // `mode` "video": at the save the recording is made into an MP4 here (fmp4-mux.js); a capture it cannot take is
+  // saved as the recording, with the reason.
+  constructor(tabId, url, mode = "file") {
     this.readyState = FILE_CONNECTING;
     this.binaryType = "arraybuffer";
     this.bufferedAmount = 0;
@@ -67,7 +69,8 @@ class FileRecorder {
     this.tabId = tabId;
     this.url = String(url || "");
     this.startedAt = new Date();
-    this.parts = [];
+    this.mode = mode === "video" ? "video" : "file";
+    this.frames = [];
     this.bytes = 0;
     this.media = 0;
     this.full = false;
@@ -102,10 +105,8 @@ class FileRecorder {
   }
 
   push(message) {
-    const len = new Uint8Array(4);
     const size = fileLengthOf(message);
-    new DataView(len.buffer).setUint32(0, size, true);
-    this.parts.push(len, message);
+    this.frames.push(message);
     this.bytes += size + 4;
     fileRecordedTotal += size + 4;
   }
@@ -123,24 +124,46 @@ class FileRecorder {
   }
 
   save() {
-    const parts = this.parts;
+    const frames = this.frames;
     const bytes = this.bytes;
-    this.parts = [];
+    this.frames = [];
     fileRecordedTotal -= bytes;
     this.bytes = 0;
     // A page that held a MediaSource but appended no media is no recording.
     if (this.media === 0) return;
-    const name = fileNameFor(this.url, this.startedAt);
+    const recording = () => {
+      const parts = [FILE_MAGIC];
+      for (const f of frames) {
+        const len = new Uint8Array(4);
+        new DataView(len.buffer).setUint32(0, fileLengthOf(f), true);
+        parts.push(len, f);
+      }
+      return new Blob(parts, { type: "application/octet-stream" });
+    };
+    if (this.mode !== "video") {
+      this.download(recording(), fileNameFor(this.url, this.startedAt), { bytes });
+      return;
+    }
+    fileVideoOf(frames).then(
+      (made) => {
+        if (made.ok) this.download(made.blob, fileNameFor(this.url, this.startedAt, "mp4"), { bytes: made.blob.size, video: true, report: made.report });
+        else this.download(recording(), fileNameFor(this.url, this.startedAt), { bytes, fallback: made.text });
+      },
+      () => this.download(recording(), fileNameFor(this.url, this.startedAt), { bytes, fallback: "the video could not be made" })
+    );
+  }
+
+  download(blob, name, note) {
     let href = null;
     try {
-      href = URL.createObjectURL(new Blob([FILE_MAGIC, ...parts], { type: "application/octet-stream" }));
+      href = URL.createObjectURL(blob);
     } catch (e) {
       fileNote({ error: "blob", at: Date.now() });
       return;
     }
     const done = (id) => {
       const failed = chrome.runtime.lastError || typeof id !== "number";
-      fileNote(failed ? { error: "download", name, at: Date.now() } : { name, bytes, full: this.full, at: Date.now() });
+      fileNote(failed ? { error: "download", name, at: Date.now() } : { name, full: this.full, at: Date.now(), ...note });
       // The download reads the blob; it is let go once that had time to finish.
       setTimeout(() => URL.revokeObjectURL(href), FILE_REVOKE_MS);
     };
@@ -151,6 +174,29 @@ class FileRecorder {
     }
   }
 }
+
+// The recorded messages made into one MP4 (fmp4-mux.js): { ok, blob, report } or { ok: false, text }.
+const fileVideoOf = async (frames) => {
+  const messages = [];
+  const dec = new TextDecoder();
+  for (const f of frames) {
+    const b = new Uint8Array(await f.arrayBuffer());
+    if (b.byteLength < 4) continue;
+    const hl = new DataView(b.buffer).getUint32(0, true);
+    if (4 + hl > b.byteLength) continue;
+    let header = null;
+    try {
+      header = JSON.parse(dec.decode(b.subarray(4, 4 + hl)));
+    } catch (e) {
+      continue;
+    }
+    messages.push({ header, payload: b.subarray(4 + hl) });
+  }
+  const r = fmp4Mux(messages);
+  if (!r.ok) return { ok: false, text: r.text };
+  const report = { gaps: r.report.gaps.length, gapSeconds: r.report.gaps.reduce((n, g) => n + g.seconds, 0), dupes: r.report.dupes, overlaps: r.report.overlaps, cut: r.report.cut };
+  return { ok: true, blob: new Blob(r.parts, { type: "video/mp4" }), report };
+};
 
 const fileNote = (entry) => {
   fileSaved.unshift(entry);

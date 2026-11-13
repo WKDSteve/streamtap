@@ -107,6 +107,8 @@ jobs:
       - run: node extension/scripts/test-firefox.mjs
       # The target "file on the device": the real sink link with a recorder, fake downloads API.
       - run: node extension/scripts/test-file-target.mjs
+      # The muxer of the target "a video on this device" on real fMP4 fixtures (ffprobe/ffmpeg checks where installed).
+      - run: node extension/scripts/test-fmp4-mux.mjs
       # The target "the sink over the tailnet": pairing, the login with a non-extractable key, every refusal, fake sink.
       - run: node extension/scripts/test-tailnet.mjs
       # The popup in a fake DOM: forged values come out as text, never as markup.

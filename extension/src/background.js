@@ -9,7 +9,7 @@
 // Chrome runs this as a service worker and loads the other scripts here; the
 // Firefox build (scripts/build-firefox.mjs) lists them in the manifest's
 // background.scripts, in front of this file, and has no importScripts.
-if (typeof importScripts === "function") importScripts("file-target.js", "tailnet-target.js", "sink-link.js", "native-pairing.js", "source-policy.js");
+if (typeof importScripts === "function") importScripts("fmp4-mux.js", "file-target.js", "tailnet-target.js", "sink-link.js", "native-pairing.js", "source-policy.js");
 const FLAVOR = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR ? STREAMTAP_FLAVOR : { name: "chrome", sourcePolicyDefault: "", nativePairing: true };
 
 const tabs = new Map(); // tabId -> { url, frames: Set, ms: Map<msId, {...}>, drm: [] }

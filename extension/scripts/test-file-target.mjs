@@ -9,6 +9,8 @@
 //              in effect first, so each file stands on its own
 //   full       beyond the bound media is dropped, `recordfull` is noted once, init bytes are still kept
 //   no-api     without the downloads API (a Chrome service worker) nothing is recorded: metadata only
+//   video      target "video": real fMP4 segments are saved as one .mp4 (ftyp, moov, moof+mdat)
+//   fallback   target "video" with a capture the muxer refuses (WebM): the recording is saved, with the reason
 // With `--write <file>` the recording of "saved" is also written there, for `streamtap-sink replay` (the CI checks
 // that the sink reads what the extension saves).
 // Exit 0 when every check passed.
@@ -29,14 +31,14 @@ const check = (ok, what) => {
 const MAGIC = "STREAMTAP-RECORDING/1\n";
 
 // A vm context with both scripts; `downloads: false` leaves the API out.
-const world = ({ downloads = true } = {}) => {
+const world = ({ downloads = true, target = "file" } = {}) => {
   const blobs = new Map();
   const saved = [];
   let connect = null;
   let n = 0;
   const chrome = {
     runtime: { onConnect: { addListener: (f) => (connect = f) }, lastError: undefined },
-    storage: { local: { get: (d, cb) => setTimeout(() => cb({ ...d, sinkTarget: "file" }), 0) } },
+    storage: { local: { get: (d, cb) => setTimeout(() => cb({ ...d, sinkTarget: target }), 0) } },
   };
   if (downloads) {
     chrome.downloads = {
@@ -59,7 +61,8 @@ const world = ({ downloads = true } = {}) => {
     return new URL(...a);
   };
   Object.assign(URLx, url);
-  const ctx = vm.createContext({ console, Blob, TextEncoder, DataView, Uint8Array, setTimeout, fetch, URL: URLx, chrome, WebSocket: { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 } });
+  const ctx = vm.createContext({ console, Blob, TextEncoder, TextDecoder, BigInt, Math, DataView, Uint8Array, setTimeout, fetch, URL: URLx, chrome, WebSocket: { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 } });
+  vm.runInContext(src("fmp4-mux.js"), ctx, { filename: "fmp4-mux.js" });
   vm.runInContext(src("file-target.js"), ctx, { filename: "file-target.js" });
   vm.runInContext(src("sink-link.js"), ctx, { filename: "sink-link.js" });
   const port = (tabId, url = "https://www.ardmediathek.de/video/x") => {
@@ -198,6 +201,42 @@ const until = async (cond) => {
   p.gone();
   await tick();
   check(w.saved.length === 0, "no-api: nothing saved");
+}
+
+// video and fallback: real segments of extension/scripts/fixtures/video-frag.mp4
+{
+  const { splitFmp4 } = await import("../../desktop/scripts/fmp4-split.mjs");
+  const v = splitFmp4(join(here, "fixtures", "video-frag.mp4"));
+  const url = (b) => "data:application/octet-stream;base64," + Buffer.from(b).toString("base64");
+  const real = (kind) => [
+    { t: "segment", header: { sb: 1, seq: seq++, ms: 1, mime: "video/mp4", isInit: true, kind, tso: 0 }, payload: url(v.init) },
+    ...v.segments.map((s) => ({ t: "segment", header: { sb: 1, seq: seq++, ms: 1, mime: "video/mp4", isInit: false, kind, tfdt: v.tfdtOf(s), tso: 0 }, payload: url(s) })),
+  ];
+  const w = world({ target: "video" });
+  const p = w.port(6);
+  for (const m of real("mp4")) p.post(m);
+  await until(() => w.run("fileStatus(6)").media === 3);
+  p.gone();
+  await until(() => w.saved.length === 1);
+  const f = w.saved[0];
+  check(f && /\.mp4$/.test(f.filename), `video: saved as .mp4 (got ${f && f.filename})`);
+  const b = f ? Buffer.from(await f.blob.arrayBuffer()) : Buffer.alloc(0);
+  check(b.toString("latin1", 4, 8) === "ftyp" && b.includes("moov") && b.includes("moof"), "video: an MP4 with ftyp, moov and fragments");
+  await until(() => w.run("fileStatus(6)").saved.length === 1);
+  const note = w.run("fileStatus(6)").saved[0];
+  check(note.video === true && note.report && note.report.gaps === 0, `video: the popup is told it is a video without gaps (got ${JSON.stringify(note)})`);
+
+  const w2 = world({ target: "video" });
+  const p2 = w2.port(7);
+  for (const m of real("webm")) p2.post(m);
+  await until(() => w2.run("fileStatus(7)").media === 3);
+  p2.gone();
+  await until(() => w2.saved.length === 1);
+  const f2 = w2.saved[0];
+  check(f2 && /\.streamtap$/.test(f2.filename), `fallback: saved as the recording (got ${f2 && f2.filename})`);
+  await until(() => w2.run("fileStatus(7)").saved.length === 1);
+  const n2 = w2.run("fileStatus(7)").saved[0];
+  check(typeof n2.fallback === "string" && n2.fallback.includes("WebM"), `fallback: the reason is said (got ${n2.fallback})`);
 }
 
 if (failures.length) {

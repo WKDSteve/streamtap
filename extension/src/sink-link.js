@@ -169,8 +169,8 @@ const sinkSettings = () =>
         tnSettings().then((p) => resolve(p ? { tailnet: p, token: "" } : null), () => resolve(null));
         return;
       }
-      if (v.sinkTarget === "file" && typeof fileTargetAvailable === "function" && fileTargetAvailable()) {
-        resolve({ file: true, token: "" });
+      if ((v.sinkTarget === "file" || v.sinkTarget === "video") && typeof fileTargetAvailable === "function" && fileTargetAvailable()) {
+        resolve({ file: true, mode: v.sinkTarget, token: "" });
         return;
       }
       resolve(v.sinkToken ? { port: Number(v.sinkPort) || 17650, token: v.sinkToken } : null);
@@ -288,7 +288,7 @@ const linkConnect = async (link) => {
   const settings = await sinkSettings();
   let ws = null;
   if (settings && settings.file) {
-    ws = new FileRecorder(link.tabId, link.hello.url);
+    ws = new FileRecorder(link.tabId, link.hello.url, settings.mode);
   } else if (settings && settings.tailnet) {
     // Open for the link only once the sink took this device's login.
     ws = new TailnetSocket(settings.tailnet);
