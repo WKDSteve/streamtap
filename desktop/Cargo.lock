@@ -3544,8 +3544,11 @@ dependencies = [
 name = "streamtap-host"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
 ]
 
 [[package]]

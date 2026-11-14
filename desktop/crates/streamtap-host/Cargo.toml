@@ -10,6 +10,11 @@ publish = false
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The bridge's handshake (src/auth.rs): HMAC-SHA256 over fresh nonces, so the bridge key is proved and never
+# sent. The versions the workspace already has (p256 and appkit bring them).
+hmac = "0.13"
+sha2 = "0.11"
+getrandom = "0.4"
 
 [lints]
 workspace = true

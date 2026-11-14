@@ -174,12 +174,12 @@ impl Settings {
         Ok(())
     }
 
-    /// Field by field, the token in constant time (tests only: the app never
-    /// needs to compare whole settings).
+    /// Field by field (tests only: the app never needs to compare whole
+    /// settings, or a token).
     #[cfg(test)]
     pub(crate) fn same_as(&self, other: &Self) -> bool {
         self.port == other.port
-            && self.token.matches(other.token.expose().as_bytes())
+            && self.token.expose() == other.token.expose()
             && self.captures_dir == other.captures_dir
             && self.tailnet == other.tailnet
             && self.language == other.language

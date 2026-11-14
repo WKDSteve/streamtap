@@ -2,10 +2,11 @@
 //! pairing decisions and the tab lists.
 //!
 //! A host connects to a loopback socket the app opens (its port and a random
-//! key, new at each start, are written to `bridge.json`), sends the key, says
-//! who it is (`hello`) and then relays the extension's messages. The hub:
+//! key, new at each start, are written to `bridge.json`). Both ends prove that
+//! key to each other (`streamtap_host::auth`; it is never sent), then the host
+//! says who it is (`hello`) and relays the extension's messages. The hub:
 //!
-//! - gives a connection without the right key no slot and no prompt;
+//! - gives a connection that does not prove the key no slot and no prompt;
 //! - refuses any origin but the streamtap extension's;
 //! - sends port and token only to a browser the user approved (now, or at an
 //!   earlier time: `pairings.json`), and never anything but a state before that;
@@ -23,10 +24,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use streamtap_host::auth::{self, Role};
 use streamtap_host::framing::read_line;
 use streamtap_host::proto::{
-    BridgeMsg, HostMsg, Pairing, TabInfo, ALLOWED_ORIGIN, BRIDGE_FILE, MAX_BRIDGE_KEY,
-    MAX_BRIDGE_LINE,
+    BridgeMsg, HostMsg, Pairing, TabInfo, ALLOWED_ORIGIN, BRIDGE_FILE, MAX_BRIDGE_LINE,
 };
 
 use crate::pairings::{Approval, Store};
@@ -34,7 +35,8 @@ use crate::secret::Token;
 
 /// Hosts connected at once (one per browser profile, with room to spare).
 const MAX_CONNECTIONS: usize = 16;
-/// A connection that has not sent the bridge key by then is dropped.
+/// A connection that has not proved the bridge key by then (the whole
+/// handshake, both of its lines) is dropped.
 const KEY_TIMEOUT: Duration = Duration::from_secs(2);
 /// A connection that has not said hello by then is dropped.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -409,7 +411,7 @@ pub(crate) struct Server {
 impl Server {
     /// Opens the bridge on a loopback port of the system's choosing and
     /// writes the port and a new random key into `dir/bridge.json`. Only a
-    /// connection that sends that key first gets a slot in the hub.
+    /// connection that proves that key first gets a slot in the hub.
     pub(crate) fn start(hub: &Arc<Hub>, dir: &Path) -> Result<Self, String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| format!("cannot open the browser bridge: {e}"))?;
@@ -444,12 +446,12 @@ impl Drop for Server {
     }
 }
 
-/// Reads the key line: at most `MAX_BRIDGE_KEY` bytes and until `deadline`
-/// in total, not per read, so a client that trickles in a byte now and then
-/// is cut off as well. None for a timeout, a closed or failed connection, a
-/// line that is too long or one without its end.
-fn read_key(lines: &mut BufReader<TcpStream>, deadline: Instant) -> Option<Vec<u8>> {
-    let mut key = Vec::new();
+/// Reads one line of the handshake: at most `auth::MAX_AUTH_LINE` bytes and
+/// until `deadline` in total, not per read, so a client that trickles in a
+/// byte now and then is cut off as well. None for a timeout, a closed or
+/// failed connection, a line that is too long or one without its end.
+fn read_auth_line(lines: &mut BufReader<TcpStream>, deadline: Instant) -> Option<Vec<u8>> {
+    let mut line = Vec::new();
     loop {
         let left = deadline
             .checked_duration_since(Instant::now())
@@ -463,29 +465,58 @@ fn read_key(lines: &mut BufReader<TcpStream>, deadline: Instant) -> Option<Vec<u
             .iter()
             .position(|&b| b == b'\n')
             .map_or((buf.len(), false), |i| (i, true));
-        if key.len() + take > MAX_BRIDGE_KEY {
+        if line.len() + take > auth::MAX_AUTH_LINE {
             return None;
         }
-        key.extend_from_slice(&buf[..take]);
+        line.extend_from_slice(&buf[..take]);
         lines.consume(take + usize::from(found));
         if found {
-            if key.last() == Some(&b'\r') {
-                key.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
             }
-            return Some(key);
+            return Some(line);
         }
     }
 }
 
+/// The app's side of the bridge handshake (`streamtap_host::auth`): the host
+/// greets with a nonce, the app answers with a nonce of its own and its proof
+/// of the key, and the host's proof must follow, all before `deadline`. The
+/// app's answer tells a stranger nothing it could use: it holds for these two
+/// nonces and for the app's role only.
+fn prove_and_check(lines: &mut BufReader<TcpStream>, key: &Token, deadline: Instant) -> bool {
+    let Some(first) = read_auth_line(lines, deadline) else {
+        return false;
+    };
+    let Some(host_nonce) = auth::parse_greeting(&first) else {
+        return false;
+    };
+    let Ok(app_nonce) = auth::nonce() else {
+        return false;
+    };
+    let answer = auth::answer_line(key.expose(), host_nonce, &app_nonce);
+    let mut out: &TcpStream = lines.get_ref();
+    if out.write_all(answer.as_bytes()).is_err() || out.flush().is_err() {
+        return false;
+    }
+    read_auth_line(lines, deadline)
+        .as_deref()
+        .and_then(|l| std::str::from_utf8(l).ok())
+        .is_some_and(|claimed| {
+            auth::proves(key.expose(), Role::Host, host_nonce, &app_nonce, claimed)
+        })
+}
+
 fn serve_connection(hub: &Hub, stream: TcpStream, key: &Token) {
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    // The key comes first, within a short time in total and a small bound;
-    // without it the connection gets no slot and no prompt.
+    // The handshake comes first, within a short time in total and small
+    // bounds; without the host's proof the connection gets no slot and no
+    // prompt.
     let deadline = Instant::now() + KEY_TIMEOUT;
     let mut lines = BufReader::new(stream);
-    let keyed = read_key(&mut lines, deadline).is_some_and(|k| key.matches(&k));
+    let proven = prove_and_check(&mut lines, key, deadline);
     let stream = lines.get_ref();
-    if !keyed {
+    if !proven {
         let _ = stream.shutdown(Shutdown::Both);
         return;
     }
@@ -817,25 +848,66 @@ mod tests {
         line
     }
 
-    /// Sends `first` (the key line, or anything else) and a hello; returns
-    /// the first answer, or none when the bridge closed without one.
-    fn talk_raw(port: u16, first: &[u8]) -> Option<HostMsg> {
-        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.write_all(first).unwrap();
-        // The bridge may already have closed after a bad first line.
+    /// The first answer to a hello on `s`, or none when the bridge closed without one.
+    fn hello_answer(mut s: TcpStream) -> Option<HostMsg> {
+        // The bridge may already have closed after a failed handshake.
         let _ = s.write_all(&hello_line(ALLOWED_ORIGIN));
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut r = BufReader::new(s);
         read_line(&mut r, 4096)
             .ok()
             .flatten()
-            .map(|l| HostMsg::parse(&l).unwrap())
+            .and_then(|l| HostMsg::parse(&l).ok())
     }
 
-    /// Without the key from `bridge.json` a connection gets no slot and no
-    /// pairing prompt: silent, wrong, missing or oversized keys.
+    /// Sends `first` instead of a handshake, then a hello; returns the first
+    /// message that comes back, or none when the bridge closed without one.
+    fn talk_raw(port: u16, first: &[u8]) -> Option<HostMsg> {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _ = s.write_all(first);
+        hello_answer(s)
+    }
+
+    /// Every byte the bridge sends to a client that opens with `first` and
+    /// then only listens, until the bridge closes the connection.
+    fn said_to(port: u16, first: &[u8]) -> Vec<u8> {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _ = s.write_all(first);
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut said = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut s, &mut said);
+        said
+    }
+
+    /// A connection that went through the handshake as a host with `key`.
+    fn proven(port: u16, key: &str) -> std::io::Result<TcpStream> {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        auth::host_handshake(&mut s, key).map(|()| s)
+    }
+
+    /// The handshake by hand up to the app's answer: (stream, host nonce, app nonce, the app's proof).
+    fn greeted(port: u16) -> (TcpStream, String, String, String) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let host_nonce = auth::nonce().unwrap();
+        s.write_all(auth::greeting_line(&host_nonce).as_bytes())
+            .unwrap();
+        let mut answer = Vec::new();
+        let mut byte = [0u8; 1];
+        while std::io::Read::read(&mut s, &mut byte).unwrap_or(0) == 1 && byte[0] != b'\n' {
+            answer.push(byte[0]);
+        }
+        let answer = String::from_utf8(answer).unwrap();
+        let (app_nonce, app_proof) = answer.split_once(' ').expect("nonce and proof");
+        (s, host_nonce, app_nonce.to_owned(), app_proof.to_owned())
+    }
+
+    /// Without the proof of the key from `bridge.json` a connection gets no
+    /// slot and no pairing prompt: silent ones, the key itself as the old
+    /// protocol sent it, a hello, a greeting that is not one.
     #[test]
-    fn the_bridge_wants_its_key_before_anything_else() {
+    fn the_bridge_wants_the_handshake_before_anything_else() {
         let (h, dir) = hub("key");
         let hub = Arc::new(h);
         let server = Server::start(&hub, &dir).unwrap();
@@ -847,15 +919,16 @@ mod tests {
         let silent: Vec<TcpStream> = (0..=MAX_CONNECTIONS)
             .map(|_| TcpStream::connect(("127.0.0.1", bridge.port)).unwrap())
             .collect();
-        let mut wrong = key.clone().into_bytes();
-        wrong[0] = if wrong[0] == b'0' { b'1' } else { b'0' };
-        wrong.push(b'\n');
+        let nonce = auth::nonce().unwrap();
         for first in [
-            wrong,
+            // The key itself: what a host of the old protocol sent first. It opens nothing any more.
+            format!("{key}\n").into_bytes(),
             hello_line(ALLOWED_ORIGIN),
             b"\n".to_vec(),
-            format!("{key}{key}{key}\n").into_bytes(),
-            key.as_bytes()[..63].to_vec(),
+            format!("streamtap-bridge/1 {nonce}\n").into_bytes(),
+            format!("streamtap-bridge/2 {}\n", &nonce[..63]).into_bytes(),
+            format!("streamtap-bridge/2 {key}{key}{key}\n").into_bytes(),
+            auth::greeting_line(&nonce).into_bytes()[..40].to_vec(),
         ] {
             assert_eq!(
                 talk_raw(bridge.port, &first),
@@ -863,12 +936,19 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&first)
             );
+            // Not even the app's own proof goes to a client that did not greet.
+            assert_eq!(
+                said_to(bridge.port, &first),
+                b"",
+                "{}",
+                String::from_utf8_lossy(&first)
+            );
         }
-        assert_eq!(hub.slots(), 0, "no slot without the key");
+        assert_eq!(hub.slots(), 0, "no slot without the proof");
         assert!(hub.view().connections.is_empty(), "no prompt");
 
-        // The right key works, although the silent ones are still open.
-        let ok = talk_raw(bridge.port, format!("{key}\n").as_bytes());
+        // The handshake works, although the silent ones are still open.
+        let ok = hello_answer(proven(bridge.port, &key).expect("the handshake"));
         assert_eq!(ok, Some(HostMsg::state(Pairing::Pending)));
         drop(silent);
         server.stop();
@@ -876,16 +956,86 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The key timeout counts in total: a client that sends a byte of the
-    /// right key now and then (each read is quick) is cut off all the same.
+    /// The app's answer is a proof of its own, for the host's nonce: a client
+    /// that does not know the key cannot go on from it. A wrong proof, the
+    /// app's own proof sent back, a proof for another connection's nonces and
+    /// no proof at all get no slot.
     #[test]
-    fn a_trickled_key_is_cut_off_after_the_key_timeout() {
+    fn a_client_that_cannot_prove_the_key_gets_no_slot() {
+        /// What a client sends as its proof, from (host nonce, app nonce, the app's proof).
+        type Forge = Box<dyn Fn(&str, &str, &str) -> String>;
+        let (h, dir) = hub("noproof");
+        let hub = Arc::new(h);
+        let server = Server::start(&hub, &dir).unwrap();
+        let bridge = streamtap_host::relay::read_bridge(&dir).unwrap();
+        let (port, key) = (bridge.port, bridge.key().to_string());
+
+        // The app proves the key first, over the host's nonce and one of its own.
+        let (s, host_nonce, app_nonce, app_proof) = greeted(port);
+        assert!(auth::proves(
+            &key,
+            Role::App,
+            &host_nonce,
+            &app_nonce,
+            &app_proof
+        ));
+        assert!(!app_proof.contains(&key) && !app_nonce.contains(&key));
+        drop(s);
+        // Each connection gets a nonce of its own.
+        let (other, _, other_nonce, _) = greeted(port);
+        assert_ne!(app_nonce, other_nonce);
+        drop(other);
+
+        let stale = auth::proof(&key, Role::Host, &host_nonce, &app_nonce);
+        let attempts: [(&str, Forge); 5] = [
+            (
+                "a proof made with another key",
+                Box::new(|h, a, _| auth::proof(&"ab".repeat(32), Role::Host, h, a)),
+            ),
+            (
+                "the app's own proof sent back",
+                Box::new(|_, _, p| p.to_owned()),
+            ),
+            (
+                "the host proof of another connection",
+                Box::new(move |_, _, _| stale.clone()),
+            ),
+            (
+                "the key itself",
+                Box::new({
+                    let key = key.clone();
+                    move |_, _, _| key.clone()
+                }),
+            ),
+            ("an empty line", Box::new(|_, _, _| String::new())),
+        ];
+        for (what, forge) in &attempts {
+            let (mut s, h, a, p) = greeted(port);
+            let _ = s.write_all(format!("{}\n", forge(&h, &a, &p)).as_bytes());
+            assert_eq!(hello_answer(s), None, "{what}");
+            assert_eq!(hub.slots(), 0, "{what}: no slot");
+        }
+        assert!(hub.view().connections.is_empty(), "no prompt");
+        // The right proof for this connection's nonces is what opens it.
+        let (mut s, h, a, _) = greeted(port);
+        s.write_all(format!("{}\n", auth::proof(&key, Role::Host, &h, &a)).as_bytes())
+            .unwrap();
+        assert_eq!(hello_answer(s), Some(HostMsg::state(Pairing::Pending)));
+        server.stop();
+        hub.close_all();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The handshake's time limit counts in total: a client that sends a byte
+    /// of a greeting now and then (each read is quick) is cut off all the same.
+    #[test]
+    fn a_trickled_handshake_is_cut_off_after_the_time_limit() {
         use std::io::Read as _;
         let (h, dir) = hub("trickle");
         let hub = Arc::new(h);
         let server = Server::start(&hub, &dir).unwrap();
         let bridge = streamtap_host::relay::read_bridge(&dir).unwrap();
-        let key = bridge.key().as_bytes().to_vec();
+        let greeting = auth::greeting_line(&auth::nonce().unwrap()).into_bytes();
         let mut s = TcpStream::connect(("127.0.0.1", bridge.port)).unwrap();
         s.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
@@ -895,7 +1045,7 @@ mod tests {
             if start.elapsed() > KEY_TIMEOUT * 3 {
                 break false;
             }
-            if s.write_all(&key[sent..=sent]).is_err() {
+            if s.write_all(&greeting[sent..=sent]).is_err() {
                 break true;
             }
             sent += 1;
@@ -916,7 +1066,7 @@ mod tests {
             "closed only after {:?}",
             start.elapsed()
         );
-        assert!(sent < key.len(), "the key was never complete");
+        assert!(sent < greeting.len(), "the greeting was never complete");
         assert_eq!(hub.slots(), 0);
         server.stop();
         std::fs::remove_dir_all(&dir).unwrap();
@@ -932,8 +1082,10 @@ mod tests {
         let second = Server::start(&hub, &dir).unwrap();
         let b = streamtap_host::relay::read_bridge(&dir).unwrap();
         assert_ne!(a.key(), b.key());
-        // The old key does not open the new bridge.
-        assert_eq!(talk_raw(b.port, format!("{}\n", a.key()).as_bytes()), None);
+        // The old key does not open the new bridge: the app's proof does not hold for it.
+        let refused = proven(b.port, a.key()).expect_err("the old key");
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(hub.slots(), 0);
         drop(second);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -947,11 +1099,10 @@ mod tests {
         let server = Server::start(&hub, &dir).unwrap();
         let bridge = streamtap_host::relay::read_bridge(&dir).unwrap();
         let port = bridge.port;
-        let key_line = format!("{}\n", bridge.key());
+        let key = bridge.key().to_string();
 
         let talk = |origin: &str| {
-            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            s.write_all(key_line.as_bytes()).unwrap();
+            let mut s = proven(port, &key).expect("the handshake");
             let hello = BridgeMsg::Hello {
                 v: 1,
                 origin: origin.into(),
@@ -972,9 +1123,8 @@ mod tests {
             talk("chrome-extension://cccccccccccccccccccccccccccccccc/"),
             HostMsg::error("origin-not-allowed")
         );
-        // A line after the key that is not a hello is dropped without an answer.
-        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.write_all(key_line.as_bytes()).unwrap();
+        // A line after the handshake that is not a hello is dropped without an answer.
+        let mut s = proven(port, &key).expect("the handshake");
         s.write_all(b"{\"t\":\"ping\",\"v\":1}\n").unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut r = BufReader::new(s);

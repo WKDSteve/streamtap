@@ -1,9 +1,11 @@
 //! Secrets the app holds: the sink token and the bridge key (SRV-11).
 //!
 //! [`Token`] has no `PartialEq` (an `==` would compare in time that depends
-//! on the content; [`Token::matches`] does not) and its `Debug` prints no
-//! value, so a `{:?}` in a log or an error message cannot leak it. Serde reads
-//! and writes it as the plain string it always was (`config.json`).
+//! on the content; the bridge key is proved with an HMAC instead,
+//! `streamtap_host::auth`, and the sink compares its token itself) and its
+//! `Debug` prints no value, so a `{:?}` in a log or an error message cannot
+//! leak it. Serde reads and writes it as the plain string it always was
+//! (`config.json`).
 
 use std::fmt;
 
@@ -23,11 +25,6 @@ impl Token {
     /// approved browsers, the settings view and the log scrubber.
     pub(crate) fn expose(&self) -> &str {
         &self.0
-    }
-
-    /// Whether `other` is this token, in time that depends on the lengths only.
-    pub(crate) fn matches(&self, other: &[u8]) -> bool {
-        constant_time_eq(self.0.as_bytes(), other)
     }
 }
 
@@ -49,41 +46,11 @@ impl fmt::Debug for Token {
     }
 }
 
-/// Compares two byte strings in time that depends on their length only.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let diff = a
-        .iter()
-        .zip(b)
-        .fold(0u8, |acc, (x, y)| std::hint::black_box(acc | (x ^ y)));
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
-
-    #[test]
-    fn bytes_compare_by_content_and_length() {
-        assert!(constant_time_eq(b"abcd", b"abcd"));
-        assert!(!constant_time_eq(b"abcd", b"abce"));
-        assert!(!constant_time_eq(b"abcd", b"abc"));
-        assert!(!constant_time_eq(b"", b"a"));
-        assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn a_token_matches_its_value_only() {
-        let t = Token::from(SECRET);
-        assert!(t.matches(SECRET.as_bytes()));
-        assert!(!t.matches(SECRET.to_uppercase().as_bytes()));
-        assert!(!t.matches(&SECRET.as_bytes()[1..]));
-        assert!(!t.matches(b""));
-    }
 
     #[test]
     fn debug_hides_the_value() {
@@ -106,6 +73,6 @@ mod tests {
     fn generated_tokens_are_long_and_differ() {
         let (a, b) = (Token::generate(), Token::generate());
         assert_eq!(a.expose().len(), 64);
-        assert!(!a.matches(b.expose().as_bytes()));
+        assert_ne!(a.expose(), b.expose());
     }
 }

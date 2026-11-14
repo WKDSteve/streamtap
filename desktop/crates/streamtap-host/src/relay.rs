@@ -2,11 +2,13 @@
 //! bridge, and refuse everything that does not fit the schema.
 //!
 //! The host knows no secret of the sink. It checks the origin the browser
-//! names (only the streamtap extension), opens the bridge with the key the app
-//! wrote next to the port (so only a process that can read the app's config
-//! directory gets a connection), forwards the extension's messages to the app,
-//! and hands the app's answers back. Port and token only ever arrive from the
-//! app, after the user approved the pairing there.
+//! names (only the streamtap extension), opens the bridge on the port the app
+//! wrote and proves, with the key written next to it, that it can read the
+//! app's config directory, after the listener on that port proved the same
+//! (`auth`: the key is never sent, so whoever holds a dead app's port learns
+//! nothing and is never taken for the app). Then it forwards the extension's
+//! messages to the app and hands the app's answers back. Port and token only
+//! ever arrive from the app, after the user approved the pairing there.
 
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
@@ -14,7 +16,7 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -47,11 +49,48 @@ pub fn app_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(APP_IDENTIFIER))
 }
 
-/// Longest wait for the key to be written to the app's bridge.
-const KEY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest the handshake with the app's bridge may take in total: a listener
+/// that says nothing, or a byte now and then, is not the app.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// What `bridge.json` holds: where the app listens and the key it expects
-/// first on every connection (new at each app start).
+/// The bridge socket during the handshake: every read and write counts against
+/// one deadline, so a listener that trickles its answer cannot hold the host.
+struct Until<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Until<'_> {
+    fn left(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::ErrorKind::TimedOut.into())
+    }
+}
+
+impl Read for Until<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.left()?))?;
+        let mut stream = self.stream;
+        stream.read(buf)
+    }
+}
+
+impl Write for Until<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.left()?))?;
+        let mut stream = self.stream;
+        stream.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let mut stream = self.stream;
+        stream.flush()
+    }
+}
+
+/// What `bridge.json` holds: where the app listens and the key both ends prove
+/// to each other on every connection (new at each app start).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bridge {
@@ -61,7 +100,7 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    /// The key the app expects as the first line.
+    /// The key of the handshake (`auth`); it is proved, never sent.
     #[must_use]
     pub fn key(&self) -> &str {
         &self.key
@@ -97,23 +136,31 @@ pub fn read_bridge(dir: &Path) -> io::Result<Bridge> {
 }
 
 /// Connects to the bridge named in `dir/bridge.json` (loopback only, by
-/// construction) and sends the key as the first line.
+/// construction) and runs the handshake: the listener must prove the key of
+/// that file before this end proves it in return. The key itself is not sent,
+/// and nothing else is until both proofs are through.
 ///
 /// # Errors
-/// When the file is missing or stale, or the app does not accept.
+/// When the file is missing or stale, the app does not accept, or whoever
+/// listens on that port does not prove the key within `AUTH_TIMEOUT` in total
+/// (a foreign process on the port of an app that is gone): no connection is
+/// handed out then.
 pub fn connect_with(dir: &Path) -> io::Result<TcpStream> {
     let bridge = read_bridge(dir)?;
-    let mut stream = TcpStream::connect_timeout(
+    let stream = TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], bridge.port)),
         CONNECT_TIMEOUT,
     )?;
-    stream.set_write_timeout(Some(KEY_WRITE_TIMEOUT))?;
-    let mut line = Vec::with_capacity(bridge.key.len() + 1);
-    line.extend_from_slice(bridge.key.as_bytes());
-    line.push(b'\n');
-    stream.write_all(&line)?;
-    stream.flush()?;
+    let mut timed = Until {
+        stream: &stream,
+        deadline: Instant::now() + AUTH_TIMEOUT,
+    };
+    if let Err(e) = crate::auth::host_handshake(&mut timed, bridge.key()) {
+        let _ = stream.shutdown(Shutdown::Both);
+        return Err(e);
+    }
     stream.set_write_timeout(None)?;
+    stream.set_read_timeout(None)?;
     Ok(stream)
 }
 
@@ -492,28 +539,286 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn the_key_is_the_first_line_on_the_bridge() {
-        let dir = bridge_dir("key");
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
+    /// What a listener on the bridge port does with a connection; returns every byte it read.
+    type Listener = Box<dyn FnOnce(TcpStream) -> Vec<u8> + Send>;
+
+    /// A `bridge.json` with `KEY` that names a port `listener` answers on (one connection).
+    fn bridge_with(name: &str, listener: Listener) -> (PathBuf, std::thread::JoinHandle<Vec<u8>>) {
+        let dir = bridge_dir(name);
+        let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = socket.local_addr().unwrap().port();
         fs::write(
             dir.join(BRIDGE_FILE),
             format!(r#"{{"port":{port},"key":"{KEY}"}}"#),
         )
         .unwrap();
-        let app = std::thread::spawn(move || {
-            let (s, _) = listener.accept().unwrap();
+        let heard = std::thread::spawn(move || {
+            let (s, _) = socket.accept().unwrap();
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut lines = BufReader::new(s);
-            read_line(&mut lines, 1024).ok().flatten()
+            listener(s)
         });
-        let s = connect_with(&dir).unwrap();
-        assert_eq!(app.join().unwrap().as_deref(), Some(KEY.as_bytes()));
+        (dir, heard)
+    }
+
+    /// The app's side of the handshake with `key`, then `after`; everything read is returned.
+    fn app_with(key: &'static str, after: &'static [u8]) -> Listener {
+        Box::new(move |mut s| {
+            use crate::auth;
+            let mut heard = Vec::new();
+            let mut lines = BufReader::new(s.try_clone().unwrap());
+            let greeting = read_line(&mut lines, 1024)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            heard.extend_from_slice(&greeting);
+            heard.push(b'\n');
+            let Some(host_nonce) = auth::parse_greeting(&greeting) else {
+                return heard;
+            };
+            let app_nonce = auth::nonce().unwrap();
+            s.write_all(auth::answer_line(key, host_nonce, &app_nonce).as_bytes())
+                .unwrap();
+            if let Some(proof) = read_line(&mut lines, 1024).ok().flatten() {
+                let text = String::from_utf8_lossy(&proof).into_owned();
+                heard.extend_from_slice(&proof);
+                heard.push(b'\n');
+                if auth::proves(key, auth::Role::Host, host_nonce, &app_nonce, &text) {
+                    heard.extend_from_slice(b"HOST-PROVEN\n");
+                    let _ = s.write_all(after);
+                }
+            }
+            // Whatever else arrives (a hello must not, after a failed handshake).
+            let _ = lines.read_to_end(&mut heard);
+            heard
+        })
+    }
+
+    #[test]
+    fn host_and_app_prove_the_key_and_the_key_is_never_sent() {
+        let (dir, heard) = bridge_with("proven", app_with(KEY, b""));
+        let s = connect_with(&dir).expect("both know the key");
         drop(s);
+        let heard = String::from_utf8(heard.join().unwrap()).unwrap();
+        assert!(heard.contains("HOST-PROVEN"), "{heard}");
+        assert!(heard.starts_with(crate::auth::GREETING), "{heard}");
+        assert!(!heard.contains(KEY), "the key crossed the socket");
         // Without a usable file nothing is connected.
-        fs::write(dir.join(BRIDGE_FILE), format!(r#"{{"port":{port}}}"#)).unwrap();
+        fs::write(dir.join(BRIDGE_FILE), r#"{"port":40123}"#).unwrap();
         assert!(connect_with(&dir).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The app is gone and `bridge.json` stayed (a crash); another local process listens on the old port. Whatever
+    /// it answers, the host hands it nothing: not the key, no proof made with the key, not the extension's hello.
+    /// And nothing it says reaches the extension: the host reports that the app is not running.
+    #[test]
+    fn a_foreign_listener_on_the_old_port_gets_no_secret_and_is_not_taken_for_the_app() {
+        const FORGED: &[u8] = b"{\"t\":\"state\",\"v\":1,\"pairing\":\"approved\"}\n\
+            {\"t\":\"credentials\",\"v\":1,\"port\":40999,\"token\":\"attackers-own-sink-token\"}\n";
+        // What the stranger answers to the greeting, then it sends its forged credentials and reads on.
+        let answers: Vec<(&str, Vec<u8>)> = vec![
+            ("nothing but its own messages", Vec::new()),
+            ("the greeting echoed", b"ECHO".to_vec()),
+            (
+                "a nonce and a proof made without the key",
+                format!(
+                    "{0} {1}\n",
+                    "ab".repeat(32),
+                    crate::auth::proof(
+                        &"cd".repeat(32),
+                        crate::auth::Role::App,
+                        &"ef".repeat(32),
+                        &"ab".repeat(32)
+                    )
+                )
+                .into_bytes(),
+            ),
+            (
+                "a nonce without a proof",
+                format!("{}\n", "ab".repeat(32)).into_bytes(),
+            ),
+            ("a very long line", vec![b'a'; 8192]),
+        ];
+        for (what, answer) in answers {
+            let stranger: Listener = Box::new(move |mut s| {
+                let mut heard = Vec::new();
+                let mut lines = BufReader::new(s.try_clone().unwrap());
+                let greeting = read_line(&mut lines, 1024)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                heard.extend_from_slice(&greeting);
+                heard.push(b'\n');
+                let answer = if answer == b"ECHO" {
+                    [&greeting[..], b"\n"].concat()
+                } else {
+                    answer
+                };
+                let _ = s.write_all(&answer);
+                let _ = s.write_all(FORGED);
+                let _ = lines.read_to_end(&mut heard);
+                heard
+            });
+            let (dir, heard) = bridge_with("stranger", stranger);
+            let out = Buf::default();
+            let connect_dir = dir.clone();
+            let code = run(
+                Some(ALLOWED_ORIGIN),
+                Cursor::new(frame(HELLO)),
+                out.clone(),
+                move || connect_with(&connect_dir),
+                || panic!("no bridge was ever open"),
+            );
+            assert_eq!(code, EXIT_NO_APP, "{what}");
+            assert_eq!(
+                out.messages(),
+                [HostMsg::error("app-not-running")],
+                "{what}: nothing of the stranger's reaches the extension"
+            );
+            let heard = String::from_utf8(heard.join().unwrap()).unwrap();
+            let nonce = crate::auth::parse_greeting(heard.trim_end().as_bytes());
+            assert!(
+                nonce.is_some(),
+                "{what}: the stranger heard more than one greeting: {heard:?}"
+            );
+            assert!(!heard.contains(KEY), "{what}: the key was sent");
+            assert!(!heard.contains("hello"), "{what}: the hello was sent");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A listener that accepts and then says nothing is not the app either: the host gives up after its time
+    /// limit instead of waiting for ever, and has sent nothing but the greeting.
+    #[test]
+    fn a_silent_listener_is_given_up_after_the_time_limit() {
+        let silent: Listener = Box::new(|s| {
+            let mut heard = Vec::new();
+            let _ = BufReader::new(s).read_to_end(&mut heard);
+            heard
+        });
+        let (dir, heard) = bridge_with("silent", silent);
+        let started = Instant::now();
+        let err = connect_with(&dir).expect_err("no proof");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "{err:?}"
+        );
+        assert!(
+            started.elapsed() < AUTH_TIMEOUT * 3,
+            "{:?}",
+            started.elapsed()
+        );
+        let heard = String::from_utf8(heard.join().unwrap()).unwrap();
+        assert!(
+            crate::auth::parse_greeting(heard.trim_end().as_bytes()).is_some(),
+            "{heard:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The time limit counts for the whole handshake: a listener that sends a byte of an answer now and then (each
+    /// read is quick) is given up all the same, long before its line could be complete.
+    #[test]
+    fn a_trickling_listener_is_given_up_after_the_time_limit() {
+        let trickle: Listener = Box::new(|mut s| {
+            let mut heard = Vec::new();
+            let mut lines = BufReader::new(s.try_clone().unwrap());
+            heard.extend(
+                read_line(&mut lines, 1024)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            );
+            // 130 bytes at one every 400 ms would take 52 s.
+            for _ in 0..130 {
+                if s.write_all(b"a").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            heard
+        });
+        let (dir, heard) = bridge_with("trickle", trickle);
+        let started = Instant::now();
+        let err = connect_with(&dir).expect_err("no proof");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "{err:?}"
+        );
+        assert!(
+            started.elapsed() < AUTH_TIMEOUT * 2,
+            "given up only after {:?}",
+            started.elapsed()
+        );
+        heard.join().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The real app's answer from an earlier connection proves nothing on a new one: the host's nonce is fresh.
+    #[test]
+    fn a_replayed_answer_of_the_app_is_refused() {
+        // Record what an app that knows the key answers.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let first_app: Listener = Box::new(move |mut s| {
+            let mut lines = BufReader::new(s.try_clone().unwrap());
+            let greeting = read_line(&mut lines, 1024).unwrap().unwrap();
+            let host_nonce = crate::auth::parse_greeting(&greeting).unwrap().to_owned();
+            let answer = crate::auth::answer_line(KEY, &host_nonce, &crate::auth::nonce().unwrap());
+            s.write_all(answer.as_bytes()).unwrap();
+            tx.send(answer.into_bytes()).unwrap();
+            Vec::new()
+        });
+        let (dir, heard) = bridge_with("record", first_app);
+        drop(connect_with(&dir).expect("the real app"));
+        heard.join().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        let recorded = rx.recv().unwrap();
+
+        let replayer: Listener = Box::new(move |mut s| {
+            let mut heard = Vec::new();
+            let mut lines = BufReader::new(s.try_clone().unwrap());
+            heard.extend(
+                read_line(&mut lines, 1024)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            );
+            heard.push(b'\n');
+            let _ = s.write_all(&recorded);
+            let _ = lines.read_to_end(&mut heard);
+            heard
+        });
+        let (dir, heard) = bridge_with("replay", replayer);
+        let err = connect_with(&dir).expect_err("a stale proof");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let heard = String::from_utf8(heard.join().unwrap()).unwrap();
+        assert!(
+            crate::auth::parse_greeting(heard.trim_end().as_bytes()).is_some(),
+            "the host answered a replay: {heard:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The app wrote another key than the file the host read (a stale or forged `bridge.json`): the host does not
+    /// take it for its app, and the app is not shown the host's proof.
+    #[test]
+    fn an_app_with_another_key_is_not_the_app() {
+        const OTHER: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+        let (dir, heard) = bridge_with("otherkey", app_with(OTHER, b""));
+        let err = connect_with(&dir).expect_err("another key");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let heard = String::from_utf8(heard.join().unwrap()).unwrap();
+        assert!(!heard.contains("HOST-PROVEN"));
+        assert!(
+            crate::auth::parse_greeting(heard.trim_end().as_bytes()).is_some(),
+            "{heard:?}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

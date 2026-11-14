@@ -698,9 +698,10 @@ Security:
   start and at the restart after a revoke; nothing token-related is on the
   command line. A sink that cannot take it is ended and the start fails.
 - In the app the token (and the browser bridge key) is a `Token` type without
-  `PartialEq`, whose `Debug` prints `Token(hidden)`; it is compared in constant
-  time only. `config.json` keeps the token as a plain string under `token`, as
-  before.
+  `PartialEq`, whose `Debug` prints `Token(hidden)`. The app compares neither:
+  the sink checks its token itself (in constant time), and the bridge key is
+  proved with an HMAC (below). `config.json` keeps the token as a plain string
+  under `token`, as before.
 - `config.json` gets no ACL of its own: the rights of the user profile on
   `%APPDATA%` (you, SYSTEM, Administrators) are enough. At every start the app
   reads the file's DACL and checks that none of the broad groups *Everyone*
@@ -799,7 +800,8 @@ the extension. Three parts:
   not the app with a flag, on purpose: the browser starts it on every
   `connectNative`, so it must start in milliseconds and without a webview; a
   Windows GUI-subsystem exe (the app) has no reliable stdio for the pipes; and
-  it has no dependency but `serde`. It speaks the browser's framing on stdin and
+  it depends on `serde` and, for the bridge's handshake, on `hmac`, `sha2` and
+  `getrandom` only. It speaks the browser's framing on stdin and
   stdout (4 byte little-endian length + JSON) and a line protocol over a
   loopback socket to the app. The host knows **no secret of the sink** (only the
   bridge key, see below): it checks the origin
@@ -813,13 +815,33 @@ the extension. Three parts:
   `127.0.0.1` port and writes `{"port":n,"key":"<64 hex>"}` into `bridge.json` in
   its config dir (`%APPDATA%\io.github.wkdsteve.streamtap`; temporary file and
   rename; removed on exit). The key is new at every app start (the same
-  generator as the sink token). A host finds the app there and sends the key as
-  the first line; the app reads at most 128 bytes for it within 2 s in total (a
-  client that trickles in a byte now and then is cut off as well), compares in
-  constant time and closes a connection without the right key before it takes
-  one of the 16 connection slots or can raise a pairing prompt. So only a process
-  that can read the app's config directory can talk to the bridge at all.
-  Without the file or the app, the extension is told `app-not-running`.
+  generator as the sink token). A host finds the app there, and **both ends
+  prove the key to each other before anything else is said; the key itself
+  never crosses the socket** (`streamtap-host/src/auth.rs`):
+
+  ```
+  host -> app   streamtap-bridge/2 <host nonce>
+  app  -> host  <app nonce> <HMAC-SHA256(key, "streamtap-bridge/2\napp\n<host nonce>\n<app nonce>")>
+  host -> app   <HMAC-SHA256(key, "streamtap-bridge/2\nhost\n<host nonce>\n<app nonce>")>
+  ```
+
+  Nonces are 32 bytes from the system's random source, new for every
+  connection; nonces and proofs are 64 lower-case hex digits, one line each. The
+  role is part of what is signed, so neither proof can be sent back as the
+  other, and each proof covers the nonce of the end that checks it, so an answer
+  recorded earlier proves nothing. Proofs are compared in constant time. The
+  host checks the app's proof **before** it sends its own; both ends read at
+  most 131 bytes per line and allow 2 s for the whole handshake (a peer that
+  trickles in a byte now and then is cut off as well). The app
+  closes a connection without the host's proof before it takes one of the 16
+  connection slots or can raise a pairing prompt. So only a process that can
+  read the app's config directory can talk to the bridge at all, in either
+  direction: when the app is gone and `bridge.json` stayed behind (a crash),
+  another process that listens on the old port is sent one random nonce and
+  nothing else, cannot answer it, and nothing it says reaches the extension.
+  Without the file, the app or its proof, the extension is told
+  `app-not-running`. Host and app ship together; an older host that still sends
+  the key as its first line is turned away (update both).
 - **Registration** (`registration.rs`): the *Connect browser* panel registers or
   removes the host for Chrome, Edge or Brave. That writes a manifest
   (`native-messaging/<browser>.json` in the config dir; `name`, `path` of
@@ -886,24 +908,33 @@ characters removed, hosts only host-name characters, icons only small
 declares more than the limit is refused before anything is read. The token is
 never printed (the `Token` type's `Debug` hides it; the tests check it).
 
-Tests: schema and framing (unit), the host against a fake app on a real socket
-(the key comes first), the bridge key (silent, wrong, missing and oversized keys get
-no slot and no prompt; a key trickled in byte by byte is cut off after 2 s; a new
-key per start), the hub (pending gets no credentials,
+Tests: schema and framing (unit), the handshake (a proof holds for its key, role
+and nonces only; a listener without the key gets one nonce and no line more), the
+host against a fake app on a real socket and against a stranger on the old port
+of an app that is gone (whatever it answers, also the app's answer from an earlier
+connection: no key, no proof and no hello reach it, and its forged credentials do
+not reach the extension), the bridge (silent connections, the key itself as the old
+protocol sent it, a wrong proof, the app's own proof sent back and a proof of
+another connection get no slot and no prompt; a handshake trickled in byte by byte
+is cut off after 2 s; a new key per start), the hub (pending gets no credentials,
 deny, remember, revoke, tap only for reported tabs, foreign origin, bounds), revoke
 with token rotation (the revoked browser gets nothing, the others the new token, the
 config is saved, a running real sink is restarted), the registry logic against a
 fake (a failed register keeps a working registration; verbatim UNC paths), the
 approvals file, and an end-to-end test that starts the real `streamtap-host.exe`
-against the real bridge (also with a wrong key in `bridge.json`).
+against the real bridge (also with a wrong key in `bridge.json`: that host is told
+`app-not-running`, the app shows no prompt).
 
 Limits: a browser or profile is identified by the random id the extension
 generated, which the extension itself claims (any process of your user that can
 read the app's config directory could claim another; you still approve every new
 one, and such a process could read `config.json` anyway). A process that cannot
-read `bridge.json` gets no slot and no prompt; one that only opens connections
-without sending anything, or only a byte now and then, holds a thread for 2 s each,
-not a slot. The hand run in a real
+read `bridge.json` gets no slot and no prompt, and is not taken for the app by a
+host; one that only opens connections without sending anything, or only a byte now
+and then, holds a thread for 2 s each, not a slot. The handshake does not tell the
+two ends which program the other is: a process of your user that reads
+`bridge.json` can still play either side (it could read `config.json` as well).
+The hand run in a real
 Chrome is still to do (see the task); Firefox is out of scope.
 
 Limits: a hard kill of the app leaves a stale `out.part.mp4` in a capture

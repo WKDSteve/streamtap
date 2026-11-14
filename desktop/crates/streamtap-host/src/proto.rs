@@ -30,8 +30,8 @@ pub const APP_IDENTIFIER: &str = "io.github.wkdsteve.streamtap";
 pub const BRIDGE_FILE: &str = "bridge.json";
 /// Shortest bridge key accepted (hex digits).
 pub const MIN_BRIDGE_KEY: usize = 32;
-/// Longest bridge key accepted (hex digits); also the bound of the key line
-/// the app reads before anything else.
+/// Longest bridge key accepted (hex digits). The key is proved to the app,
+/// never sent (`auth`).
 pub const MAX_BRIDGE_KEY: usize = 128;
 /// The protocol version in every message.
 pub const PROTOCOL_VERSION: u8 = 1;

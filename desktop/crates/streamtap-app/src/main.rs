@@ -885,7 +885,7 @@ mod tests {
             (Language::De, Theme::Dark)
         );
         assert!(
-            g.settings.token.matches(before.token.expose().as_bytes()),
+            g.settings.token.expose() == before.token.expose(),
             "only the preferences change"
         );
         let stored = config::load_or_create(&dir.join("config.json"), &dir).unwrap();
@@ -1380,8 +1380,10 @@ mod tests {
     }
 
     /// A real host that read another key (a stale or forged `bridge.json`)
-    /// is turned away by the app before it gets a slot or a prompt. The file
-    /// is put back afterwards.
+    /// gets no slot and no prompt, and does not take this app for its own:
+    /// the app's proof does not hold for the key the host read, so the host
+    /// tells the extension that the app is not running. The file is put back
+    /// afterwards.
     fn a_wrong_key_is_turned_away(
         dir: &Path,
         hub: &Hub,
@@ -1404,15 +1406,17 @@ mod tests {
         });
         stdin.write_all(&native_frame(&hello)).unwrap();
         stdin.flush().unwrap();
-        // The app closes the bridge at once; the host leaves (it says
-        // `app-closed` unless its write of the hello failed first).
+        // The handshake fails on the host's side: it leaves, and says that
+        // its app is not running.
         wait_for("the turned-away host to exit", || {
             forged.try_wait().unwrap()
         });
         let said: Vec<serde_json::Value> = rx.try_iter().collect();
         assert!(
-            said.iter()
-                .all(|m| m["t"] == "error" && m["code"] == "app-closed"),
+            said.len() == 1
+                && said
+                    .iter()
+                    .all(|m| m["t"] == "error" && m["code"] == "app-not-running"),
             "{said:?}"
         );
         assert!(
