@@ -214,6 +214,10 @@ MIT, see [LICENSE](LICENSE).
 
 ![streamtap: what it uses and what uses it](assets/graphs/streamtap.png)
 
+**Uses**
+
+- [appkit](https://github.com/WKDSteve/appkit): The sink of streamtap pairs phones over the tailnet with the one-time code of `appkit-core` and keeps them in the device list of `appkit-hub`. ([picture](assets/graphs/pair/streamtap--appkit.png))
+
 **Used by**
 
 - [hub-desktop](https://github.com/WKDSteve/hub-desktop): hub-desktop shows streamtap as a tile; it is a program with a window of its own. ([picture](assets/graphs/pair/hub-desktop--streamtap.png))
