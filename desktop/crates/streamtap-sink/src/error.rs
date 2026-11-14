@@ -106,6 +106,13 @@ impl fmt::Display for SinkError {
     }
 }
 
+/// A message that is not in the wire format is a protocol error of its connection.
+impl From<streamtap_core::wire::WireError> for SinkError {
+    fn from(e: streamtap_core::wire::WireError) -> Self {
+        SinkError::Protocol(e.0)
+    }
+}
+
 impl std::error::Error for SinkError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

@@ -20,13 +20,6 @@ pub(crate) const MAX_PARTS_PER_TRACK: u32 = 64;
 /// Budget charged for each part file (its directory entry and cluster).
 pub(crate) const PART_FILE_COST: u64 = 4096;
 
-/// Dedupe keys: (tfdt, timestampOffset in ms, duration, track ID), or in
-/// sequence mode (payload hash, `i64::MIN`, length, 0); each with the offset
-/// of its row in the part file (a sequence-mode duplicate points there,
-/// `Admit::Mark`). The track keeps the appends of two tracks of one
-/// `SourceBuffer` that share a start and duration apart (0: no track ID).
-pub(crate) type SeenSet = HashMap<(u64, i64, u64, u32), u64>;
-
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent per-track flags, not states of one machine"
@@ -36,7 +29,9 @@ pub(crate) struct TrackState {
     pub(crate) file: File,
     pub(crate) offset: u64,
     pub(crate) init_hash: Option<u64>,
-    pub(crate) seen: SeenSet,
+    /// The media written into the current part (`saved` holds the other parts'), and whether the untimed
+    /// chunks arriving now continue a duplicate.
+    pub(crate) dedupe: Dedupe,
     /// Offset and dedupe set of the parts that are not current, so a switch
     /// back to an earlier init continues its part.
     pub(crate) saved: HashMap<u32, (u64, SeenSet)>,
@@ -58,9 +53,6 @@ pub(crate) struct TrackState {
     /// Container of the last init: continuation chunks have
     /// no kind of their own.
     pub(crate) init_kind: Container,
-    /// The last timed chunk was a duplicate: the untimed chunks that follow
-    /// it (its continuation) are duplicates too.
-    pub(crate) skip_tail: bool,
     /// Boxes in front of the samples appended without them.
     pub(crate) segment_head: Option<SegmentHead>,
     /// The current init segment is encrypted (EME/DRM): nothing is written
@@ -186,21 +178,6 @@ pub(crate) fn event_log_line(dir: &Path, name: &str, sb: Option<u32>) -> String 
     format!("{}: event {} sb={sb:?}", dir.display(), printable(name, 32))
 }
 
-/// `timestampOffset` in whole milliseconds; non-finite values count as 0.
-pub(crate) fn tso_millis(tso: Option<f64>) -> i64 {
-    let v = tso.filter(|v| v.is_finite()).unwrap_or(0.0) * 1000.0;
-    // Clamped to about ±31 years, so the cast below cannot truncate.
-    #[allow(clippy::cast_possible_truncation)]
-    let ms = v.clamp(-1e12, 1e12).round() as i64;
-    ms
-}
-
-pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
 pub(crate) fn sanitize(s: &str, max: usize) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -231,7 +208,7 @@ impl TrackState {
             file,
             offset: 0,
             init_hash: None,
-            seen: HashMap::new(),
+            dedupe: Dedupe::default(),
             saved: HashMap::new(),
             hash_part: HashMap::new(),
             parts: 1,
@@ -241,7 +218,6 @@ impl TrackState {
             pending_done: false,
             pending_after_refusal: false,
             init_kind: Container::Other,
-            skip_tail: false,
             segment_head: None,
             refused: false,
             parts_full: false,
@@ -281,13 +257,13 @@ impl TrackState {
 
     /// Makes `part` the current part file, keeping the state of the old one.
     pub(crate) fn switch_part(&mut self, dir: &Path, sb: u32, part: u32) -> io::Result<()> {
-        let seen = std::mem::take(&mut self.seen);
+        let seen = std::mem::take(&mut self.dedupe.seen);
         self.saved.insert(self.part, (self.offset, seen));
         let (offset, seen) = self.saved.remove(&part).unwrap_or_default();
         self.file = Session::open_part(dir, sb, part)?;
         self.part = part;
         self.offset = offset;
-        self.seen = seen;
+        self.dedupe.seen = seen;
         Ok(())
     }
 
@@ -295,7 +271,7 @@ impl TrackState {
     /// or a switch back to an earlier part writes nothing; a new init writes
     /// into a new part (or the first, still empty one).
     pub(crate) fn decide_init(&mut self, hash: u64, dir: &Path, sb: u32) -> io::Result<bool> {
-        self.skip_tail = false;
+        self.dedupe.skip_tail = false;
         if self.init_hash == Some(hash) {
             // Same init again (player re-appends after a seek).
             self.dupes += 1;
@@ -334,72 +310,30 @@ impl TrackState {
         Ok(true)
     }
 
-    /// Decides about a media segment (timed) or an untimed continuation.
+    /// Decides about a media segment (timed) or an untimed continuation
+    /// (`Dedupe::admit`), and counts what is left out.
     pub(crate) fn admit_media(
         &mut self,
         h: &SegmentHeader,
         payload: &[u8],
         seen_room: bool,
     ) -> Admit {
-        let Some(t) = h.tfdt else {
-            // A segment cut before its tfdt: the sequence number of the moof makes the head
-            // the same bytes only when it is the same segment, fetched again.
-            if starts_a_numbered_moof(payload) {
-                let key = (fnv1a(payload), i64::MIN + 1, payload.len() as u64, 0);
-                self.skip_tail = self.seen.contains_key(&key);
-                if self.skip_tail {
-                    self.dupes += 1;
-                    return Admit::Skip;
-                }
-                if !seen_room {
-                    self.skipped += 1;
-                    return Admit::Skip;
-                }
-                self.seen.insert(key, self.offset);
-                return Admit::Write { as_init: false };
-            }
-            if self.skip_tail {
+        match self.dedupe.admit(h, payload, self.offset, seen_room) {
+            Admission::Write => Admit::Write { as_init: false },
+            Admission::Mark { offset } => {
                 self.dupes += 1;
-                return Admit::Skip;
-            }
-            return Admit::Write { as_init: false };
-        };
-        self.skip_tail = false;
-        // In sequence mode the browser places media one after the other and
-        // rewrites timestampOffset itself; a later period may reuse tfdt
-        // values. A re-append after a seek has the same bytes, a new period
-        // other bytes: the key there is the payload.
-        let key = if h.seq_mode {
-            (fnv1a(payload), i64::MIN, payload.len() as u64, 0)
-        } else {
-            (
-                t,
-                tso_millis(h.tso),
-                h.dur.unwrap_or(0),
-                h.track.unwrap_or(0),
-            )
-        };
-        if let Some(&offset) = self.seen.get(&key) {
-            self.dupes += 1;
-            self.skip_tail = true;
-            return if h.seq_mode {
                 Admit::Mark { offset }
-            } else {
+            }
+            Admission::Duplicate => {
+                self.dupes += 1;
                 Admit::Skip
-            };
+            }
+            Admission::NoRoom => {
+                self.skipped += 1;
+                Admit::Skip
+            }
         }
-        if !seen_room {
-            self.skipped += 1;
-            return Admit::Skip;
-        }
-        self.seen.insert(key, self.offset);
-        Admit::Write { as_init: false }
     }
-}
-
-/// The chunk starts with a `moof` whose `mfhd` (and so its sequence number) arrived in full.
-pub(crate) fn starts_a_numbered_moof(payload: &[u8]) -> bool {
-    payload.len() >= 24 && &payload[4..8] == b"moof" && &payload[12..16] == b"mfhd"
 }
 
 /// Written atomically: a reader never sees half a file.
@@ -912,7 +846,7 @@ impl Session {
                     track.skipped += 1;
                 } else {
                     // Its further untimed chunks are dropped too.
-                    track.skip_tail = true;
+                    track.dedupe.skip_tail = true;
                     track.dupes += 1;
                 }
                 return Ok(());
@@ -941,7 +875,7 @@ impl Session {
             Admit::Skip => Ok(()),
             Admit::Mark { offset } => self.write_mark(h.sb, h, offset, payload.len()),
             Admit::Write { as_init } => {
-                if h.tfdt.is_some() || starts_a_numbered_moof(payload) {
+                if Dedupe::remembers(h, payload) {
                     self.seen_total += 1;
                 }
                 self.write_row(h.sb, h, payload, as_init)

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/streamtap-sink", "crates/streamtap-app", "crates/streamtap-host"]
+members = [
+    "crates/streamtap-core",
+    "crates/streamtap-testkit",
+    "crates/streamtap-sink",
+    "crates/streamtap-app",
+    "crates/streamtap-host",
+]
 
 [workspace.package]
 edition = "2021"

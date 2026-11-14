@@ -30,7 +30,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod error;
-mod init;
 mod mux;
 mod proc;
 mod replay;
@@ -39,17 +38,15 @@ mod session;
 mod tailnet;
 #[cfg(test)]
 mod tests;
-mod wire;
 
 use error::SinkError;
-use init::*;
 use mux::*;
 use proc::{Spec, Tool, Tools};
 use replay::*;
 use serve::*;
 use session::*;
+use streamtap_core::{dedupe::*, fmp4::*, parts::*, timeline::*, wire::*};
 use tailnet::*;
-use wire::*;
 
 /// Deadline of `ffmpeg -version`.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -59,7 +56,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 16 GiB capture takes minutes, not hours.
 const DEFAULT_MUX_TIMEOUT_SECS: u64 = 3600;
 
-const MAX_HEADER: usize = 64 * 1024;
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 /// `SourceBuffers` per session; a page can forge records with arbitrary ids,
 /// and each track holds an open file.

@@ -1,0 +1,14 @@
+[package]
+name = "streamtap-testkit"
+version = "0.1.0"
+description = "Fixture builders for the tests of streamtap: fMP4 boxes, segment headers and index rows made in memory"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+streamtap-core = { path = "../streamtap-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "streamtap-core"
+version = "0.1.0"
+description = "The logic of streamtap without I/O: wire format, fMP4/WebM structure, dedupe, part selection, timeline order and gaps"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Fixture builders. The testkit depends on this crate, so the tests live in tests/ (integration tests see the same
+# build of the types as the testkit; unit tests inside the crate would see a second one).
+streamtap-testkit = { path = "../streamtap-testkit" }
+
+[lints]
+workspace = true

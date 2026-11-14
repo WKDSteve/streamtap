@@ -9,6 +9,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# The logic without I/O: wire format, fMP4/WebM structure, dedupe, part selection, timeline order.
+streamtap-core = { path = "../streamtap-core" }
 # Blocking WebSocket server; small enough for a spike, no async runtime.
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +25,8 @@ appkit-hub = { git = "https://github.com/WKDSteve/appkit", tag = "v0.49.0" }
 qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
+# Fixture builders shared with streamtap-core's tests.
+streamtap-testkit = { path = "../streamtap-testkit" }
 # A device's key in the tests (tests/tailnet.rs): signs the sink's challenge as WebCrypto would. The version appkit brings.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 

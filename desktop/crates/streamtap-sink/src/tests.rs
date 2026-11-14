@@ -1,4 +1,5 @@
 use super::*;
+use streamtap_testkit::*;
 
 const GIB: u64 = 1 << 30;
 
@@ -66,59 +67,6 @@ fn test_dirs_are_removed_when_dropped() {
     assert!(!root.exists(), "{} left behind", root.display());
 }
 
-fn mp4_box(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
-    let mut v = u32::try_from(8 + body.len())
-        .expect("small")
-        .to_be_bytes()
-        .to_vec();
-    v.extend_from_slice(&kind);
-    v.extend_from_slice(body);
-    v
-}
-
-/// A minimal media segment: moof > traf > tfdt (version 0) with `tfdt`.
-fn moof(tfdt: u32) -> Vec<u8> {
-    let mut tfdt_body = vec![0, 0, 0, 0];
-    tfdt_body.extend_from_slice(&tfdt.to_be_bytes());
-    mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"tfdt", &tfdt_body)))
-}
-
-fn tfdt_of(seg: &[u8]) -> u32 {
-    u32::from_be_bytes([seg[28], seg[29], seg[30], seg[31]])
-}
-
-/// An init segment with `traks` empty trak boxes.
-fn init_with_traks(traks: usize) -> Vec<u8> {
-    let mut moov = Vec::new();
-    for _ in 0..traks {
-        moov.extend(mp4_box(*b"trak", b""));
-    }
-    let mut v = mp4_box(*b"ftyp", b"iso6");
-    v.extend(mp4_box(*b"moov", &moov));
-    v
-}
-
-fn row(offset: u64, len: u64, is_init: bool, tfdt: Option<u64>, tso: Option<f64>) -> IndexRow {
-    IndexRow {
-        sb: 1,
-        ms: Some(1),
-        part: 0,
-        offset,
-        len,
-        is_init,
-        tfdt,
-        track: None,
-        timescale: Some(1000),
-        dur: None,
-        tso,
-        seq_mode: false,
-        tso_set: false,
-        mark: false,
-        mime: "video/mp4".into(),
-        kind: "mp4".into(),
-    }
-}
-
 /// (bytes, `is_init`, tfdt, tso) of one test segment.
 type TestSeg<'a> = (&'a [u8], bool, Option<u64>, Option<f64>);
 
@@ -147,99 +95,6 @@ fn order(dir: &Path, rows: &[IndexRow]) -> (Vec<u8>, PathBuf, Option<f64>) {
     let (moves, _) = seq_layout(&refs, &leads);
     let (path, start, _, _) = ordered_part(dir, 1, 0, &refs, Some(&moves), 0).expect("ordered");
     (fs::read(&path).expect("read"), path, start)
-}
-
-#[test]
-fn tso_millis_handles_odd_values() {
-    assert_eq!(tso_millis(None), 0);
-    assert_eq!(tso_millis(Some(1.5)), 1500);
-    assert_eq!(tso_millis(Some(-2.0)), -2000);
-    assert_eq!(tso_millis(Some(f64::NAN)), 0);
-    assert_eq!(tso_millis(Some(f64::INFINITY)), 0);
-    assert_eq!(tso_millis(Some(1e300)), 1_000_000_000_000);
-}
-
-#[test]
-fn shift_ticks_is_exact_not_millisecond_rounded() {
-    // tso = -tfdt/ts for tfdt 1001 at 30000. Rounding tso to whole
-    // milliseconds first (-33 ms) would give -990 ticks instead of -1001.
-    let tso = -1001.0 / 30000.0;
-    assert_eq!(shift_ticks(Some(tso), Some(30000)), -1001);
-    assert_eq!(shift_ticks(None, Some(1000)), 0);
-    assert_eq!(shift_ticks(Some(1.0), None), 0);
-}
-
-#[test]
-fn encrypted_payloads_are_recognised() {
-    assert!(looks_encrypted(b"\0\0\0\x10moov....encv...."));
-    assert!(!looks_encrypted(b"\0\0\0\x10moov....avc1...."));
-    let mut h = seg(1, false, Some(0), None);
-    let senc = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"senc", b"")));
-    assert!(
-        payload_encrypted(&h, &senc, false, Container::Mp4),
-        "senc in a moof"
-    );
-    assert!(
-        !payload_encrypted(&h, &moof(0), false, Container::Mp4),
-        "clear moof"
-    );
-    for aux in [*b"saiz", *b"saio"] {
-        let cenc = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(aux, b"")));
-        assert!(
-            payload_encrypted(&h, &cenc, false, Container::Mp4),
-            "auxiliary info without senc"
-        );
-    }
-    let mut moov = mp4_box(*b"ftyp", b"iso6");
-    moov.extend(mp4_box(*b"moov", b"..encv.."));
-    assert!(
-        payload_encrypted(&h, &moov, false, Container::Mp4),
-        "moov in a chunk not flagged as init"
-    );
-    h.kind = "webm".into();
-    h.is_init = true;
-    assert!(payload_encrypted(
-        &h,
-        &[0x16, 0x54, 0x6d, 0x80, 0x50, 0x35, 0x47, 0xe2],
-        false,
-        Container::Webm
-    ));
-    assert!(!payload_encrypted(
-        &h,
-        &[0x16, 0x54, 0xae, 0x6b],
-        false,
-        Container::Mp4
-    ));
-}
-
-#[test]
-fn shift_tfdt_moves_and_refuses_underflow() {
-    let mut seg = moof(1000);
-    assert!(shift_tfdt(&mut seg, 500));
-    assert_eq!(tfdt_of(&seg), 1500);
-    let before = seg.clone();
-    assert!(!shift_tfdt(&mut seg, -2000), "negative result is refused");
-    assert_eq!(seg, before, "a refused shift leaves the segment unchanged");
-    let mut no_moof = b"\0\0\0\x08mdat".to_vec();
-    assert!(!shift_tfdt(&mut no_moof, 1), "nothing to shift");
-}
-
-#[test]
-fn box_walker_survives_garbage_sizes() {
-    for buf in [
-        b"\0\0\0\x03moofxxxx".to_vec(),
-        b"\0\0\x10\0moofxxxx".to_vec(),
-        b"\0\0\0\x01moof\0\0".to_vec(),
-    ] {
-        assert_eq!(boxes_in(&buf, 0, buf.len()), Vec::new());
-    }
-}
-
-#[test]
-fn trak_count_reads_the_init() {
-    assert_eq!(trak_count(&init_with_traks(1)), 1);
-    assert_eq!(trak_count(&init_with_traks(2)), 2);
-    assert_eq!(trak_count(b"INIT"), 0);
 }
 
 #[test]
@@ -531,105 +386,6 @@ fn coverage_is_per_track() {
     assert_eq!(order(&dir, &rows).0.len(), 4 + 64, "two tracks: both kept");
 }
 
-#[test]
-fn by_track_keeps_order_inside_and_first_seen_between_groups() {
-    let mk = |track: Option<u32>, tfdt: u64| IndexRow {
-        track,
-        ..row(0, 1, false, Some(tfdt), None)
-    };
-    let rows = [mk(Some(2), 0), mk(Some(1), 5), mk(Some(2), 9), mk(None, 1)];
-    let groups = by_track(rows.iter().collect());
-    let shape: Vec<(Option<u32>, Vec<u64>)> = groups
-        .iter()
-        .map(|(t, g)| (*t, g.iter().filter_map(|r| r.tfdt).collect()))
-        .collect();
-    assert_eq!(
-        shape,
-        vec![(Some(2), vec![0, 9]), (Some(1), vec![5]), (None, vec![1])]
-    );
-}
-
-/// A row of a part for the selection tests: `len` bytes claiming `dur_ms`.
-fn claim(part: u32, len: u64, dur_ms: Option<u64>) -> IndexRow {
-    IndexRow {
-        part,
-        dur: dur_ms,
-        ..row(0, len, false, Some(0), None)
-    }
-}
-
-fn init_row(part: u32) -> IndexRow {
-    IndexRow {
-        part,
-        ..row(0, 10, true, None, None)
-    }
-}
-
-fn ranked_parts(rows: &[IndexRow]) -> Vec<u32> {
-    let refs: Vec<&IndexRow> = rows.iter().collect();
-    pick_parts(&refs)[0].ranked.iter().map(|r| r.0).collect()
-}
-
-/// Bytes alone do not decide: a padded part (many bytes, little time) and a
-/// part whose claimed time the bytes cannot carry rank after a real one.
-#[test]
-fn the_part_selection_checks_bytes_against_time() {
-    let rows = [
-        init_row(0),
-        claim(0, 500_000, Some(10_000)), // 50 kB/s: plausible
-        init_row(1),
-        claim(1, 900_000_000, Some(1_000)), // padded: 900 MB/s
-        init_row(2),
-        claim(2, 1_000, Some(3_600_000)), // an hour in 1 kB: inflated time
-    ];
-    let ranked = ranked_parts(&rows);
-    assert_eq!(ranked[0], 0, "the real part first");
-    assert_eq!(ranked.len(), 3, "the others stay available as fallbacks");
-}
-
-/// Among plausible parts the one with more media time wins, even with
-/// fewer bytes (a low quality that ran longer).
-#[test]
-fn the_part_selection_prefers_more_media_time() {
-    let rows = [
-        init_row(0),
-        claim(0, 4_000_000, Some(20_000)),
-        init_row(1),
-        claim(1, 1_000_000, Some(60_000)),
-    ];
-    assert_eq!(ranked_parts(&rows), vec![1, 0]);
-}
-
-/// Without durations nothing can be checked: the most bytes, as before.
-#[test]
-fn the_part_selection_falls_back_to_bytes() {
-    let rows = [
-        init_row(0),
-        claim(0, 1_000, None),
-        init_row(1),
-        claim(1, 9_000, None),
-    ];
-    assert_eq!(ranked_parts(&rows), vec![1, 0]);
-}
-
-/// The tracks of a `SourceBuffer` run in parallel: their times are not
-/// added up.
-#[test]
-fn the_part_selection_does_not_add_up_tracks() {
-    let track = |part: u32, t: u32, len: u64, ms: u64| IndexRow {
-        track: Some(t),
-        ..claim(part, len, Some(ms))
-    };
-    let rows = [
-        init_row(0),
-        track(0, 1, 500_000, 10_000),
-        track(0, 2, 500_000, 10_000),
-        init_row(1),
-        track(1, 1, 700_000, 12_000),
-    ];
-    assert_eq!(ranked_parts(&rows), vec![1, 0], "12 s beats 10 s, not 20 s");
-}
-
 /// Appends of two tracks that share a start and duration are not each
 /// other's re-fetch; the same track again is.
 #[test]
@@ -650,103 +406,6 @@ fn dedupe_keeps_the_tracks_of_one_sourcebuffer_apart() {
         .filter(|r| r["is_init"] == false)
         .count();
     assert_eq!(media_rows, 2, "one per track, the re-fetch dropped");
-}
-
-#[test]
-fn gap_report_survives_huge_steps() {
-    let untimed = |starts: &[i128]| -> Vec<(i128, Option<u64>)> {
-        starts.iter().map(|s| (*s, None)).collect()
-    };
-    report_gaps(1, 0, &untimed(&[0, 10, i128::from(u64::MAX)]), 1000);
-    report_gaps(
-        1,
-        0,
-        &untimed(&[0, i128::from(u64::MAX), i128::from(u64::MAX) * 2]),
-        1,
-    );
-    let huge = [
-        (0, Some(u64::MAX)),
-        (i128::from(u64::MAX) * 3, Some(u64::MAX)),
-    ];
-    report_gaps(1, 0, &huge, 1);
-}
-
-/// (start, 6 s) segments at 1000 ticks/s with these start steps (s).
-fn timed_steps(steps: &[i128]) -> Vec<(i128, Option<u64>)> {
-    let mut start = 0;
-    let mut segs = vec![(0, Some(6000))];
-    for s in steps {
-        start += s * 1000;
-        segs.push((start, Some(6000)));
-    }
-    segs
-}
-
-/// One played segment, a seek to 10:00, two more: the gap is the seek,
-/// not the typical step (the upper median was the gap itself).
-#[test]
-fn a_gap_is_found_from_durations() {
-    assert_eq!(find_gaps(&timed_steps(&[600, 6]), 1000), (1, 594_000, true));
-    assert_eq!(
-        find_gaps(&timed_steps(&[6, 6, 300, 300]), 1000),
-        (2, 588_000, true),
-        "sampling by seeking: gaps make up half the steps"
-    );
-    assert_eq!(find_gaps(&timed_steps(&[60]), 1000), (1, 54_000, true));
-    assert_eq!(
-        find_gaps(&timed_steps(&[6, 6, 6]), 1000),
-        (0, 0, true),
-        "back to back"
-    );
-    // A longer earlier segment covers the next start: no false gap.
-    let segs = [(0, Some(20_000)), (6000, Some(6000)), (20_000, Some(6000))];
-    assert_eq!(find_gaps(&segs, 1000), (0, 0, true));
-    // Rounding of a few ticks is no gap.
-    let segs = [(0, Some(6000)), (6010, Some(6000))];
-    assert_eq!(find_gaps(&segs, 1000), (0, 0, true));
-}
-
-/// Without durations the lower median is the typical step.
-#[test]
-fn a_gap_without_durations_uses_the_lower_median() {
-    let segs: Vec<(i128, Option<u64>)> = [0, 6000, 606_000].iter().map(|s| (*s, None)).collect();
-    assert_eq!(find_gaps(&segs, 1000), (1, 594_000, false));
-    let segs: Vec<(i128, Option<u64>)> = [0, 6000].iter().map(|s| (*s, None)).collect();
-    assert_eq!(
-        find_gaps(&segs, 1000),
-        (0, 0, false),
-        "one step: no typical"
-    );
-}
-
-#[test]
-fn container_is_parsed_once_from_the_wire_kind() {
-    assert_eq!(Container::from_kind("mp4"), Container::Mp4);
-    assert_eq!(Container::from_kind("webm"), Container::Webm);
-    // Anything else is `Other`: MP4 code paths, but no input format.
-    for other in ["", "MP4", "ogg", "mp4 "] {
-        assert_eq!(Container::from_kind(other), Container::Other, "{other:?}");
-    }
-    assert_eq!(Container::default(), Container::Other);
-    assert!(Container::Webm.is_webm() && !Container::Mp4.is_webm() && !Container::Other.is_webm());
-
-    let mp4_head = *b"\0\0\0\x18ftyp";
-    let webm_head = [0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0];
-    assert_eq!(Container::Mp4.head_format(mp4_head), Some("mp4"));
-    assert_eq!(Container::Webm.head_format(webm_head), Some("matroska"));
-    assert_eq!(
-        Container::Mp4.head_format(webm_head),
-        None,
-        "kind and magic must agree"
-    );
-    assert_eq!(Container::Webm.head_format(mp4_head), None);
-    assert_eq!(Container::Other.head_format(mp4_head), None);
-
-    let mut h = seg(0, true, None, None);
-    h.kind = "webm".into();
-    assert_eq!(h.container(), Container::Webm);
-    h.kind = "mp4".into();
-    assert_eq!(h.container(), Container::Mp4);
 }
 
 #[test]
@@ -803,54 +462,6 @@ fn inputs_are_aligned_by_their_start() {
     assert!(args[0].windows(2).any(|w| w[0] == "-f" && w[1] == "mp4"));
 }
 
-#[test]
-fn split_message_rejects_malformed_frames() {
-    assert!(split_message(b"\x01\0").is_err());
-    assert!(
-        split_message(b"\xff\xff\0\0{}").is_err(),
-        "header longer than the message"
-    );
-    let mut bad = 5u32.to_le_bytes().to_vec();
-    bad.extend_from_slice(b"{bad}");
-    assert!(split_message(&bad).is_err());
-    let frame = |json: &[u8]| {
-        let mut f = u32::try_from(json.len())
-            .expect("small")
-            .to_le_bytes()
-            .to_vec();
-        f.extend_from_slice(json);
-        f
-    };
-    assert!(
-        split_message(&frame(br#"{"type":"segment","sb":"x","seq":1}"#)).is_err(),
-        "a string sb id is rejected"
-    );
-    let big = frame(br#"{"type":"segment","sb":1,"seq":1,"tfdt":"18446744073709551615"}"#);
-    match split_message(&big).expect("tfdt as a decimal string").0 {
-        Header::Segment(h) => assert_eq!(h.tfdt, Some(u64::MAX)),
-        _ => panic!("not a segment"),
-    }
-}
-
-fn seg(sb: u32, is_init: bool, tfdt: Option<u64>, tso: Option<f64>) -> SegmentHeader {
-    SegmentHeader {
-        sb,
-        seq: 1,
-        ms: Some(1),
-        mime: "video/mp4".into(),
-        is_init,
-        init_cont: false,
-        kind: "mp4".into(),
-        tfdt,
-        track: None,
-        timescale: Some(1000),
-        dur: None,
-        tso,
-        seq_mode: false,
-        tso_set: false,
-    }
-}
-
 fn budget(per_session: u64, total_max: u64) -> Arc<Budget> {
     Arc::new(Budget {
         per_session,
@@ -901,6 +512,21 @@ fn index_lines(dir: &Path) -> usize {
 
 fn write(s: &mut Session, h: &SegmentHeader, bytes: &[u8]) {
     s.write_segment(h, bytes).expect("write");
+}
+
+/// The summary of a connection counts what was left out: a re-fetch as a duplicate, media beyond what the
+/// session remembers as skipped.
+#[test]
+fn left_out_media_is_counted_as_duplicate_or_skipped() {
+    let mut s = session("counted");
+    write(&mut s, &seg(1, true, None, None), &init_with_traks(1));
+    write(&mut s, &seg(1, false, Some(1000), None), &moof(1000));
+    write(&mut s, &seg(1, false, Some(1000), None), &moof(1000));
+    assert_eq!((s.tracks[&1].dupes, s.tracks[&1].skipped), (1, 0));
+    s.seen_total = MAX_SEEN_PER_SESSION;
+    write(&mut s, &seg(1, false, Some(2000), None), &moof(2000));
+    assert_eq!((s.tracks[&1].dupes, s.tracks[&1].skipped), (1, 1));
+    assert_eq!(written(&s, 1), init_with_traks(1).len() + moof(1000).len());
 }
 
 #[test]
@@ -1377,19 +1003,6 @@ fn encrypted_continuation_of_a_split_init_is_refused() {
 }
 
 #[test]
-fn piff_sample_encryption_is_refused() {
-    let mut uuid = PIFF_SAMPLE_ENCRYPTION.to_vec();
-    uuid.extend_from_slice(b"rest");
-    let piff = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"uuid", &uuid)));
-    assert!(payload_encrypted(
-        &seg(1, false, Some(0), None),
-        &piff,
-        false,
-        Container::Mp4
-    ));
-}
-
-#[test]
 fn session_budget_counts_index_lines_and_stops_for_good() {
     let out = temp_dir("cap");
     let mut s = Session::open(&out, "test", "u", "t", &budget(9000, 64 * GIB), &refusals())
@@ -1526,50 +1139,6 @@ fn segments_mode_duplicate_writes_no_mark() {
     write(&mut s, &seg(1, false, Some(0), None), b"A");
     write(&mut s, &seg(1, false, Some(0), None), b"A");
     assert_eq!(index_lines(&s.dir), 2);
-}
-
-/// Sequence mode: a re-append the sink did not store again still holds
-/// its place, so the next append continues after it (not after the end
-/// of the stretch before the seek), and the row it repeats keeps its own
-/// place.
-#[test]
-fn seq_layout_continues_after_a_marked_duplicate() {
-    let mut rows = Vec::new();
-    let mut add = |offset: u64, tfdt: u64, tso: f64, tso_set: bool, mark: bool| {
-        let mut r = row(offset, 1, false, Some(tfdt), Some(tso));
-        r.seq_mode = true;
-        r.dur = Some(1000);
-        r.tso_set = tso_set;
-        r.mark = mark;
-        rows.push(r);
-    };
-    add(0, 0, 0.0, true, false); // A at 0
-    add(1, 1000, 0.0, false, false); // B at 1
-    add(2, 2000, 0.0, false, false); // C at 2
-    add(3, 4000, 4.0, true, false); // seek forward: E at 4
-    add(4, 5000, 0.0, false, false); // F at 5
-    add(2, 2000, 10.0, true, true); // seek: C again, at 10
-    add(5, 3000, 8.0, false, false); // D right after it, at 11
-    let refs: Vec<&IndexRow> = rows.iter().collect();
-    let (moves, jumps) = seq_layout(&refs, &SeqMoves::new());
-    assert_eq!(jumps, 0, "D continues the re-append: {moves:?}");
-    assert_eq!(moves[&(0, 5)], 8000, "D where the browser played it");
-    assert_eq!(moves[&(0, 2)], 0, "C keeps its first place");
-}
-
-/// The lift counts only the parts that are muxed: a part left out (here
-/// one with a negative offset) moves nothing.
-#[test]
-fn lift_counts_only_the_chosen_parts() {
-    let mut low = row(0, 1, false, Some(0), Some(-5.0));
-    low.part = 0;
-    let mut high = row(0, 1, false, Some(0), None);
-    high.part = 1;
-    let rows = vec![low, high];
-    let lift = seq_lift(&rows, &HashMap::new(), &[(1, 1)]);
-    assert_eq!(lift, 0, "part 0 is not muxed");
-    let lift = seq_lift(&rows, &HashMap::new(), &[(1, 0)]);
-    assert_eq!(lift, 5_000_000_000, "part 0 muxed: lifted by 5 s");
 }
 
 /// A chosen part that mux then leaves out (here: no complete moov) does
@@ -1769,17 +1338,6 @@ fn ordered_part_says_whether_the_bytes_carry_the_lift() {
     );
 }
 
-/// A moof of the given sequence number, cut before its tfdt: what a chunked fetch can deliver
-/// as an append of its own.
-fn cut_moof_head(seq: u32) -> Vec<u8> {
-    let mut mfhd = vec![0, 0, 0, 0];
-    mfhd.extend(seq.to_be_bytes());
-    let mut head = 100u32.to_be_bytes().to_vec(); // the moof goes on in the next chunk
-    head.extend(b"moof");
-    head.extend(mp4_box(*b"mfhd", &mfhd));
-    head
-}
-
 #[test]
 fn a_refetched_segment_cut_before_its_tfdt_is_dropped_whole() {
     let mut s = session("cuthead");
@@ -1849,53 +1407,6 @@ fn the_lead_is_found_when_the_append_was_cut_inside_the_moof() {
 }
 
 #[test]
-fn first_cto_reads_version_0_offsets_signed() {
-    let mut trun = vec![0, 0, 0x08, 0x00]; // version 0, cto present
-    trun.extend_from_slice(&1u32.to_be_bytes());
-    trun.extend_from_slice(&(-1024i32).to_be_bytes());
-    let seg = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"trun", &trun)));
-    assert_eq!(first_cto(&seg), -1024);
-}
-
-#[test]
-fn elst_media_time_skips_an_empty_first_edit() {
-    let mut elst = vec![0, 0, 0, 0];
-    elst.extend_from_slice(&2u32.to_be_bytes());
-    for (dur, media_time) in [(100u32, -1i32), (500, 1024)] {
-        elst.extend_from_slice(&dur.to_be_bytes());
-        elst.extend_from_slice(&media_time.to_be_bytes());
-        elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
-    }
-    let edts = mp4_box(*b"edts", &mp4_box(*b"elst", &elst));
-    let mut init = mp4_box(*b"ftyp", b"iso6");
-    init.extend(mp4_box(*b"moov", &mp4_box(*b"trak", &edts)));
-    assert_eq!(elst_media_time(&init), 1024);
-}
-
-/// A combined append cut right after the per-segment styp (or emsg) is
-/// split there; an init+index range (ftyp moov sidx) stays init.
-#[test]
-fn init_prefix_len_splits_at_a_lone_styp() {
-    let init = init_with_traks(1);
-    for kind in [*b"styp", *b"emsg", *b"prft"] {
-        let mut p = init.clone();
-        p.extend(mp4_box(kind, b"msdh"));
-        assert_eq!(
-            init_prefix_len(Container::Mp4, &p),
-            Some(init.len()),
-            "{kind:?}"
-        );
-    }
-    let mut p = init.clone();
-    p.extend(mp4_box(*b"sidx", b"index"));
-    assert_eq!(
-        init_prefix_len(Container::Mp4, &p),
-        None,
-        "single-file index"
-    );
-}
-
-#[test]
 fn media_bytes_never_count_as_init_markers() {
     let mut s = session("nofalsedrm");
     write(&mut s, &seg(1, true, None, None), &init_with_traks(1));
@@ -1930,73 +1441,6 @@ fn untimed_media_of_a_combined_append_is_not_init_bytes() {
         [true, false, false],
         "init row, media row, media row"
     );
-}
-
-#[test]
-fn init_prefix_is_found_in_mp4_and_webm() {
-    let init = init_with_traks(1);
-    let mut combined = init.clone();
-    combined.extend(moof(0));
-    assert_eq!(init_prefix_len(Container::Mp4, &combined), Some(init.len()));
-    assert_eq!(init_prefix_len(Container::Mp4, &init), None);
-    // EBML header, Segment (unknown size) > Info, Cluster.
-    let webm = [
-        0x1a, 0x45, 0xdf, 0xa3, 0x81, 0x00, 0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0x15, 0x49, 0xa9, 0x66, 0x80, 0x1f, 0x43, 0xb6, 0x75, 0x80,
-    ];
-    assert_eq!(init_prefix_len(Container::Webm, &webm), Some(23));
-}
-
-#[test]
-fn multi_track_segments_shift_each_traf_by_its_timescale() {
-    // tkhd v0: fullbox(4) ctime(4) mtime(4) track_ID(4); mdhd v0: fullbox, ctime, mtime, timescale.
-    let trak = |id: u32, ts: u32| {
-        let mut tkhd = vec![0u8; 16];
-        tkhd[12..16].copy_from_slice(&id.to_be_bytes());
-        let mut mdhd = vec![0u8; 16];
-        mdhd[12..16].copy_from_slice(&ts.to_be_bytes());
-        mp4_box(
-            *b"trak",
-            &[
-                mp4_box(*b"tkhd", &tkhd),
-                mp4_box(*b"mdia", &mp4_box(*b"mdhd", &mdhd)),
-            ]
-            .concat(),
-        )
-    };
-    let mut init = mp4_box(*b"ftyp", b"iso6");
-    init.extend(mp4_box(
-        *b"moov",
-        &[trak(1, 90_000), trak(2, 48_000)].concat(),
-    ));
-    let ts = trak_timescales(&init);
-    assert_eq!(ts.get(&1), Some(&90_000));
-    assert_eq!(ts.get(&2), Some(&48_000));
-    let frag = |id: u32| {
-        let mut tfhd = vec![0u8; 8];
-        tfhd[4..8].copy_from_slice(&id.to_be_bytes());
-        mp4_box(
-            *b"traf",
-            &[mp4_box(*b"tfhd", &tfhd), mp4_box(*b"tfdt", &[0u8; 8])].concat(),
-        )
-    };
-    let mut seg = mp4_box(*b"moof", &[frag(1), frag(2)].concat());
-    let by_track =
-        |tid: Option<u32>| shift_ticks(Some(10.0), tid.and_then(|t| ts.get(&t)).copied());
-    assert!(shift_tfdt_by(&mut seg, &by_track));
-    let tfdt_at = |n: usize| {
-        let at = seg
-            .windows(4)
-            .enumerate()
-            .filter(|(_, w)| w == b"tfdt")
-            .nth(n)
-            .expect("tfdt")
-            .0
-            + 8;
-        u32::from_be_bytes([seg[at], seg[at + 1], seg[at + 2], seg[at + 3]])
-    };
-    assert_eq!(tfdt_at(0), 900_000, "video: 10 s at 90 kHz");
-    assert_eq!(tfdt_at(1), 480_000, "audio: 10 s at 48 kHz");
 }
 
 /// The largest part of a `SourceBuffer` has a cut init: the smaller one
@@ -2794,25 +2238,6 @@ fn untimed_media_after_a_complete_init_is_media() {
 }
 
 #[test]
-fn init_complete_needs_moov_or_tracks() {
-    let init = init_with_traks(1);
-    assert!(init_complete(Container::Mp4, &init));
-    assert!(!init_complete(Container::Mp4, &init[..init.len() - 1]));
-    assert!(!init_complete(Container::Mp4, &mp4_box(*b"ftyp", b"iso6")));
-    // EBML header, Segment (unknown size), Info, Tracks.
-    let ebml = [0x1a, 0x45, 0xdf, 0xa3, 0x80];
-    let segment = [
-        0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    ];
-    let info = [0x15, 0x49, 0xa9, 0x66, 0x80];
-    let tracks = [0x16, 0x54, 0xae, 0x6b, 0x80];
-    let mut head = [&ebml[..], &segment, &info].concat();
-    assert!(!init_complete(Container::Webm, &head));
-    head.extend_from_slice(&tracks);
-    assert!(init_complete(Container::Webm, &head));
-}
-
-#[test]
 fn parts_per_track_are_capped() {
     let mut s = session("parts");
     for i in 0..(MAX_PARTS_PER_TRACK + 6) {
@@ -2910,86 +2335,6 @@ fn sequence_mode_follows_a_set_timestamp_offset() {
     );
 }
 
-#[test]
-fn sequence_mode_layout_spans_all_parts() {
-    // An ABR switch and back: part 0 has 0, 1 s and 4, 5 s, part 1 the
-    // 2, 3 s in between. One timeline: nothing moves.
-    let init = init_with_traks(1);
-    let mut rows = Vec::new();
-    for (i, (part, t)) in [
-        (0, 0),
-        (0, 1000),
-        (1, 2000),
-        (1, 3000),
-        (0, 4000),
-        (0, 5000),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut r = row(i as u64 * 100, 32, false, Some(t), Some(0.0));
-        r.part = part;
-        r.seq_mode = true;
-        r.dur = Some(1000);
-        rows.push(r);
-    }
-    let mut first = row(9999, init.len() as u64, true, None, None);
-    first.seq_mode = true;
-    rows.insert(0, first);
-    let refs: Vec<&IndexRow> = rows.iter().collect();
-    let (moves, jumps) = seq_layout(&refs, &HashMap::new());
-    assert_eq!(jumps, 0);
-    assert!(moves.values().all(|m| *m == 0), "{moves:?}");
-}
-
-#[test]
-fn init_index_range_stays_one_init() {
-    // SegmentBase: ftyp moov sidx with no moof is all init.
-    let mut v = init_with_traks(1);
-    v.extend(mp4_box(*b"sidx", b"1234"));
-    assert_eq!(init_prefix_len(Container::Mp4, &v), None);
-}
-
-#[test]
-fn init_scan_resumes_where_it_stopped() {
-    let init = init_with_traks(1);
-    let (done, at) = init_scan(Container::Mp4, &init[..20], 0);
-    assert!(!done);
-    assert_eq!(at, 12, "after the complete ftyp");
-    assert!(init_scan(Container::Mp4, &init, at).0);
-}
-
-#[test]
-fn a_set_offset_places_the_first_presentation_time() {
-    // trun with duration and composition offset: the first frame shows
-    // 80 ticks after its decode time.
-    let mut trun = vec![0, 0, 0x09, 0x00]; // v0, duration + cto
-    trun.extend(1u32.to_be_bytes());
-    trun.extend(40u32.to_be_bytes());
-    trun.extend(80u32.to_be_bytes());
-    let seg = mp4_box(*b"moof", &mp4_box(*b"traf", &mp4_box(*b"trun", &trun)));
-    assert_eq!(first_cto(&seg), 80);
-    assert_eq!(first_cto(&moof(0)), 0, "no trun");
-
-    let mut r = row(0, 32, false, Some(1000), Some(4.0));
-    r.seq_mode = true;
-    r.tso_set = true;
-    r.dur = Some(1000);
-    let leads: SeqMoves = HashMap::from([((0, 0), 80)]);
-    let (moves, _) = seq_layout(&[&r], &leads);
-    // PTS (1000 + 80) at 4 s: tfdt goes to 3920.
-    assert_eq!(moves[&(0, 0)], 2920);
-}
-
-#[test]
-fn a_cut_moof_still_splits_a_combined_append() {
-    let init = init_with_traks(1);
-    let mut v = init.clone();
-    v.extend(mp4_box(*b"styp", b"msdh"));
-    v.extend(&moof(0)[..12]); // header says 40 bytes, 12 arrived
-    assert_eq!(init_prefix_len(Container::Mp4, &v), Some(init.len()));
-}
-
 /// A cut `moof` without `tfdt` in its own append, arriving while an init
 /// is still incomplete, is media: it must not join the init (and its
 /// hash, and the DRM scan of the init).
@@ -3018,13 +2363,6 @@ fn pending_chunks_count_their_header() {
         write(&mut s, &seg(1, false, None, None), b"x");
     }
     assert!(s.tracks[&1].pending_cost() <= MAX_PENDING_INIT);
-}
-
-#[test]
-fn rescale_rounds_between_timescales() {
-    assert_eq!(rescale(1000, Some(1000), 90_000), 90_000);
-    assert_eq!(rescale(-3, Some(2), 1), -2);
-    assert_eq!(rescale(5, None, 1000), 0);
 }
 
 #[test]

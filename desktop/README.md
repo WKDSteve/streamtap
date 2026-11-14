@@ -12,8 +12,21 @@ cargo test --release         # unit tests of dedupe, ordering, limits, DRM refus
 ```
 
 On Linux without the GTK development packages (a cloud session) the app crate does not build
-(`gdk-sys`), so `cargo test --workspace` is not meant for there. The other two have no such
-dependency: `cargo test -p streamtap-sink -p streamtap-host`. The CI runs the whole workspace.
+(`gdk-sys`), so `cargo test --workspace` is not meant for there. The others have no such
+dependency: `cargo test -p streamtap-core -p streamtap-sink -p streamtap-host`. The CI runs the whole
+workspace.
+
+### Crates
+
+| Crate | What it is |
+| --- | --- |
+| `streamtap-core` | What streamtap decides, without I/O: the wire format (`wire`), what the bytes are (`fmp4`: container, init, encryption, the boxes the mux rewrites), has a segment been written before (`dedupe`), which `MediaSource` and which part is muxed (`parts`), offsets, sequence-mode layout, order, coverage and gaps (`timeline`). It opens no file, socket or process, reads no clock and prints nothing; `tests/no_io.rs` reads its sources and holds that. |
+| `streamtap-testkit` | Fixtures made in memory for the tests of the core and the sink: MP4 boxes, a `moof` with a `tfdt`, inits, segment headers, index rows. |
+| `streamtap-sink` | The I/O around the core: the WebSocket server, the capture directory (`session.json` is written to a temporary file and renamed), the budgets, ffmpeg and ffprobe, and every message on the terminal. |
+| `streamtap-app`, `streamtap-host` | The desktop app and the native messaging host (below). |
+
+A rule that needs no disk goes into the core with a test in `crates/streamtap-core/tests/`; the sink keeps
+what reads, writes, waits or prints. `cargo test -p streamtap-core` runs in well under a second.
 
 `scripts/build.ps1` (repo root) is what the nvim-config's `:MyNative build`
 runs: it refuses while a sink from this checkout is running (the exe is

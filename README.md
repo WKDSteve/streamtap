@@ -51,7 +51,9 @@ Layout:
 ```
 streamtap/
   extension/   MV3 extension (hook, content script, service worker, popup)
-  desktop/     Rust workspace: streamtap-sink (WebSocket receiver, segment store, mux),
+  desktop/     Rust workspace: streamtap-core (the logic without I/O: wire format, fMP4 structure,
+               dedupe, part selection, timeline order), streamtap-testkit (fixtures of the tests),
+               streamtap-sink (WebSocket receiver, segment store, mux),
                streamtap-app (Tauri 2 shell + static UI in crates/streamtap-app/ui),
                streamtap-host (native messaging host: browser <-> app relay)
   scripts/     build, install, uninstall, package-release (the release zip) and their tests
