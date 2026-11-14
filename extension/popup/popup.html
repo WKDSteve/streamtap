@@ -2,104 +2,101 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>streamtap</title>
-    <style>
-      body { font: 12px/1.4 system-ui, sans-serif; margin: 0; padding: 10px; width: 520px; color: #222; }
-      h1 { font-size: 13px; margin: 0 0 6px; }
-      .drm { background: #fde7e9; color: #8a0012; padding: 6px 8px; border-radius: 4px; margin-bottom: 8px; }
-      .ms { border: 1px solid #ddd; border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; }
-      .ms h2 { font-size: 12px; margin: 0 0 4px; font-weight: 600; }
-      table { border-collapse: collapse; width: 100%; }
-      th, td { text-align: left; padding: 2px 6px 2px 0; vertical-align: top; white-space: nowrap; }
-      th { color: #666; font-weight: 500; }
-      td.mime { white-space: normal; word-break: break-all; max-width: 200px; }
-      .muted { color: #777; }
-      button { margin-top: 6px; }
-      .sink { margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
-      .sink label { margin-right: 8px; }
-      .sink input { width: 110px; }
-      .policy, .target { margin-top: 10px; border: 1px solid #ddd; border-radius: 4px; }
-      .target label { display: block; margin: 4px 0; }
-      #file-state { white-space: pre-line; }
-      .tailnet { margin: 4px 0 6px 20px; }
-      .tailnet input { width: 230px; }
-      .policy label { display: block; margin: 4px 0; }
-      .policy textarea { width: 100%; box-sizing: border-box; min-height: 3em; font: inherit; }
-      .locked { color: #8a0012; }
-      .released { color: #1b5e20; }
-      /* A phone (Firefox for Android shows the popup as a page): full width, larger text, touch targets. */
-      @media (pointer: coarse) {
-        body { width: auto; font-size: 16px; padding: 12px; }
-        h1 { font-size: 18px; }
-        button { min-height: 44px; min-width: 44px; padding: 0 12px; font-size: 16px; }
-        input, textarea { font-size: 16px; }
-        input[type="checkbox"] { width: 24px; height: 24px; vertical-align: middle; }
-        .policy label, .target label { min-height: 44px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-        input[type="radio"] { width: 24px; height: 24px; }
-        .sink input, .tailnet input { width: 100%; box-sizing: border-box; min-height: 44px; }
-        .tailnet { margin-left: 0; }
-        th, td { white-space: normal; }
-      }
-      @media (prefers-color-scheme: dark) {
-        body { background: #1e1e1e; color: #e6e6e6; }
-        th, .muted { color: #b0b0b0; }
-        .ms, .sink, .policy, .target { border-color: #444; }
-        .drm { background: #4a1219; color: #ffd7dc; }
-        .locked { color: #ff9aa5; }
-        .released { color: #9be3a1; }
-      }
-    </style>
+    <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <h1>streamtap · Spike 1</h1>
-    <div id="out" class="muted">loading…</div>
-    <button id="clear">clear tab state</button>
-    <div class="muted">
-      <span id="pair">app pairing: …</span>
-      <button id="pair-now">pair now</button>
-    </div>
-    <fieldset class="policy">
-      <legend>Sources</legend>
-      <div id="source" class="muted">source: …</div>
-      <label><input id="policy-on" type="checkbox" /> only allowed sources (source policy)</label>
-      <label><input id="unlock-obfuscated" type="checkbox" /> unlock: obfuscated services (YouTube and alike)</label>
-      <label><input id="unlock-social" type="checkbox" /> unlock: social media</label>
-      <div class="muted">Unlock a group only where capturing it is allowed for you. DRM is never captured.</div>
-      <label>own servers (one host per line) <textarea id="own-hosts" rows="2"></textarea></label>
-      <label>learning platforms that allow downloads (one host per line) <textarea id="learning-hosts" rows="2"></textarea></label>
-      <button id="policy-save">save sources</button>
-      <span id="policy-saved" class="muted"></span>
-    </fieldset>
-    <fieldset class="target">
-      <legend>Target</legend>
-      <label><input type="radio" name="target" value="sink" id="target-sink" /> the sink on the PC (port and token below, or a paired app)</label>
-      <label><input type="radio" name="target" value="file" id="target-file" /> a file on this device (a recording; on the PC: <code>streamtap-sink replay</code>, then <code>mux</code>)</label>
-      <label><input type="radio" name="target" value="tailnet" id="target-tailnet" /> the sink on the PC over the tailnet (Tailscale or Headscale; this device paired with the PC)</label>
-      <div class="tailnet">
-        <div id="tailnet-state" class="muted" role="status"></div>
-        <div id="tailnet-offer" hidden>
-          <span id="tailnet-offer-text"></span>
-          <button id="tailnet-offer-pair">pair with this PC</button>
-        </div>
-        <label>PC in the tailnet <input id="tailnet-host" type="text" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="pc.example.ts.net" /></label>
-        <label>pairing code (or the whole link) <input id="tailnet-code" type="text" autocapitalize="none" autocomplete="off" spellcheck="false" maxlength="400" /></label>
-        <label>name of this device <input id="tailnet-name" type="text" maxlength="40" placeholder="phone" /></label>
-        <button id="tailnet-pair">pair this device</button>
-        <button id="tailnet-forget" hidden>forget this pairing</button>
-        <div id="tailnet-result" class="muted" role="status"></div>
+    <!-- One document, four pages: the start page with the state of this tab, and a page per group of settings.
+         popup.js shows the page location.hash names (#target, #sources, #about), so the browser's back key is "back".
+         Every text comes from i18n.js (data-i18n); what stands here in English is the text without scripts. -->
+    <main id="page-home">
+      <header><h1>streamtap</h1></header>
+      <div class="status">
+        <div id="tab-line" class="muted" role="status" data-i18n="loading">loading…</div>
+        <div id="source" class="muted"></div>
+        <div id="target-line" class="muted" role="status"></div>
       </div>
-      <label><input type="radio" name="target" value="video" id="target-video" /> a video on this device (an MP4 made here, without the PC; a capture it cannot make is saved as a recording, with the reason)</label>
-      <div id="file-state" class="muted"></div>
-      <button id="file-save" hidden>save the recording now</button>
-      <span id="target-saved" class="muted"></span>
-    </fieldset>
-    <fieldset class="sink">
-      <legend>Sink (manual fallback; a paired app fills this in)</legend>
-      <label>port <input id="port" type="number" min="1" max="65535" size="6" /></label>
-      <label>token <input id="token" type="password" size="16" /></label>
-      <button id="save">save</button>
-      <span id="link" class="muted"></span>
-    </fieldset>
+      <button id="file-save" hidden data-i18n="fileSave">save the recording now</button>
+      <div id="tailnet-offer" hidden>
+        <span id="tailnet-offer-text"></span>
+        <button id="tailnet-offer-pair" data-i18n="tnOfferPair">pair with this PC</button>
+      </div>
+      <nav>
+        <a id="nav-target" href="#target"><strong data-i18n="navTarget">Target</strong><span data-i18n="navHintTarget">where the capture goes, pairing</span></a>
+        <a id="nav-sources" href="#sources"><strong data-i18n="navSources">Sources</strong><span data-i18n="navHintSources">which sites are captured</span></a>
+        <a id="nav-about" href="#about"><strong data-i18n="navAbout">About</strong><span data-i18n="navHintAbout">version, what is captured</span></a>
+      </nav>
+      <details>
+        <summary data-i18n="tabDetails">Details of this tab</summary>
+        <div id="out"></div>
+        <button id="clear" data-i18n="clear">clear tab state</button>
+      </details>
+    </main>
+
+    <main id="page-target" hidden>
+      <header><button class="back" id="back-target" data-i18n="back">Back</button><h1 data-i18n="navTarget">Target</h1></header>
+      <fieldset>
+        <legend data-i18n="targetLegend">Where the capture goes</legend>
+        <label class="choice"><input type="radio" name="target" value="sink" id="target-sink" /><span><span data-i18n="targetSink">the sink on the PC</span><small data-i18n="targetSinkHint">this browser runs on the PC; the app pairs it, or port and token by hand</small></span></label>
+        <label class="choice"><input type="radio" name="target" value="tailnet" id="target-tailnet" /><span><span data-i18n="targetTailnet">the sink on the PC over the tailnet</span><small data-i18n="targetTailnetHint">Tailscale or Headscale; this device paired with the PC</small></span></label>
+        <label class="choice"><input type="radio" name="target" value="file" id="target-file" /><span><span data-i18n="targetFile">a file on this device</span><small data-i18n="targetFileHint">a recording; on the PC: streamtap-sink replay, then mux</small></span></label>
+        <label class="choice"><input type="radio" name="target" value="video" id="target-video" /><span><span data-i18n="targetVideo">a video on this device</span><small data-i18n="targetVideoHint">an MP4 made here, without the PC; a capture it cannot make is saved as a recording, with the reason</small></span></label>
+        <div id="target-note" class="muted"></div>
+        <div id="target-saved" class="muted" role="status"></div>
+      </fieldset>
+
+      <!-- Only the block of the chosen target is shown. -->
+      <section id="block-sink" class="block" hidden>
+        <div id="pair" class="muted" role="status"></div>
+        <button id="pair-now" data-i18n="pairNow">pair now</button>
+        <div id="link" class="muted"></div>
+        <details>
+          <summary data-i18n="sinkManual">Port and token by hand (a paired app fills this in)</summary>
+          <label><span data-i18n="port">port</span> <input id="port" type="number" min="1" max="65535" /></label>
+          <label><span data-i18n="token">token</span> <input id="token" type="password" autocomplete="off" /></label>
+          <button id="save" data-i18n="save">save</button>
+          <div id="sink-saved" class="muted" role="status"></div>
+        </details>
+      </section>
+
+      <section id="block-tailnet" class="block" hidden>
+        <div id="tailnet-state" class="muted" role="status"></div>
+        <label><span data-i18n="tnHost">PC in the tailnet</span> <input id="tailnet-host" type="text" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="pc.example.ts.net" /></label>
+        <label><span data-i18n="tnCode">pairing code (or the whole link)</span> <input id="tailnet-code" type="text" autocapitalize="none" autocomplete="off" spellcheck="false" maxlength="400" /></label>
+        <label><span data-i18n="tnName">name of this device</span> <input id="tailnet-name" type="text" maxlength="40" placeholder="phone" data-i18n-placeholder="tnNamePlaceholder" /></label>
+        <button id="tailnet-pair" data-i18n="tnPair">pair this device</button>
+        <button id="tailnet-forget" hidden data-i18n="tnForget">forget this pairing</button>
+        <div id="tailnet-result" class="muted" role="status"></div>
+      </section>
+
+      <section id="block-device" class="block" hidden>
+        <div id="file-state" class="muted" role="status"></div>
+      </section>
+    </main>
+
+    <main id="page-sources" hidden>
+      <header><button class="back" id="back-sources" data-i18n="back">Back</button><h1 data-i18n="navSources">Sources</h1></header>
+      <label class="choice"><input id="policy-on" type="checkbox" /><span data-i18n="policyOn">only allowed sources (source policy)</span></label>
+      <label class="choice"><input id="unlock-obfuscated" type="checkbox" /><span data-i18n="unlockObfuscated">unlock: obfuscated services (YouTube and alike)</span></label>
+      <label class="choice"><input id="unlock-social" type="checkbox" /><span data-i18n="unlockSocial">unlock: social media</span></label>
+      <p class="muted" data-i18n="unlockHint">Unlock a group only where capturing it is allowed for you. DRM is never captured.</p>
+      <label><span data-i18n="ownHosts">own servers (one host per line)</span> <textarea id="own-hosts" rows="2" autocapitalize="none" spellcheck="false"></textarea></label>
+      <label><span data-i18n="learningHosts">learning platforms that allow downloads (one host per line)</span> <textarea id="learning-hosts" rows="2" autocapitalize="none" spellcheck="false"></textarea></label>
+      <button id="policy-save" data-i18n="policySave">save sources</button>
+      <div id="policy-saved" class="muted" role="status"></div>
+    </main>
+
+    <main id="page-about" hidden>
+      <header><button class="back" id="back-about" data-i18n="back">Back</button><h1 data-i18n="navAbout">About</h1></header>
+      <p id="about-version"></p>
+      <p data-i18n="aboutWhat">Copies the segments a video player appends (Media Source Extensions) to the target you chose. The video is not re-encoded.</p>
+      <p data-i18n="aboutDrm">A stream with DRM is detected and left alone: nothing of it is copied.</p>
+      <p data-i18n="aboutPolicy">Which sites are captured is yours to set under Sources. Capture only what you may.</p>
+      <p class="muted" data-i18n="aboutLanguage">The language follows the browser (German or English).</p>
+    </main>
+
+    <script src="i18n.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

@@ -118,7 +118,8 @@ jobs:
       # The app UI: German and English tables match, every used key exists, both themes keep their contrast.
       - run: node desktop/scripts/test-app-ui.mjs
 
-  # The app's page in a real Chrome: axe in light and dark, also hovered and focused. Playwright and axe come at fixed
+  # The app's page in a real Chrome: axe in light and dark, also hovered and focused; then the extension's popup, every
+  # page of it on a PC and on a phone (touch targets, no sideways scrolling). Playwright and axe come at fixed
   # versions from tools/page-check; streamtap has no other Node dependency.
   page:
     runs-on: ${{ github.event_name == 'pull_request' && 'windows-latest' || fromJSON('["self-hosted","windows"]') }}

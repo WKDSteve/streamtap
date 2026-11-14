@@ -237,6 +237,7 @@ const until = async (cond) => {
   await until(() => w2.run("fileStatus(7)").saved.length === 1);
   const n2 = w2.run("fileStatus(7)").saved[0];
   check(typeof n2.fallback === "string" && n2.fallback.includes("WebM"), `fallback: the reason is said (got ${n2.fallback})`);
+  check(n2.reason === "webm", `fallback: and named by its code, for the popup's own language (got ${n2.reason})`);
 }
 
 if (failures.length) {

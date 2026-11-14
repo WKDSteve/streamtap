@@ -51,6 +51,11 @@ try {
   const listed = [...m.background.scripts, ...m.content_scripts.flatMap((c) => c.js), m.action.default_popup, ...Object.values(m.icons)];
   check(listed.every((p) => existsSync(join(r.dir, p))), "every file the manifest names is shipped");
   check(!r.names.some((n) => n.startsWith("scripts/") || n.endsWith(".md")), "no test scripts or READMEs in the add-on");
+  // The popup is more than the page the manifest names: its style sheet, its script and the table of its texts.
+  const popupPage = readFileSync(join(r.dir, "popup", "popup.html"), "utf8");
+  const popupFiles = [...popupPage.matchAll(/<(?:script src|link rel="stylesheet" href)="([^"]+)"/g)].map((x) => `popup/${x[1]}`);
+  check(popupFiles.join() === "popup/popup.css,popup/i18n.js,popup/popup.js" && popupFiles.every((n) => r.names.includes(n)), `every file the popup loads is shipped (${popupFiles.join(", ")})`);
+  check(/const de = \{/.test(readFileSync(join(r.dir, "popup", "i18n.js"), "utf8")), "the shipped table holds the German texts");
 
   // ---- the xpi --------------------------------------------------------------------
   const x = readFileSync(r.xpi);

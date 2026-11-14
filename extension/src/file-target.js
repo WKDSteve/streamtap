@@ -147,9 +147,9 @@ class FileRecorder {
     fileVideoOf(frames).then(
       (made) => {
         if (made.ok) this.download(made.blob, fileNameFor(this.url, this.startedAt, "mp4"), { bytes: made.blob.size, video: true, report: made.report });
-        else this.download(recording(), fileNameFor(this.url, this.startedAt), { bytes, fallback: made.text });
+        else this.download(recording(), fileNameFor(this.url, this.startedAt), { bytes, fallback: made.text, reason: made.reason });
       },
-      () => this.download(recording(), fileNameFor(this.url, this.startedAt), { bytes, fallback: "the video could not be made" })
+      () => this.download(recording(), fileNameFor(this.url, this.startedAt), { bytes, fallback: "the video could not be made", reason: "failed" })
     );
   }
 
@@ -175,7 +175,7 @@ class FileRecorder {
   }
 }
 
-// The recorded messages made into one MP4 (fmp4-mux.js): { ok, blob, report } or { ok: false, text }.
+// The recorded messages made into one MP4 (fmp4-mux.js): { ok, blob, report } or { ok: false, reason, text }.
 const fileVideoOf = async (frames) => {
   const messages = [];
   const dec = new TextDecoder();
@@ -193,7 +193,7 @@ const fileVideoOf = async (frames) => {
     messages.push({ header, payload: b.subarray(4 + hl) });
   }
   const r = fmp4Mux(messages);
-  if (!r.ok) return { ok: false, text: r.text };
+  if (!r.ok) return { ok: false, reason: r.reason, text: r.text };
   const report = { gaps: r.report.gaps.length, gapSeconds: r.report.gaps.reduce((n, g) => n + g.seconds, 0), dupes: r.report.dupes, overlaps: r.report.overlaps, cut: r.report.cut };
   return { ok: true, blob: new Blob(r.parts, { type: "video/mp4" }), report };
 };

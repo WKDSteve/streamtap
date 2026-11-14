@@ -1,0 +1,82 @@
+/* The popup: a start page with the state of the tab, and one page per group of settings. Every colour is a variable
+   here at the top, once for light and once for dark. */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --text: #222222;
+  --muted: #5f5f5f;
+  --line: #c9c9c9;
+  --soft: #f3f3f3;
+  --bad: #8a0012;
+  --bad-bg: #fde7e9;
+  --good: #1b5e20;
+  --focus: #0b57d0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e;
+    --text: #e6e6e6;
+    --muted: #b4b4b4;
+    --line: #555555;
+    --soft: #2a2a2a;
+    --bad: #ff9aa5;
+    --bad-bg: #4a1219;
+    --good: #9be3a1;
+    --focus: #a8c7fa;
+  }
+}
+
+body { font: 13px/1.45 system-ui, sans-serif; margin: 0; padding: 10px; width: 380px; background: var(--bg); color: var(--text); }
+h1 { font-size: 15px; margin: 0; }
+p { margin: 6px 0; }
+.muted { color: var(--muted); }
+.locked { color: var(--bad); }
+.released { color: var(--good); }
+[hidden] { display: none !important; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* The head of a page: on the start page the name, on every other page the way back and the title, the same place. */
+header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; min-height: 28px; }
+.status > div, .status > p { margin: 4px 0; }
+#file-save, #tailnet-offer { margin: 8px 0; }
+#tailnet-offer button { display: block; }
+
+nav { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+nav a { display: block; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); color: var(--text); text-decoration: none; }
+nav a strong { display: block; }
+nav a span { color: var(--muted); }
+nav a:hover { border-color: var(--text); }
+
+fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 0 0 8px; padding: 6px 8px; min-width: 0; }
+label { display: block; margin: 6px 0; }
+label.choice { display: flex; align-items: flex-start; gap: 6px; }
+label.choice small { display: block; color: var(--muted); font-size: inherit; }
+input[type="text"], input[type="number"], input[type="password"], textarea { width: 100%; box-sizing: border-box; font: inherit; margin-top: 2px; }
+textarea { min-height: 3em; }
+button { font: inherit; margin: 4px 4px 4px 0; }
+.block { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 6px; }
+#file-state, #target-note { white-space: pre-line; }
+
+details { margin-top: 8px; }
+summary { cursor: pointer; color: var(--muted); }
+.drm { background: var(--bad-bg); color: var(--bad); padding: 6px 8px; border-radius: 4px; margin: 6px 0; }
+.ms { border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; margin: 6px 0; overflow-x: auto; }
+.ms h2 { font-size: inherit; margin: 0 0 4px; font-weight: 600; }
+/* The table of a MediaSource keeps its columns readable and scrolls sideways inside its box where the page is narrow. */
+table { border-collapse: collapse; width: 100%; min-width: 420px; }
+th, td { text-align: left; padding: 2px 6px 2px 0; vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+.ms .muted { overflow-wrap: anywhere; }
+
+/* A phone (Firefox for Android shows the popup as a page): full width, larger text, touch targets of 48 px. */
+@media (pointer: coarse) {
+  body { width: auto; font-size: 16px; padding: 12px; }
+  h1 { font-size: 20px; }
+  header { min-height: 48px; }
+  button { min-height: 48px; min-width: 48px; padding: 0 14px; }
+  nav a { min-height: 48px; box-sizing: border-box; padding: 10px 12px; }
+  summary { padding: 13px 0; }
+  label.choice { min-height: 48px; align-items: center; gap: 10px; }
+  input[type="checkbox"], input[type="radio"] { width: 24px; height: 24px; flex: none; }
+  input[type="text"], input[type="number"], input[type="password"] { min-height: 48px; }
+}

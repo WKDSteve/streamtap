@@ -37,7 +37,7 @@ alone, by design. Respect the terms of the sites you use it on; see the
 - Mobile (Firefox for Android, in progress, own devices only, no store): the extension has a
   source policy, on by default on the desktop too, that taps released sources and unlisted sites
   and keeps groups such as obfuscated services and social media locked until you unlock them
-  (popup, *Sources*); never DRM. A build script
+  (popup, *Sources*); never DRM. The popup has a start page and one page per group of settings, in English and German. A build script
   makes the Firefox variant and its `.xpi`. Two targets on the phone (code done, hand run on a phone pending): a
   recording saved on the device (`streamtap-sink replay` reads it on the PC), and the sink on the PC over your
   tailnet (Tailscale Serve, or a Headscale that issues certificates): the sink stays on loopback, each phone is
@@ -171,7 +171,7 @@ python -m unittest discover tools
 python tools/check-control-chars.py
 python tools/check-workflows.py --online          # pins, runners, drafts only
 actionlint                                        # syntax and expressions; winget install rhysd.actionlint
-pnpm --dir tools/page-check install --frozen-lockfile; node tools/page-check.mjs tools/page-check/node_modules   # axe, light and dark
+pnpm --dir tools/page-check install --frozen-lockfile; node tools/page-check.mjs tools/page-check/node_modules   # axe, light and dark: the page of the app and the popup of the extension
 pwsh -NoProfile -File scripts/test-install.ps1   # install/uninstall in a temp folder, fake registry root
 pwsh -NoProfile -File scripts/test-release.ps1   # the release zip: contents, checksums, install from it
 Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Error, Warning   # PSScriptAnalyzer 1.24.0

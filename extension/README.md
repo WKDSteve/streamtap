@@ -27,7 +27,7 @@ to `oggpddakdbffbjhkjmcakidgmhpgakia` on every machine, so the origin is
 | `src/fmp4-mux.js` | background page (Firefox) | The muxer of the target **a video on this device**: the messages of a recording made into one fragmented MP4 without re-encoding (ftyp, one `moov` with the tracks of every SourceBuffer renumbered, one `trex` each, then their `moof`+`mdat` pairs in decode order, numbered anew). Assembles inits cut over appends and media cut over appends, keeps a fragment appended again after a seek once, drops one that overlaps, reports gaps (over 50 ms or 1 % of a fragment) with their length. Refuses, with the reason, WebM, a quality switch (a second, different init), sequence mode, a changed `timestampOffset`, protection, a lost init and absolute data offsets: then the recording is saved instead, for `streamtap-sink replay` on the PC. |
 | `src/file-target.js` | background page (Firefox) | The target **file on the device** (`sinkTarget: "file"`): a link of `sink-link.js` gets a recorder in place of its WebSocket, which keeps exactly the messages the link would send to the sink (hello, the inits in effect, segments, `initlost` and other events) as one recording per MediaSource, each message with its 32-bit little-endian length behind the line `STREAMTAP-RECORDING/1`. When the link closes (the video or tab ends, or *save the recording now* in the popup) it is saved through the downloads API as `streamtap-<time>-<host>.streamtap`, without a dialog and never over an existing file; a recording without media is not saved. All open recordings hold at most 512 MiB together; beyond that media is dropped, a `recordfull` event is noted once and the popup says so. Needs a background page (a blob URL) and the `downloads` permission: the Firefox build has both, a Chrome service worker does not (there the target is not offered). |
 | `src/source-policy.js` | service worker | The source policy, **on unless `sourcePolicy` is `"off"`** in `chrome.storage.local`, in the Chrome and the Firefox build alike. When on, the hosts of the tab's top document and of the asking frame (from the browser, not the page) are sorted into groups: *released* (own hosts, free licences, ARD, ZDF/3sat/KiKA, learning platforms the user entered) is tapped; *locked* (YouTube and similarly obfuscated services, social media) copies nothing until the user unlocks that group (`sourceUnlocked`); *unknown* is tapped, with a hint to check the site's terms. One locked URL locks the frame, so a locked player embedded in another site is locked too, and a locked host stays locked when the user lists it as own. The content script asks before it taps (also when the app switches a tab on) and taps nothing without an answer. DRM is no group: the hook refuses EME in any case. |
-| `popup/` | action popup | Shows the registry for the current tab, the pairing state with *pair now* (in Firefox: not available), the *Sources* box of the source policy, and the manual port/token fields (fallback; saving them taps every tab as before). |
+| `popup/` | action popup | A start page and three settings pages, in English and German: see [The popup](#the-popup). `popup.html` (the pages), `popup.css`, `popup.js`, `i18n.js` (every text, in both languages). |
 
 ## Source policy
 
@@ -44,14 +44,41 @@ not allowed are built in but locked until you unlock them. Settings in `chrome.s
 The list of groups and the reasons for it (a judgement, not legal advice) are kept outside this repository with the
 project's planning notes. Never DRM: there is no setting for it.
 
-The popup's *Sources* box shows how the policy judges the current tab (by the URL the browser reported for it) and
-sets all of the above: the policy itself, one switch per locked group, and the own and learning hosts (one per
-line). Open tabs follow a change at once. On a phone the popup uses the full width, larger text and touch-sized
-controls; it follows the system's dark mode.
+The popup's start page shows how the policy judges the current tab (by the URL the browser reported for it); its
+*Sources* page sets all of the above: the policy itself, one switch per locked group, and the own and learning hosts
+(one per line). Open tabs follow a change at once.
+
+## The popup
+
+The popup opens on a start page that says what is, in three sentences: this tab (how many tracks were seen, or that
+it uses DRM and is not captured), how the source policy judges it, and the target with its state. Below them is the
+one action that matters while capturing on a phone (**save the recording now**, only while a recording runs), an
+opened pairing link if there is one, and one entry per settings page. The registry of the tab (every MediaSource and
+SourceBuffer, *clear tab state*) is folded away under *Details of this tab*.
+
+| page | what is on it |
+|---|---|
+| *Target* | Where the capture goes: the sink on the PC, the sink over the tailnet, a file or a video on this device. Below the choice only what belongs to the chosen target: for the sink the pairing with the app (*pair now*), the link's state, and port and token by hand (folded away; saving them taps every tab as before); for the tailnet its state and the pairing; for a file or a video what is being recorded and what was saved. A target this browser cannot offer is greyed out, and a line says so. |
+| *Sources* | The source policy, see above. |
+| *About* | The version, and what is and is not captured. |
+
+Every settings page has the same *Back* in the same place. The pages are one document; `location.hash` names the page
+(`#target`, `#sources`, `#about`), so the browser's own back key, the only one on a phone, leaves a settings page
+too.
+
+The language follows the browser: German for `de*`, English otherwise (like the desktop app; there is no switch).
+All texts are in `popup/i18n.js`, one table per language, no build step and no dependency. The reason a wanted video
+became a recording comes from the background as a code and is said in the popup's language.
+
+On a phone the popup uses the full width, larger text and touch targets of 48 px; it follows the system's dark mode.
+`node scripts/test-popup.mjs` drives it in a fake DOM built from `popup.html` (the pages, the block per target, both
+tables with the same keys and placeholders, every key used and none left over); `tools/page-check.mjs` opens it in a
+real Chrome with a stand-in for `chrome.*` (every page on a PC and on a phone, light and dark, axe, touch targets,
+no sideways scrolling; `--shots <folder>` writes a picture of each).
 
 ## Target: a file on the device (Firefox for Android)
 
-On a phone there is no sink to send to. In the popup's *Target* box choose **a file on this device**, then reload the
+On a phone there is no sink to send to. On the popup's *Target* page choose **a file on this device**, then reload the
 video page and play it. The recording is saved when the video or the tab is closed, or at once with **save the
 recording now** (the next part of the video goes into a new file that starts with the init in effect, so each file
 stands on its own). On the PC:
@@ -87,7 +114,8 @@ instead and says why, so nothing is lost: on the PC `replay` and `mux` handle th
 6. To capture, either pair with the desktop app (below) or: start
    `streamtap-sink serve --token-stdin` with the token on stdin (or
    `--token <secret>`, visible to other processes; see `../desktop/README.md`), enter
-   port and token in the popup, **save**, reload the video page. The popup's sink line shows connected / sent / dropped.
+   port and token in the popup (*Target*, the sink on the PC, *Port and token by hand*), **save**, reload the video
+   page. The popup's start page shows connected / sent / dropped.
    After the video ended (or you close the tab) run
    `streamtap-sink mux captures/<dir>` and open the MP4 in mpv.
 
@@ -98,7 +126,7 @@ instead and says why, so nothing is lost: on the PC `replay` and `mux` handle th
 2. **Reload the extension** on `chrome://extensions` (0.3 adds the `nativeMessaging` and
    `favicon` permissions; Chrome asks again or disables the extension until you accept).
 3. The app shows *"<browser> (profile …) wants to pair"*: **Approve**. The extension stores
-   port and token itself; the popup shows `app pairing: paired`.
+   port and token itself; the popup's *Target* page shows `App pairing: paired`.
 4. The app lists the tabs that hold a video; **Capture** one. That tab is reloaded once and
    from then on tapped; the other tabs are not (mode `selected`). **Stop** ends it.
    The choice belongs to the site the tab showed (scheme, host, port): when the tab's top document
@@ -133,7 +161,8 @@ Pair once:
 1. On the PC: `streamtap-sink devices pair` shows a QR code, good for one minute and one use.
 2. Scan it with the phone's camera and open the link in the Firefox that has the add-on. The page says to open the
    add-on; its popup (menu, *Extensions*, streamtap) names the PC and offers **pair with this PC**. Or type the PC's
-   name and the code (or paste the whole link) into the popup's *Target* box and tap **pair this device**.
+   name and the code (or paste the whole link) on the popup's *Target* page (choose *the sink on the PC over the
+   tailnet*) and tap **pair this device**.
 3. The target switches to *the sink on the PC over the tailnet*. Reload the video page and play.
 
 What is on the phone: one key pair made at pairing. The private key is a WebCrypto key that cannot be exported (the
@@ -261,7 +290,8 @@ Injected into a running ARD Mediathek page (hls.js → fMP4), 7 s after a seek:
   init segment → new part), and after seeks segments arrive out of order.
 - The popup builds its view from elements and `textContent`, never from markup: any
   page script can forge the hook's `postMessage` records.
-  `node scripts/test-popup.mjs` checks it with a fake DOM.
+  `node scripts/test-popup.mjs` checks it with a fake DOM. A value put into a translated text is put in once and
+  as text: one that looks like a placeholder is not filled in again.
 
 ## Known limitations of the spike
 
