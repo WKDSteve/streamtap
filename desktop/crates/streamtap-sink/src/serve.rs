@@ -68,11 +68,18 @@ pub(crate) struct Timed {
 }
 
 impl Timed {
-    /// The handshake and the first message share one deadline.
-    pub(crate) fn new(inner: TcpStream, limits: Limits, pushed_out: Arc<AtomicBool>) -> Self {
+    /// The handshake and the first message share one deadline, `hello_by`: the caller sets it when the
+    /// connection is accepted, so that whatever is read before the handshake (`answer_plain_get`) counts
+    /// against it too.
+    pub(crate) fn new(
+        inner: TcpStream,
+        hello_by: Instant,
+        limits: Limits,
+        pushed_out: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             inner,
-            deadline: Some(Instant::now() + limits.hello),
+            deadline: Some(hello_by),
             idle_until: None,
             idle: limits.idle,
             end_at: None,
@@ -517,6 +524,7 @@ pub(crate) fn next_binary(
 pub(crate) fn accept_ws(
     stream: TcpStream,
     origin: &str,
+    hello_by: Instant,
     limits: Limits,
     pushed_out: Arc<AtomicBool>,
     tailnet: Option<&Tailnet>,
@@ -526,7 +534,9 @@ pub(crate) fn accept_ws(
     stream
         .set_write_timeout(Some(WRITE_TIMEOUT))
         .map_err(io_err("set write timeout"))?;
-    let stream = Timed::new(stream, limits, pushed_out);
+    // The port this sink answers on: a local request names it in its `Host`.
+    let port = stream.local_addr().map_err(io_err("local address"))?.port();
+    let stream = Timed::new(stream, hello_by, limits, pushed_out);
     // tungstenite's default caps a frame at 16 MiB; segments may be up to
     // MAX_MESSAGE, so the frame and message caps follow it (plus header).
     let config = tungstenite::protocol::WebSocketConfig::default()
@@ -535,7 +545,7 @@ pub(crate) fn accept_ws(
     let mut class = Class::Local;
     let mut ws = tungstenite::accept_hdr_with_config(
         stream,
-        |req: &_, resp| match classify(tailnet, req) {
+        |req: &_, resp| match classify(tailnet, port, req) {
             Ok(Class::Local) => check_origin(origin, req, resp),
             Ok(Class::Remote) => {
                 class = Class::Remote;
@@ -572,15 +582,19 @@ pub(crate) fn handle_connection(
     tailnet: Option<&Arc<Tailnet>>,
 ) -> Result<(), SinkError> {
     let mut stream = stream;
+    // One deadline from here to a valid `hello`: the look at the first bytes below, the handshake and the
+    // first message share it. A client that trickles its request head gets no second one.
+    let hello_by = Instant::now() + limits.hello;
     // The phone's browser opening the pairing link: a page, no WebSocket.
     if let Some(t) = tailnet {
-        if answer_plain_get(&mut stream, t, limits.hello, &waiting.pushed_out) != Plain::Handshake {
+        if answer_plain_get(&mut stream, t, hello_by, &waiting.pushed_out) != Plain::Handshake {
             return Ok(());
         }
     }
     let (mut ws, peer, class) = accept_ws(
         stream,
         origin,
+        hello_by,
         limits,
         Arc::clone(&waiting.pushed_out),
         tailnet.map(Arc::as_ref),

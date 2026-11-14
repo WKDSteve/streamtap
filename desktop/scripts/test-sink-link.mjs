@@ -45,6 +45,8 @@
 //                   says initlost and replays no stale init.
 //   mock-lost       content.js dropped an init (`lost` with drop) while the
 //                   worker keeps the previous one: initlost, media dropped.
+//   mock-retry-now  a link waiting for its next attempt tries at once when asked
+//                   to (a new pairing); one with a socket is left alone.
 //   mock-drain      the port closes while the socket connects and a payload
 //                   is still decoding: it is still sent, then the socket
 //                   closes.
@@ -504,6 +506,33 @@ const check = (ok, what) => {
     await tick();
     const got = await labels(ws);
     check(got === "H A" && ws.readyState === 3, `mock-drain: a socket opened after the cleanup sends its queue and closes (got ${got}, state ${ws.readyState})`);
+  }
+
+  // mock-retry-now: after a new pairing (tailnet-target.js calls it) a link that waits for its next attempt
+  // tries at once; a link that is connecting or connected is left alone.
+  {
+    const p = mkPort(21);
+    await tick();
+    const first = sockets.at(-1);
+    let count = sockets.length;
+    vm.runInContext("sinkRetryNow()", ctx);
+    await tick();
+    check(sockets.length === count, "mock-retry-now: a link that is connecting opens no second socket");
+    first.open();
+    await tick();
+    vm.runInContext("sinkRetryNow()", ctx);
+    await tick();
+    check(sockets.length === count, "mock-retry-now: a connected link opens no second socket");
+    first.close();
+    await tick();
+    const wait = linkOf(21).nextRetryAt - Date.now();
+    count = sockets.length;
+    vm.runInContext("sinkRetryNow()", ctx);
+    await tick();
+    check(wait > 500 && sockets.length === count + 1, `mock-retry-now: a waiting link (${wait} ms to go) opens its socket at once`);
+    check(linkOf(21).retryDelay === 1000, `mock-retry-now: the backoff starts over (got ${linkOf(21).retryDelay})`);
+    p.gone();
+    await tick();
   }
 
   // mock-backoff: the retry policy on a link's own state (no socket needed). The retry is due after the

@@ -60,6 +60,10 @@ target/release/streamtap-sink devices [pair | revoke <id>] (--token-stdin | --to
   the streamtap extension, whose id the manifest `key` fixes). A web page,
   another extension or a client without `Origin` gets `403` before anything
   is written.
+- The handshake's `Host` must name this sink: `127.0.0.1`, `localhost` or `[::1]` with the port it is bound
+  to (the port may only be missing on port 80, where a client leaves it out). A page whose own host name was
+  pointed at `127.0.0.1` (DNS rebinding) names that host and gets `403` too, whatever `Origin` it sends; so
+  does a request without `Host`. A client of your own that sets headers by hand sends `Host: 127.0.0.1:<port>`.
 - A token is required, from exactly one of two places (both: usage error,
   exit 2):
   - `--token-stdin` (what the app uses): the sink reads the first line of
@@ -207,7 +211,10 @@ tailscale serve --bg 17650                                   # https://<pc>.<tai
   proxy's `X-Forwarded-*` headers. Such a connection is a device's: its `Origin` must be an extension's
   (`moz-extension://…`, `chrome-extension://…`; a web page open on the phone stops at the handshake with `403`),
   and its first message must be `pair` or `login`. A forwarded request for any other host is refused, also when the
-  sink runs without `--tailnet`. Everything else is local and works as before (exact origin, token).
+  sink runs without `--tailnet`. Everything else is local and works as before (its `Host` a loopback name with
+  the sink's port, exact origin, token). With `--tailnet` the sink looks at the first bytes of every connection
+  (the pairing page below); that look, the handshake and the first message share the one deadline of
+  `--hello-timeout-secs`, so a client that trickles its request head gets no second one.
 - **Pairing** (`devices pair`, asked of the running sink over loopback with the token): a code of 128 bit, good for
   60 seconds and one use, shown as `https://<name>/#streamtap-pair=1&code=…` (the code is in the fragment, which a
   browser sends to no server), as a QR code of that link, and as plain text to type. Scan it with the phone's

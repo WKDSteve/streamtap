@@ -147,7 +147,9 @@ new pairing. The popup's line under the target always says what is: *not paired*
 PC does not answer* (PC off, sink not running with `--tailnet`, `tailscale serve` off, phone not in the tailnet),
 *revoked on the PC*, *another sink answers*, *another version*. While the PC does not answer, segments are dropped
 and counted (the *dropped* number in the popup), never kept without a bound; the add-on tries again with the next
-segments. After *revoked* or *another sink* it does not try again until you pair anew.
+segments. After *revoked* or *another sink* it does not try again until you pair anew; a capture that is
+running then logs in with the new key at once, without waiting for the rest of its pause between attempts (up to
+10 s).
 
 A pairing link counts only when it was opened as a page of its own over `https` on a plain host name; the add-on
 takes the host from the browser, shows it, and does nothing until you tap. Check the name in the popup: it must be

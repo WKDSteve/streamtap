@@ -279,6 +279,20 @@ const scheduleRetry = (link, stable) => {
   link.retryDelay = Math.min(link.retryDelay * 2, SINK_RETRY_MAX_MS);
 };
 
+// What a link connects with has changed for the better (a new pairing): every link that waits for its next
+// attempt tries now, instead of sitting out the rest of a backoff (up to 10 s) that the old state earned. A link
+// with a socket, or one that is connecting, is left alone.
+const sinkRetryNow = () => {
+  for (const links of sinkLinks.values()) {
+    for (const link of links.values()) {
+      if (link.ws || link.connecting) continue;
+      link.retryDelay = SINK_RETRY_MIN_MS;
+      link.nextRetryAt = 0;
+      linkConnect(link);
+    }
+  }
+};
+
 const linkConnect = async (link) => {
   // A gone link is never admitted again (overflow), so it opens no new
   // socket; its late items reach linkSend before its cleanup runs.

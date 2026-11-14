@@ -8,7 +8,7 @@
 //   pair-errors a bad host or code opens no socket; a refusal and a silent PC come back as their reason
 //   login       nothing but `login` leaves before the sink's ok; the signature verifies; then hello (no token), media
 //   hub         a sink with another id gets no signature, and no second attempt
-//   revoked     a refused device stops trying until it is paired again
+//   revoked     a refused device stops trying until it is paired again; then its waiting link tries at once
 //   unreachable a PC that does not answer drops the segments, counted, and says so
 //   not-paired  the target without a pairing opens no socket at all, never the local sink in its place
 //   offer       a pairing link counts only from a top-level https page of a plain host; the status never holds the code
@@ -275,10 +275,15 @@ const state = async (w) => (await w.run("tnStatus()")).state;
   await sleep(150);
   check(w.sink.sockets.length === before, "revoked: no further attempt");
   w.sink.mode = "ok";
-  check((await w.run(`tnPair("${HOST}", "${CODE}", "p")`)).ok === true && (await state(w)) === "idle", "revoked: a new pairing clears it");
+  // The link's own backoff doubled while it was refused (seconds by now): the new pairing ends the wait, the
+  // running link logs in with the new key at once, before any new segment.
+  const waiting = w.run("[...sinkLinks.get(3).values()].every((l) => !l.ws && l.nextRetryAt > Date.now() + 1000)");
   w.sink.heard.length = 0;
-  // The link's own backoff (it doubled while refused) runs out first.
-  await sleep(4500);
+  const soon = Date.now();
+  check((await w.run(`tnPair("${HOST}", "${CODE}", "p")`)).ok === true && (await state(w)) !== "revoked", "revoked: a new pairing clears it");
+  const loggedIn = await until(() => w.sink.heard.some((h) => h.type === "hello"));
+  check(waiting, "revoked: the link was waiting for its next attempt, more than a second away");
+  check(loggedIn && Date.now() - soon < 900, `revoked: the waiting link is in again at once after the new pairing (${Date.now() - soon} ms)`);
   p.post(seg("I2", true));
   p.post(seg("m9"));
   await until(() => w.sink.heard.some((h) => h.payload === "m9"));

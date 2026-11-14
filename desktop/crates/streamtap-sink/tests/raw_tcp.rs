@@ -67,7 +67,10 @@ impl Sink {
 
     fn connect(&self) -> Client {
         let s = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
-        Client { s }
+        Client {
+            s,
+            host: format!("127.0.0.1:{}", self.port),
+        }
     }
 
     /// Files and folders the sink wrote into its capture folder.
@@ -96,12 +99,15 @@ impl Drop for Sink {
 
 struct Client {
     s: TcpStream,
+    /// What the upgrade names as `Host`: the sink's address with its port, as a browser sends it.
+    host: String,
 }
 
 impl Client {
-    fn handshake_request(origin: &str) -> String {
+    fn handshake_request(&self, origin: &str) -> String {
+        let host = &self.host;
         format!(
-            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+            "GET / HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\
              Origin: {origin}\r\n\r\n"
         )
@@ -109,8 +115,9 @@ impl Client {
 
     /// The WebSocket upgrade; true on `101 Switching Protocols`.
     fn handshake(&mut self) -> bool {
+        let request = self.handshake_request(ORIGIN);
         self.s
-            .write_all(Self::handshake_request(ORIGIN).as_bytes())
+            .write_all(request.as_bytes())
             .expect("send the upgrade");
         self.s
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -215,6 +222,67 @@ fn binds_loopback_only() {
     assert!(sink.alive());
 }
 
+/// SRV-03: a local request must name this sink, a loopback name with the port it is bound to. A page whose own
+/// host name was pointed at 127.0.0.1 (DNS rebinding) names that host; it stops at the handshake although the
+/// origin is the allowed one, and with the token in hand it still writes nothing.
+#[test]
+fn a_handshake_for_another_host_is_refused() {
+    let sink = Sink::start("host", &[]);
+    let port = sink.port;
+    for host in [
+        format!("rebound.example:{port}"),
+        "rebound.example".to_owned(),
+        // The right name, but not this sink's port (another service of the machine), or none at all.
+        format!("127.0.0.1:{}", if port == 1 { 2 } else { 1 }),
+        "127.0.0.1".to_owned(),
+        format!("127.0.0.1:{port}.rebound.example"),
+        format!("127.0.0.1.rebound.example:{port}"),
+        format!("user@127.0.0.1:{port}"),
+        format!("127.0.0.2:{port}"),
+        String::new(),
+    ] {
+        let mut c = sink.connect();
+        c.host.clone_from(&host);
+        assert!(!c.handshake(), "Host {host:?} must be refused");
+        c.hello(TOKEN);
+        assert!(
+            c.closed_within(SOON),
+            "Host {host:?}: the connection stays open"
+        );
+    }
+    no_session(&sink);
+    // The names a client of this machine uses, in any case.
+    for host in [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("LocalHost:{port}"),
+        format!("[::1]:{port}"),
+    ] {
+        let mut c = sink.connect();
+        c.host.clone_from(&host);
+        assert!(c.handshake(), "Host {host:?} is this sink");
+    }
+}
+
+/// A request without any `Host` line is not a local client's either.
+#[test]
+fn a_handshake_without_a_host_is_refused() {
+    let sink = Sink::start("nohost", &[]);
+    let mut c = sink.connect();
+    let request = c
+        .handshake_request(ORIGIN)
+        .replace(&format!("Host: {}\r\n", c.host), "");
+    assert!(!request.contains("Host"));
+    c.s.write_all(request.as_bytes()).expect("send the upgrade");
+    let mut answer = [0u8; 12];
+    c.s.set_read_timeout(Some(SOON)).unwrap();
+    let _ = c.s.read_exact(&mut answer);
+    assert_ne!(&answer, b"HTTP/1.1 101", "no upgrade without a Host");
+    c.hello(TOKEN);
+    assert!(c.closed_within(SOON));
+    no_session(&sink);
+}
+
 #[test]
 fn silent_connection_is_closed_after_the_hello_timeout() {
     let sink = Sink::start("silent", &["--hello-timeout-secs", "1"]);
@@ -231,7 +299,7 @@ fn a_trickling_handshake_does_not_restart_the_deadline() {
     let sink = Sink::start("trickle", &["--hello-timeout-secs", "1"]);
     let mut c = sink.connect();
     let start = Instant::now();
-    let request = Client::handshake_request(ORIGIN);
+    let request = c.handshake_request(ORIGIN);
     let mut bytes = request.bytes();
     // One byte every 300 ms would keep a per-read timeout of 1 s alive for ever.
     let closed = loop {

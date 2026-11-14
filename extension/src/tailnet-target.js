@@ -190,6 +190,9 @@ const tnPair = async (hostValue, code, nameValue) => {
   tn.blocked = "";
   tn.state = "idle";
   tn.offer = null;
+  // A capture that is running waits for its next attempt (the sink link's backoff, up to 10 s): it logs in with
+  // the new key now.
+  if (typeof sinkRetryNow === "function") sinkRetryNow();
   return { ok: true, host };
 };
 

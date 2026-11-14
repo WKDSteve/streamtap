@@ -10,7 +10,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
@@ -624,6 +624,66 @@ fn silent_connections_do_not_hold_the_places() {
     );
     let device = Device::pair(&sink, 8);
     assert_eq!(device.login(&sink).0["type"], "ok");
+}
+
+/// With `--tailnet` the look at a connection's first bytes comes before the handshake. Both count against the
+/// one deadline of `hello`: a client that trickles its request head for most of the limit and then finishes the
+/// handshake has only the rest of it left, not a second limit.
+#[test]
+fn a_trickled_head_gets_no_second_deadline() {
+    const LIMIT: Duration = Duration::from_secs(3);
+    let sink = Sink::start(
+        "onedeadline",
+        &["--tailnet", NAME, "--hello-timeout-secs", "3"],
+    );
+    let mut s = TcpStream::connect(("127.0.0.1", sink.port)).expect("connect");
+    let started = Instant::now();
+    let head = format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: {ORIGIN}\r\n\r\n",
+        sink.port
+    );
+    let (first, rest) = head.split_at(head.len() / 2);
+    s.write_all(first.as_bytes()).expect("half the head");
+    // Two thirds of the limit pass before the head is complete.
+    std::thread::sleep(Duration::from_secs(2));
+    s.write_all(rest.as_bytes()).expect("the rest of the head");
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut answer = [0u8; 12];
+    s.read_exact(&mut answer).expect("the handshake's answer");
+    assert_eq!(&answer, b"HTTP/1.1 101", "the handshake itself is in time");
+    // No hello follows. The sink ends the connection when the one limit is over, 3 s after the connect; with
+    // a limit of its own for the handshake it would stay open until 5 s.
+    let mut sink_closed = false;
+    let mut buf = [0u8; 256];
+    while started.elapsed() < LIMIT + Duration::from_millis(1200) {
+        s.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        match s.read(&mut buf) {
+            Ok(0) => sink_closed = true,
+            Ok(_) => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue
+            }
+            Err(_) => sink_closed = true,
+        }
+        break;
+    }
+    assert!(
+        sink_closed,
+        "still open {:?} after the connect: the handshake started a limit of its own",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(2500),
+        "closed before the limit"
+    );
+    assert_eq!(sink.captures(), Vec::<String>::new());
 }
 
 #[test]

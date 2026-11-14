@@ -50,7 +50,13 @@ let proxy = null;
 const stop = (code) => {
   sink.kill();
   if (proxy) proxy.close();
-  rmSync(out, { recursive: true, force: true });
+  // Windows may still hold the files of the sink that was just ended: tried a few times, and a folder that
+  // stays (in the system's temp folder) never makes a run red that passed its checks.
+  try {
+    rmSync(out, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (e) {
+    console.error(`note: could not remove ${out}: ${e.code || e}`);
+  }
   // Not at once: on Windows Node aborts when it exits while a WebSocket of its own is still closing.
   process.exitCode = code;
   setTimeout(() => process.exit(code), 500);

@@ -307,7 +307,15 @@ pub(crate) fn forbidden(why: &str) -> ErrorResponse {
 /// Which way a handshake came. A request a proxy forwarded (Tailscale Serve adds `X-Forwarded-*` and, for a user of
 /// the tailnet, `Tailscale-*` headers) is remote whatever `Host` it claims, and is only taken for the name
 /// `--tailnet` gave: without the flag nothing forwarded gets to the token check at all.
-pub(crate) fn classify(tailnet: Option<&Tailnet>, req: &Request) -> Result<Class, &'static str> {
+///
+/// Everything else is local and must have asked for this sink by a loopback name and the port it is bound to
+/// (`is_loopback_host`, SRV-03): a page whose own host name was pointed at 127.0.0.1 (DNS rebinding) names
+/// that host, and stops here whatever `Origin` it sends.
+pub(crate) fn classify(
+    tailnet: Option<&Tailnet>,
+    port: u16,
+    req: &Request,
+) -> Result<Class, &'static str> {
     let host = req
         .headers()
         .get("host")
@@ -322,7 +330,33 @@ pub(crate) fn classify(tailnet: Option<&Tailnet>, req: &Request) -> Result<Class
     if forwarded {
         return Err("forwarded for a host this sink does not answer");
     }
+    if !host.is_some_and(|h| is_loopback_host(h, port)) {
+        return Err("asked for a host this sink does not answer");
+    }
     Ok(Class::Local)
+}
+
+/// The `Host` of a request to this sink over loopback: `127.0.0.1`, `localhost` or `[::1]` with the bound port.
+/// The port may only be left out where a client leaves it out, on port 80. Host names compare without case;
+/// nothing is trimmed or normalised beyond that (no trailing dot, no user info, no other spelling of the
+/// address).
+pub(crate) fn is_loopback_host(host: &[u8], port: u16) -> bool {
+    const NAMES: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
+    let Ok(host) = std::str::from_utf8(host) else {
+        return false;
+    };
+    let name = match host.rsplit_once(':') {
+        // `[::1]` without a port holds colons of its own.
+        Some((name, p)) if !p.ends_with(']') => {
+            if p != port.to_string() {
+                return false;
+            }
+            name
+        }
+        _ if port == 80 => host,
+        _ => return false,
+    };
+    NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
 }
 
 /// The origin of a remote handshake must be an extension's (`moz-extension://<id>`, `chrome-extension://<id>`): a
@@ -368,15 +402,15 @@ pub(crate) enum Plain {
 
 /// Answers a plain `GET` for the tailnet name (the phone's browser opening the pairing link) with a small page.
 /// Anything else (a WebSocket handshake, another host) is left unread for the handshake. A connection that sends no
-/// request head is held to the same rules as one that waits for `hello`: at most `limit`, and it gives way as soon
-/// as newer connections push it out, so silent connections cannot hold the places here either.
+/// request head is held to the same rules as one that waits for `hello`: until `until` at most (the deadline of
+/// the connection's `hello`, which the handshake after this shares), and it gives way as soon as newer
+/// connections push it out, so silent connections cannot hold the places here either.
 pub(crate) fn answer_plain_get(
     stream: &mut TcpStream,
     tailnet: &Tailnet,
-    limit: Duration,
+    until: Instant,
     pushed_out: &AtomicBool,
 ) -> Plain {
-    let until = Instant::now() + limit;
     let mut buf = [0u8; MAX_HEAD];
     let head = loop {
         let left = until.saturating_duration_since(Instant::now());
@@ -751,7 +785,12 @@ mod tests {
             idle: Duration::from_secs(3600),
             max_connections: 1,
         };
-        let mut timed = Timed::new(server, limits, Arc::new(AtomicBool::new(false)));
+        let mut timed = Timed::new(
+            server,
+            Instant::now() + limits.hello,
+            limits,
+            Arc::new(AtomicBool::new(false)),
+        );
         timed.worked();
         client.write_all(b"x").expect("write");
         let mut buf = [0u8; 1];

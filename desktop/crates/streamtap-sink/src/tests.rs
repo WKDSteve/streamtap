@@ -2068,6 +2068,50 @@ fn ffmpeg_runs_quiet_and_maps_every_input() {
     assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
 }
 
+/// SRV-03: which `Host` a local request may name.
+#[test]
+fn a_local_host_is_a_loopback_name_with_the_bound_port() {
+    for ok in [
+        "127.0.0.1:17650",
+        "localhost:17650",
+        "LOCALHOST:17650",
+        "[::1]:17650",
+    ] {
+        assert!(is_loopback_host(ok.as_bytes(), 17650), "{ok}");
+    }
+    for bad in [
+        "",
+        "127.0.0.1",
+        "localhost",
+        "[::1]",
+        "127.0.0.1:17651",
+        "127.0.0.1:017650",
+        "127.0.0.1:17650 ",
+        " 127.0.0.1:17650",
+        "127.0.0.1.:17650",
+        "localhost.:17650",
+        "127.1:17650",
+        "0.0.0.0:17650",
+        "::1:17650",
+        "[::1:17650",
+        "example.com:17650",
+        "127.0.0.1.example.com:17650",
+        "example.com@127.0.0.1:17650",
+        "127.0.0.1:17650:17650",
+        "127.0.0.1:",
+        ":17650",
+    ] {
+        assert!(!is_loopback_host(bad.as_bytes(), 17650), "{bad:?}");
+    }
+    assert!(!is_loopback_host(&[0xff, b':', b'1'], 1), "not UTF-8");
+    // Port 80 is the one a client leaves out.
+    for ok in ["127.0.0.1", "localhost", "[::1]", "127.0.0.1:80"] {
+        assert!(is_loopback_host(ok.as_bytes(), 80), "{ok}");
+    }
+    assert!(!is_loopback_host(b"example.com", 80));
+    assert!(!is_loopback_host(b"127.0.0.1:8080", 80));
+}
+
 #[test]
 fn printable_strips_terminal_escapes() {
     assert_eq!(
