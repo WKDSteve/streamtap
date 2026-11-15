@@ -102,41 +102,14 @@ function Invoke-Child([string] $Script, [string[]] $Arguments, [string] $Shell =
 }
 
 # Run the UninstallString of the Settings > Apps entry: the program it names, with what follows as it
-# stands, and --yes (no window asks, the output and the exit code are the answer). The temp folder of
-# the program is one of the test: the app moves its own file there.
+# stands, and --yes (no window asks, the output and the exit code are the answer); the release kit's
+# runner (uninstall-entry.ps1). The temp folder of the program is one of the test: the app moves its own
+# file there.
+. (Join-Path $here 'uninstall-entry.ps1')
 function Invoke-Entry([string] $Command) {
-    if ($Command -notmatch '^"([^"]+)"(.*)$') { return [pscustomobject]@{ Code = -1; Text = "not a command: $Command" } }
-    $exe = $Matches[1]
-    $arguments = @($Matches[2].Trim(), '--yes')
-    if ($elevated) { $arguments += '--allow-elevated' }
-    $info = New-Object Diagnostics.ProcessStartInfo
-    $info.FileName = $exe
-    $info.Arguments = $arguments -join ' '
-    $info.UseShellExecute = $false
-    $info.CreateNoWindow = $true
-    $info.RedirectStandardOutput = $true
-    $info.RedirectStandardError = $true
-    $info.StandardOutputEncoding = [Text.Encoding]::UTF8
-    $info.StandardErrorEncoding = [Text.Encoding]::UTF8
-    # From inside the folder that is to go, as a terminal standing in it would.
-    $info.WorkingDirectory = Split-Path -Parent $exe
-    $info.EnvironmentVariables.Remove('CLAUDECODE')
-    $info.EnvironmentVariables['TEMP'] = $script:appTemp
-    $info.EnvironmentVariables['TMP'] = $script:appTemp
-    $process = [Diagnostics.Process]::Start($info)
-    try {
-        $out = $process.StandardOutput.ReadToEndAsync()
-        $err = $process.StandardError.ReadToEndAsync()
-        # A window that asks would wait for ever: that is a failure, not a hang of the test.
-        if (-not $process.WaitForExit(60000)) {
-            $process.Kill()
-            return [pscustomobject]@{ Code = -1; Text = 'did not end within a minute (does a window ask?)' }
-        }
-        return [pscustomobject]@{ Code = $process.ExitCode; Text = ($out.Result + $err.Result) }
-    }
-    finally {
-        $process.Dispose()
-    }
+    $extra = @('--yes')
+    if ($elevated) { $extra += '--allow-elevated' }
+    return Invoke-UninstallEntry -Command $Command -Temp $script:appTemp -Extra $extra
 }
 
 # Every file below $Dir, relative, sorted, as one text: the shape of a folder.
@@ -192,7 +165,7 @@ function Get-ExtensionShipped([string] $Dir) {
 function Test-Archive([string] $Path, [string] $Programs, [string] $Label, [string] $Title) {
     $names = Get-ZipEntryName $Path
     $expected = @('bin/streamtap-app.exe', 'bin/streamtap-sink.exe', 'bin/streamtap-host.exe',
-        'install.ps1', 'uninstall.ps1', 'LICENSE', 'README.md', 'VERSION') + (Get-ExtensionShipped (Join-Path $root 'extension'))
+        'install.ps1', 'uninstall-entry.ps1', 'uninstall.ps1', 'LICENSE', 'README.md', 'VERSION') + (Get-ExtensionShipped (Join-Path $root 'extension'))
     $missing = @($expected | Where-Object { $names -cnotcontains $_ })
     $unexpected = @($names | Where-Object { $expected -cnotcontains $_ })
     Write-Check ($missing.Count -eq 0 -and $unexpected.Count -eq 0) "$Title holds exactly the programs, the extension files, the scripts, LICENSE, README.md and VERSION"
@@ -212,6 +185,7 @@ function Test-Archive([string] $Path, [string] $Programs, [string] $Label, [stri
     }
     Write-Check $same "$Title carries the bytes of the programs"
     $sources = @{ 'install.ps1' = (Join-Path $here 'install.ps1'); 'uninstall.ps1' = (Join-Path $here 'uninstall.ps1'); 'LICENSE' = (Join-Path $root 'LICENSE')
+        'uninstall-entry.ps1' = (Join-Path $here 'uninstall-entry.ps1')
         'README.md' = (Join-Path $here 'release-readme.md') }
     # Every file of the extension, not just two of them.
     foreach ($rel in Get-ExtensionShipped (Join-Path $root 'extension')) { $sources[$rel.Replace('/', '\')] = Join-Path $root $rel.Replace('/', '\') }
@@ -239,7 +213,7 @@ function Test-ExtensionComplete([string] $ExtensionDir) {
 function Copy-FakeRoot([string] $Name) {
     $fake = Join-Path $tmp $Name
     New-Item -ItemType Directory -Path (Join-Path $fake 'scripts'), (Join-Path $fake 'desktop\crates\streamtap-app') | Out-Null
-    foreach ($file in 'package-release.ps1', 'install.ps1', 'uninstall.ps1', 'release-readme.md') {
+    foreach ($file in 'package-release.ps1', 'install.ps1', 'uninstall-entry.ps1', 'uninstall.ps1', 'release-readme.md') {
         Copy-Item -LiteralPath (Join-Path $here $file) -Destination (Join-Path $fake "scripts\$file")
     }
     foreach ($file in 'Cargo.toml', 'tauri.conf.json') {
@@ -456,8 +430,8 @@ try {
     Write-Check ($r.Code -eq 0) 'install.ps1 of the unpacked zip installs'
     if ($r.Code -ne 0) { Write-Output $r.Text }
     $installedTree = @(Get-ChildItem -LiteralPath $install -Recurse -File | ForEach-Object { $_.FullName.Substring($install.Length + 1).Replace('\', '/') } | Sort-Object)
-    $zipTree = @(Get-ZipEntryName $zip1 | Where-Object { $_ -cne 'install.ps1' } | Sort-Object)
-    Write-Check (($installedTree -join '|') -ceq ($zipTree -join '|')) 'the install holds exactly the zip but install.ps1'
+    $zipTree = @(Get-ZipEntryName $zip1 | Where-Object { $_ -cne 'install.ps1' -and $_ -cne 'uninstall-entry.ps1' } | Sort-Object)
+    Write-Check (($installedTree -join '|') -ceq ($zipTree -join '|')) 'the install holds exactly the zip but install.ps1 and uninstall-entry.ps1'
     $entry = Get-ItemProperty -LiteralPath "$regRoot\Microsoft\Windows\CurrentVersion\Uninstall\streamtap" -ErrorAction SilentlyContinue
     Write-Check ($null -ne $entry -and $entry.DisplayVersion -eq $version -and $entry.InstallLocation -eq $install) 'the Settings > Apps entry says the version of the zip'
     Write-Check (Test-ExtensionComplete (Join-Path $install 'extension')) 'the installed extension is complete: Load unpacked can take it'
@@ -465,6 +439,10 @@ try {
     Write-Check ($null -ne $entry -and $entry.UninstallString -ceq $entryCommand) 'the entry runs the installed app with --uninstall (the places only because they are not the account''s own)'
     if ($null -ne $entry -and $entry.UninstallString -cne $entryCommand) { Write-Output "  it is: $($entry.UninstallString)" }
     Write-Check ($null -ne $entry -and $entry.UninstallString -notmatch '(powershell|pwsh|cmd)\.exe|\.ps1|-File') 'and names no PowerShell, no shell and no script'
+    $problems = @(Test-UninstallEntry -RegistryRoot $regRoot -Name 'streamtap' -DisplayName 'streamtap' -Version $version -InstallDir $install `
+            -App (Join-Path $install 'bin\streamtap-app.exe') -StartMenuDir $startMenu -DesktopDir $desktopDir)
+    Write-Check ($problems.Count -eq 0) 'the entry is the one of the release kit'
+    if ($problems.Count) { $problems | ForEach-Object { Write-Output "  $_" } }
     $r = Invoke-Child (Join-Path $install 'uninstall.ps1') $places
     Write-Check ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $install) -and -not (Test-Path -LiteralPath (Join-Path $startMenu 'streamtap.lnk'))) 'the installed uninstall.ps1 removes it all'
     Write-Check (-not (Test-Path -LiteralPath $entryKey)) 'and the Settings > Apps entry'

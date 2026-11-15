@@ -316,8 +316,9 @@ try {
     Write-Check ($r.Code -eq 0) 'install again (build-install.ps1 in Windows PowerShell 5.1)'
     if ($r.Code -ne 0) { Write-Output $r.Text }
     Write-Check ($r.Text -notmatch 'Edge:' -and $r.Text -match 'Chrome:') 'only the browser of the other copy is named (a non-ASCII path in a UTF-8 manifest)'
-    $expectedTree = Get-Tree $payload | Where-Object { $_ -ne 'install.ps1' }
-    Write-Check ((@(Get-Tree $install) -join '|') -ceq (@($expectedTree) -join '|')) 'the install holds exactly the payload but install.ps1'
+    # install.ps1 and the text of the entry it writes (uninstall-entry.ps1) stay in the payload.
+    $expectedTree = Get-Tree $payload | Where-Object { $_ -ne 'install.ps1' -and $_ -ne 'uninstall-entry.ps1' }
+    Write-Check ((@(Get-Tree $install) -join '|') -ceq (@($expectedTree) -join '|')) 'the install holds exactly the payload but install.ps1 and uninstall-entry.ps1'
 
     # 4a. A newer release drops a file of the extension: the installed copy of it goes, the rest stays.
     $stale = Join-Path $install 'extension\src\gone-in-this-release.js'

@@ -9,6 +9,7 @@ scripts\install.ps1 installs, in the layout it installs it:
   bin\streamtap-app.exe, streamtap-sink.exe, streamtap-host.exe
   extension\   the files Chrome needs (manifest.json, popup\, src\, icons\), no tests, no README, no keys
   install.ps1  installs this zip's content for the current user
+  uninstall-entry.ps1 (the Settings > Apps entry install.ps1 writes; appkit's release kit),
   uninstall.ps1, LICENSE, README.md (how to install), VERSION
 
 The zip is reproducible: entries are sorted, use forward slashes and a fixed timestamp, so the
@@ -278,6 +279,7 @@ try {
 
     Copy-Into (Join-Path $PSScriptRoot 'install.ps1') 'install.ps1'
     Copy-Into (Join-Path $PSScriptRoot 'uninstall.ps1') 'uninstall.ps1'
+    Copy-Into (Join-Path $PSScriptRoot 'uninstall-entry.ps1') 'uninstall-entry.ps1'
     Copy-Into (Join-Path $root 'LICENSE') 'LICENSE'
     Copy-Into (Join-Path $PSScriptRoot 'release-readme.md') 'README.md'
     # LF and no BOM: it is read by install.ps1 and by people.

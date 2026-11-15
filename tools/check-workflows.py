@@ -62,6 +62,9 @@ CI_RUNS_ON = """${{ github.event_name == 'pull_request' && 'windows-latest' || f
 # machine cannot run (the extension sheet needs Playwright's full Chromium, which does not start there).
 HOSTED_CI_JOBS = {"extension-sheet": "ubuntu-latest"}
 WRITERS = {"ci.yml": set(), "release.yml": {"publish"}, "rolling.yml": {"prepare", "publish"}}
+# The jobs whose release-kit publish attests the files (appkit >= v0.48): they, and only they, hold the OIDC token.
+ATTESTERS = {"ci.yml": set(), "release.yml": {"publish"}, "rolling.yml": {"publish"}}
+ATTEST = ("id-token", "attestations")
 TIP_IF = "${{ steps.tip.outputs.current == 'true' }}"
 
 
@@ -360,12 +363,18 @@ def check_common(name, text, wf):
             problems.append(f"{name}: job {job} has permissions {perms!r}; list them one by one")
             continue
         for key, value in perms.items():
+            if key in ATTEST:
+                if value != "write" or job not in ATTESTERS.get(name, set()):
+                    problems.append(f"{name}: job {job} has the permission {key}: {value}, which no job here needs")
+                continue
             if key not in ("contents", "actions") or value not in ("read", "write"):
                 problems.append(f"{name}: job {job} has the permission {key}: {value}, which no job here needs")
             elif value == "write" and not (key == "contents" and job in writers):
                 problems.append(f"{name}: job {job} has {key}: write; only {' and '.join(sorted(writers)) or 'no job'} may write")
         if job in writers and perms.get("contents") != "write":
             problems.append(f"{name}: job {job} needs contents: write")
+        if job in ATTESTERS.get(name, set()) and any(perms.get(key) != "write" for key in ATTEST):
+            problems.append(f"{name}: job {job} needs id-token: write and attestations: write (the release-kit attests)")
     for job in writers:
         if job in jobs and jobs[job].get("permissions") is None:
             problems.append(f"{name}: job {job} needs contents: write")

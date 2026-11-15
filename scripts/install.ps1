@@ -11,7 +11,8 @@ exactly what that folder holds:
   %LOCALAPPDATA%\streamtap\           uninstall.ps1, LICENSE, README.md, VERSION
 
 plus a Start menu entry "streamtap" and an entry in Settings > Apps (which runs the installed app as
-"streamtap-app.exe --uninstall": no PowerShell and no console window). No administrator rights. The files are all copied first and then swapped in; a copy
+"streamtap-app.exe --uninstall": no PowerShell and no console window; uninstall-entry.ps1 beside this
+script, appkit's release kit, writes it and is not installed). No administrator rights. The files are all copied first and then swapped in; a copy
 or a swap that fails puts the old ones back, so the install is never a mix of versions. An install
 from an earlier build-install.ps1 (programs directly in the install folder) is moved to bin\.
 
@@ -80,7 +81,7 @@ $programs = @('streamtap-app', 'streamtap-sink', 'streamtap-host')
 $hostName = 'io.github.wkdsteve.streamtap'
 $browsers = [ordered]@{ Chrome = 'Google\Chrome'; Edge = 'Microsoft\Edge'; Brave = 'BraveSoftware\Brave-Browser' }
 # What a payload may hold at its top: anything else is refused (a folder that is not a release).
-$topLevel = @('bin', 'extension', 'install.ps1', 'uninstall.ps1', 'LICENSE', 'README.md', 'VERSION')
+$topLevel = @('bin', 'extension', 'install.ps1', 'uninstall-entry.ps1', 'uninstall.ps1', 'LICENSE', 'README.md', 'VERSION')
 
 function Exit-Install([string] $Message) {
     throw "install.ps1: $Message"
@@ -204,11 +205,12 @@ if ((Test-Path -LiteralPath $InstallDir -PathType Container) -and -not (Test-Ins
     Exit-Install "$InstallDir holds files but no streamtap install: nothing was installed; use an empty folder (-InstallDir) or none"
 }
 
-# Everything in the payload but this script goes, with its place relative to the install folder.
+# Everything in the payload but this script and the text of the entry it writes (uninstall-entry.ps1) goes,
+# with its place relative to the install folder.
 $payloadPrefix = $PayloadDir + '\'
 $files = @(Get-ChildItem -LiteralPath $PayloadDir -Recurse -File -Force |
         ForEach-Object { [pscustomobject]@{ From = $_.FullName; Name = $_.FullName.Substring($payloadPrefix.Length) } } |
-        Where-Object { $_.Name -cne 'install.ps1' })
+        Where-Object { $_.Name -cne 'install.ps1' -and $_.Name -cne 'uninstall-entry.ps1' })
 
 Write-Output "==> copying streamtap $version to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -309,41 +311,11 @@ if ($DesktopShortcut) {
 # its own process, and asks in a window (crates/streamtap-app/src/uninstall.rs). No PowerShell is
 # started and no console window shows. The install is the folder above the app's bin\; the other
 # places are named only when they are not the user's own (a test, a folder of your choice).
-$uninstallKey = "$RegistryRoot\Microsoft\Windows\CurrentVersion\Uninstall\streamtap"
-Write-Output "==> Settings > Apps entry ($uninstallKey)"
-$command = "`"$app`" --uninstall"
-# An account without such a folder (a service account) has no place of its own to compare with.
-$ownStartMenu = [Environment]::GetFolderPath('Programs')
-$ownDesktop = [Environment]::GetFolderPath('Desktop')
-if (-not $ownStartMenu -or $StartMenuDir -ne $ownStartMenu.TrimEnd('\')) { $command += " --start-menu-dir `"$StartMenuDir`"" }
-if (-not $ownDesktop -or $DesktopDir -ne $ownDesktop.TrimEnd('\')) { $command += " --desktop-dir `"$DesktopDir`"" }
-if ($RegistryRoot -ne 'HKCU:\Software') { $command += " --registry-root `"$RegistryRoot`"" }
-$size = [int](((Get-ChildItem -LiteralPath $InstallDir -Recurse -File | Measure-Object -Property Length -Sum).Sum) / 1KB)
-# There is one entry: an install in another folder loses it (its files stay there), so say so.
-$previous = Get-ItemProperty -LiteralPath $uninstallKey -ErrorAction SilentlyContinue
-$previousDir = ''
-if ($previous -and $previous.PSObject.Properties['InstallLocation']) { $previousDir = ([string]$previous.InstallLocation).TrimEnd('\') }
-if ($previousDir -and $previousDir -ne $InstallDir) {
-    Write-Output "the Settings > Apps entry was for the install in $previousDir; it now names this one, that copy stays:"
-    Write-Output "  remove it with: & `"$(Join-Path $previousDir 'uninstall.ps1')`" -InstallDir `"$previousDir`""
-}
-if (Test-Path -LiteralPath $uninstallKey) { Remove-Item -LiteralPath $uninstallKey -Recurse -Force }
-New-Item -Path $uninstallKey -Force | Out-Null
-$values = [ordered]@{
-    DisplayName     = 'streamtap'
-    DisplayVersion  = [string]$version
-    Publisher       = 'WKDSteve'
-    InstallLocation = $InstallDir
-    DisplayIcon     = "$app,0"
-    UninstallString = $command
-}
-foreach ($k in $values.Keys) {
-    New-ItemProperty -LiteralPath $uninstallKey -Name $k -Value $values[$k] -PropertyType String -Force | Out-Null
-}
-foreach ($k in 'NoModify', 'NoRepair') {
-    New-ItemProperty -LiteralPath $uninstallKey -Name $k -Value 1 -PropertyType DWord -Force | Out-Null
-}
-New-ItemProperty -LiteralPath $uninstallKey -Name 'EstimatedSize' -Value $size -PropertyType DWord -Force | Out-Null
+# The text of the entry is the release kit's (appkit release-kit/scripts/uninstall-entry.ps1), shipped beside
+# this script; tools/check-release-kit-copy.py holds the copy to the kit.
+. (Join-Path $PSScriptRoot 'uninstall-entry.ps1')
+Set-UninstallEntry -RegistryRoot $RegistryRoot -Name 'streamtap' -DisplayName 'streamtap' -Version ([string]$version) `
+    -InstallDir $InstallDir -App $app -StartMenuDir $StartMenuDir -DesktopDir $DesktopDir
 
 Write-Output ''
 Write-Output "installed streamtap $version to $InstallDir"

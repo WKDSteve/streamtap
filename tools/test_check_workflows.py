@@ -1,6 +1,7 @@
 """Tests of tools/check-workflows.py: the rules hold for the real workflows, and each rule fails
 without what it asks for (a sabotage of the real text must be found)."""
 
+import re
 import importlib.util
 import pathlib
 import subprocess
@@ -16,11 +17,23 @@ spec.loader.exec_module(check)
 
 CHECKOUT = "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"
 KIT = "WKDSteve/appkit/release-kit"
-PIN = "518092716d00fb3fc18ce1b418032f71c3414817"
 
 
 def real():
     return {p.name: p.read_text(encoding="utf-8") for p in sorted(WORKFLOWS.glob("*.yml"))}
+
+
+# The commit the kit's actions are pinned by, as the release workflow has it: read, not written down, so a bump of
+# appkit does not have to touch the tests.
+PIN = re.search(rf"{KIT}/publish@([0-9a-f]{{40}})", real()["release.yml"]).group(1)
+
+
+# The token of a publish job: it writes the release and attests its files (appkit's release-kit).
+PUBLISH_PERMISSIONS = (
+    "    permissions:\n      contents: write\n"
+    "      id-token: write        # the attestation of the files (appkit release-kit, see its README)\n"
+    "      attestations: write\n"
+)
 
 
 def sabotaged(name, old, new, count=1):
@@ -171,6 +184,18 @@ class Rules(unittest.TestCase):
     def test_a_write_right_for_the_whole_release_is_found(self):
         self.found(sabotaged("release.yml", "permissions:\n  contents: read\n\nenv:", "permissions:\n  contents: write\n\nenv:"), "whole workflow")
 
+    def test_a_publish_job_that_may_not_attest_is_found(self):
+        for scope in ("id-token", "attestations"):
+            for name in ("release.yml", "rolling.yml"):
+                line = next(l for l in real()[name].splitlines(keepends=True) if l.strip().startswith(scope + ":"))
+                self.found(sabotaged(name, line, ""), "needs id-token: write and attestations: write")
+
+    def test_an_attestation_right_that_is_only_read_is_found(self):
+        self.found(sabotaged("release.yml", "      attestations: write", "      attestations: read"), "no job here needs")
+
+    def test_the_rolling_prepare_job_may_not_attest(self):
+        self.found(sabotaged("rolling.yml", "    permissions:\n      contents: write\n", "    permissions:\n      contents: write\n      id-token: write\n"), "no job here needs")
+
     def test_a_release_without_top_level_permissions_is_found(self):
         self.found(sabotaged("release.yml", "permissions:\n  contents: read\n\nenv:", "env:"), "whole workflow")
 
@@ -181,7 +206,7 @@ class Rules(unittest.TestCase):
         self.found(sabotaged("release.yml", "permissions:\n  contents: read\n\nenv:", "permissions:\n  actions: read\n  contents: read\n\nenv:"), "whole workflow")
 
     def test_a_job_with_write_all_is_found(self):
-        self.found(sabotaged("release.yml", "    permissions:\n      contents: write\n", "    permissions: write-all\n"), "list them one by one")
+        self.found(sabotaged("release.yml", PUBLISH_PERMISSIONS, "    permissions: write-all\n"), "list them one by one")
 
     def test_another_write_right_in_a_job_is_found(self):
         self.found(sabotaged("release.yml", "    timeout-minutes: 40\n", "    timeout-minutes: 40\n    permissions:\n      packages: write\n"), "no job here needs")
@@ -205,7 +230,7 @@ class Rules(unittest.TestCase):
         self.found(sabotaged("ci.yml", "permissions:\n  contents: read\n\nconcurrency:", "concurrency:"), "whole workflow")
 
     def test_a_publish_job_without_write_is_found(self):
-        self.found(sabotaged("release.yml", "    permissions:\n      contents: write\n", ""), "needs contents: write")
+        self.found(sabotaged("release.yml", PUBLISH_PERMISSIONS, ""), "needs contents: write")
 
     # the release
     def test_a_release_that_publishes_is_found(self):
