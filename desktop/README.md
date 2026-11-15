@@ -689,8 +689,11 @@ Security:
   canonical form must lie directly inside the canonical captures folder.
   Delete additionally refuses a live capture or one that is being muxed.
 - Children are started without a shell and, on Windows, without a console
-  window (`CREATE_NO_WINDOW`). Open result / Open folder start `explorer.exe`
-  with the path as one argument. The sink binds 127.0.0.1 only (its own rule).
+  window (`CREATE_NO_WINDOW`). Open result / Open folder start no program on
+  Windows: the app asks the shell in its own process (`ShellExecuteExW`, a
+  folder through `SHOpenFolderAndSelectItems`); on macOS and Linux `open` /
+  `xdg-open` gets the path as one argument. The sink binds 127.0.0.1 only (its
+  own rule).
 - The token is random per install (std `RandomState`, seeded by the OS, mixed
   with time and pid) and is never logged (sink output is scrubbed of it). The
   app starts the sink as `serve --token-stdin --port <p> --out <dir>`, writes
@@ -756,7 +759,10 @@ Security:
 
 The header's **Phones** panel is the app's side of
 [Phones over the tailnet](#phones-over-the-tailnet-tailscale-or-headscale): it starts the sink with `--tailnet`,
-shows a phone's pairing code and lists and revokes the paired phones. The sink does the work; the app asks it.
+shows a phone's pairing code and lists and revokes the paired phones. The sink does the work; the app asks it,
+in its own process: a WebSocket to the sink on loopback with the extension's origin and one `control` message with
+the token, as `streamtap-sink devices` does (no child process per question). The QR code of the link is made by the
+app.
 
 - **Name of this PC in the tailnet** (`tailnet` in `config.json`; absent while empty, the default): a plain host name, lower case,
   no `https://`, no port (`pc.example.ts.net`; with Headscale `pc.<base_domain>`). A pasted address is cut down to

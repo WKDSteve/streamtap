@@ -670,34 +670,30 @@ fn phone_target(shared: &AppState) -> CmdResult<(u16, secret::Token, String)> {
 }
 
 /// A one-time pairing code of the running sink, as a link, its QR code and the code to type.
-fn phone_pairing(shared: &AppState, exe: &Path) -> CmdResult<phones::Pairing> {
+fn phone_pairing(shared: &AppState) -> CmdResult<phones::Pairing> {
     let (port, token, tailnet) = phone_target(shared)?;
-    phones::pairing_of(
-        &phones::ask(exe, port, &token, &phones::Op::Pair)?,
-        &tailnet,
-    )
+    phones::pairing_of(&phones::ask(port, &token, &phones::Op::Pair)?, &tailnet)
 }
 
 /// The phones paired with the running sink.
-fn phone_list(shared: &AppState, exe: &Path) -> CmdResult<Vec<phones::Phone>> {
+fn phone_list(shared: &AppState) -> CmdResult<Vec<phones::Phone>> {
     let (port, token, _) = phone_target(shared)?;
-    phones::phones_of(&phones::ask(exe, port, &token, &phones::Op::List)?)
+    phones::phones_of(&phones::ask(port, &token, &phones::Op::List)?)
 }
 
 /// Revokes one phone: the sink forgets it and closes its connections; the others and the token stay.
-fn phone_revoked(shared: &AppState, exe: &Path, id: &str) -> CmdResult<()> {
+fn phone_revoked(shared: &AppState, id: &str) -> CmdResult<()> {
     let (port, token, _) = phone_target(shared)?;
-    phones::ask(exe, port, &token, &phones::Op::Revoke(id.to_owned())).map(|_| ())
+    phones::ask(port, &token, &phones::Op::Revoke(id.to_owned())).map(|_| ())
 }
 
-/// Runs a question to the sink off the async runtime: it waits for a child process.
+/// Runs a question to the sink off the async runtime: it waits for the sink's answer on a socket.
 async fn phone_job<T: Send + 'static>(
     state: State<'_, AppState>,
-    job: impl FnOnce(&AppState, &Path) -> CmdResult<T> + Send + 'static,
+    job: impl FnOnce(&AppState) -> CmdResult<T> + Send + 'static,
 ) -> CmdResult<T> {
-    let exe = sink::find_sink().ok_or("streamtap-sink was not found next to the app")?;
     let shared = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || job(&shared, &exe))
+    tauri::async_runtime::spawn_blocking(move || job(&shared))
         .await
         .map_err(|e| format!("the question to the sink was interrupted: {e}"))?
 }
@@ -714,7 +710,7 @@ async fn phone_devices(state: State<'_, AppState>) -> CmdResult<Vec<phones::Phon
 
 #[tauri::command]
 async fn phone_revoke(state: State<'_, AppState>, id: String) -> CmdResult<()> {
-    phone_job(state, move |shared, exe| phone_revoked(shared, exe, &id)).await
+    phone_job(state, move |shared| phone_revoked(shared, &id)).await
 }
 
 fn main() -> ExitCode {
@@ -1279,25 +1275,23 @@ mod tests {
         const NAME: &str = "pc.example.ts.net";
         let sink = built_sink();
         let (st, dir) = state("e2e-phones");
-        assert!(phone_list(&st, &sink).unwrap_err().contains("tailnet"));
+        assert!(phone_list(&st).unwrap_err().contains("tailnet"));
         {
             let mut g = st.lock();
             g.settings.port = free_port();
             g.settings.captures_dir = dir.join("captures");
             g.settings.tailnet = NAME.into();
         }
-        assert_eq!(phone_list(&st, &sink).unwrap_err(), "start the sink first");
+        assert_eq!(phone_list(&st).unwrap_err(), "start the sink first");
         launch_sink(&st, &sink).expect("start the sink");
-        let pairing = wait_for("a pairing code of the sink", || {
-            phone_pairing(&st, &sink).ok()
-        });
+        let pairing = wait_for("a pairing code of the sink", || phone_pairing(&st).ok());
         assert_eq!(pairing.tailnet, NAME);
         assert_eq!(
             pairing.link,
             format!("https://{NAME}/#streamtap-pair=1&code={}", pairing.code)
         );
         assert!(pairing.qr.len() >= 21 && pairing.qr.iter().all(|r| r.len() == pairing.qr.len()));
-        assert_eq!(phone_list(&st, &sink).unwrap(), Vec::new());
+        assert_eq!(phone_list(&st).unwrap(), Vec::new());
 
         // A phone: the tailnet name as Host, the proxy's header, an add-on's origin; its key is the curve's base point.
         let port = st.lock().settings.port;
@@ -1330,7 +1324,7 @@ mod tests {
         assert_eq!(said["type"], "paired", "{said}");
         let id = said["device"].as_str().unwrap().to_owned();
 
-        let list = phone_list(&st, &sink).unwrap();
+        let list = phone_list(&st).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(
             (list[0].id.as_str(), list[0].name.as_str()),
@@ -1342,16 +1336,13 @@ mod tests {
         let token = st.lock().settings.token.expose().to_owned();
         assert!(st.lock().log.iter().all(|l| !l.contains(&token)));
 
-        phone_revoked(&st, &sink, &id).expect("revoke");
-        assert_eq!(phone_list(&st, &sink).unwrap(), Vec::new());
-        let again = phone_revoked(&st, &sink, &id).unwrap_err();
+        phone_revoked(&st, &id).expect("revoke");
+        assert_eq!(phone_list(&st).unwrap(), Vec::new());
+        let again = phone_revoked(&st, &id).unwrap_err();
         assert!(again.contains("no paired device"), "{again}");
-        assert_eq!(
-            phone_revoked(&st, &sink, "--port").unwrap_err(),
-            "not a device id"
-        );
+        assert_eq!(phone_revoked(&st, "--port").unwrap_err(), "not a device id");
         st.shutdown();
-        assert_eq!(phone_list(&st, &sink).unwrap_err(), "start the sink first");
+        assert_eq!(phone_list(&st).unwrap_err(), "start the sink first");
         fs::remove_dir_all(&dir).unwrap();
     }
 

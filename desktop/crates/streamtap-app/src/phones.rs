@@ -1,31 +1,29 @@
-//! Phones over the tailnet: what the app asks the running sink (`streamtap-sink devices ... --json`).
+//! Phones over the tailnet: what the app asks the running sink.
 //!
-//! The sink keeps the paired phones and makes the pairing codes; the app only asks it, through the sink's own
-//! command line: a short-lived child process that talks to the running sink over loopback with the token, which it
-//! gets on stdin like the sink itself (never on a command line). Its answer is one line of JSON, read up to a limit
-//! and checked field by field before the page sees it: a phone chose its own name.
+//! The sink keeps the paired phones and makes the pairing codes; the app only asks it, the way the sink's own
+//! command line (`streamtap-sink devices`) does, but in its own process: a WebSocket to the sink on loopback with the
+//! extension's origin and one `control` message that carries the token. No child process is started for a question.
+//! The answer is one message of JSON, read up to a limit and checked field by field before the page sees it: a phone
+//! chose its own name.
 
-use std::io::Read;
-use std::path::Path;
-use std::process::Stdio;
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::secret::Token;
-use crate::sink;
 
-/// How long one question may take (the command line itself gives up after 10 s).
-const ASK_TIMEOUT: Duration = Duration::from_secs(15);
-const WAIT_POLL: Duration = Duration::from_millis(25);
-/// The most of the answer that is read; 16 devices and a QR code are a few KiB.
-const MAX_ANSWER: u64 = 64 * 1024;
-const MAX_STDERR: u64 = 4 * 1024;
+/// How long one question may take: the connection, the handshake and the answer together.
+const ASK_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most of the answer that is read; 16 devices are a few KiB.
+const MAX_ANSWER: usize = 64 * 1024;
 /// The most devices a sink keeps (appkit's limit); more in an answer is not an answer of the sink.
 const MAX_PHONES: usize = 16;
-/// The largest QR code has 177 modules a side.
-const MAX_QR: usize = 177;
 const MAX_NAME: usize = 60;
+/// The origin the sink takes on loopback (its `--allow-origin`, which the app never changes): the extension's.
+fn sink_origin() -> &'static str {
+    streamtap_host::proto::ALLOWED_ORIGIN.trim_end_matches('/')
+}
 
 /// Whether `name` is a machine's name in a tailnet as the sink's `--tailnet` takes it: a plain host name in lower
 /// case with a dot, no scheme, no port (`pc.example.ts.net`; with Headscale `pc.<base_domain>`).
@@ -93,102 +91,119 @@ fn clean_name(name: &str) -> String {
         .to_owned()
 }
 
-/// Runs `exe devices ... --json` against the sink on `port` and returns its answer.
-pub(crate) fn ask(
-    exe: &Path,
-    port: u16,
-    token: &Token,
-    op: &Op,
-) -> Result<serde_json::Value, String> {
-    let mut args: Vec<String> = vec!["devices".into()];
-    match op {
-        Op::Pair => args.push("pair".into()),
-        Op::List => {}
+/// Asks the sink on `port` (loopback) and returns its answer, an answer with `ok` true.
+pub(crate) fn ask(port: u16, token: &Token, op: &Op) -> Result<serde_json::Value, String> {
+    let (op_word, device) = match op {
+        Op::Pair => ("pair", ""),
+        Op::List => ("devices", ""),
         Op::Revoke(id) => {
-            // Checked before it is an argument: nothing but an id goes into the command line.
+            // Checked before it is sent: nothing but an id goes to the sink.
             if !is_id(id) {
                 return Err("not a device id".into());
             }
-            args.extend(["revoke".into(), id.clone()]);
+            ("revoke", id.as_str())
         }
-    }
-    args.extend([
-        "--json".into(),
-        "--token-stdin".into(),
-        "--port".into(),
-        port.to_string(),
-    ]);
-    let mut child = sink::command(exe)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot start streamtap-sink: {e}"))?;
-    let handed_over = child
-        .stdin
-        .take()
-        .ok_or_else(|| std::io::Error::other("no stdin pipe"))
-        .and_then(|stdin| sink::hand_over_token(stdin, token));
-    // Both pipes are read on threads of their own, so a child that writes much never blocks, and a child that
-    // hangs is ended by the deadline below.
-    let read = |pipe: Option<Box<dyn Read + Send>>, limit: u64| {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(p) = pipe {
-                let _ = p.take(limit).read_to_string(&mut text);
-            }
-            text
-        })
     };
-    let out = read(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        MAX_ANSWER,
-    );
-    let err = read(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        MAX_STDERR,
-    );
+    let request = serde_json::json!({ "type": "control", "token": token.expose(), "op": op_word, "device": device });
+    let answer = exchange(port, &request)?;
+    if answer["ok"] != true {
+        return Err(answer["error"]
+            .as_str()
+            .unwrap_or("the sink refused")
+            .chars()
+            .take(300)
+            .collect());
+    }
+    if matches!(op, Op::Revoke(_)) && answer["revoked"] != true {
+        return Err(format!("no paired device has the id {device}"));
+    }
+    Ok(answer)
+}
+
+/// One `control` message to the sink and its answer. Every step is bounded by what is left of [`ASK_TIMEOUT`].
+fn exchange(port: u16, request: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use tungstenite::client::IntoClientRequest;
     let until = Instant::now() + ASK_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if handed_over.is_ok() && Instant::now() < until => {
-                std::thread::sleep(WAIT_POLL);
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
+    let left = || {
+        until
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| "the sink did not answer in time".to_owned())
     };
-    let (out, err) = (
-        out.join().unwrap_or_default(),
-        err.join().unwrap_or_default(),
+    let stream = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), left()?)
+        .map_err(|_| format!("no sink answers on 127.0.0.1:{port}"))?;
+    let set_timeouts = |stream: &TcpStream| -> Result<(), String> {
+        let d = left()?;
+        stream
+            .set_read_timeout(Some(d))
+            .and_then(|()| stream.set_write_timeout(Some(d)))
+            .map_err(|e| format!("cannot set a timeout: {e}"))
+    };
+    set_timeouts(&stream)?;
+    let mut req = format!("ws://127.0.0.1:{port}/")
+        .into_client_request()
+        .map_err(|e| e.to_string())?;
+    req.headers_mut().insert(
+        "origin",
+        tungstenite::http::HeaderValue::from_static(sink_origin()),
     );
-    if let Err(e) = handed_over {
-        return Err(format!("cannot hand the token to streamtap-sink: {e}"));
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_ANSWER))
+        .max_frame_size(Some(MAX_ANSWER));
+    let (mut ws, _) = tungstenite::client::client_with_config(req, stream, Some(config))
+        .map_err(|e| format!("the sink on 127.0.0.1:{port} refused the connection ({e})"))?;
+    // The sink's framing: the length of the JSON header (u32, little endian), the header, no payload.
+    let header = request.to_string().into_bytes();
+    let mut frame = u32::try_from(header.len())
+        .map_err(|_| "request too large".to_owned())?
+        .to_le_bytes()
+        .to_vec();
+    frame.extend_from_slice(&header);
+    ws.send(tungstenite::Message::binary(frame))
+        .map_err(|e| format!("cannot ask the sink: {e}"))?;
+    loop {
+        set_timeouts(ws.get_ref())?;
+        match ws.read() {
+            Ok(tungstenite::Message::Text(t)) => {
+                let _ = ws.close(None);
+                return serde_json::from_str(t.as_str())
+                    .map_err(|_| "the sink's answer is not JSON".to_owned());
+            }
+            Ok(tungstenite::Message::Close(_)) => return Err(
+                "the sink closed without an answer: a wrong token, or a sink older than this app"
+                    .into(),
+            ),
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err("the sink did not answer in time".into())
+            }
+            Err(_) => return Err(
+                "the sink closed without an answer: a wrong token, or a sink older than this app"
+                    .into(),
+            ),
+        }
     }
-    let Some(status) = status else {
-        return Err("the sink did not answer in time".into());
-    };
-    if !status.success() {
-        // The command line says why on stderr (`devices: ...`); the token is never part of it.
-        let why = err.trim().trim_start_matches("devices: ");
-        return Err(if why.is_empty() {
-            "the sink did not answer".into()
-        } else {
-            why.chars().take(300).collect()
-        });
-    }
-    serde_json::from_str(out.trim()).map_err(|_| "the sink's answer is not JSON".to_owned())
+}
+
+/// The modules of the QR code of `text`, one string of `1` (dark) and `0` per row, without a quiet zone (as the
+/// sink's `devices pair --json` makes them).
+fn qr_rows(text: &str) -> Result<Vec<String>, String> {
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M)
+        .map_err(|_| "the pairing link is too long for a QR code".to_owned())?;
+    Ok(code
+        .to_colors()
+        .chunks(code.width())
+        .map(|row| {
+            row.iter()
+                .map(|c| if *c == qrcode::Color::Dark { '1' } else { '0' })
+                .collect()
+        })
+        .collect())
 }
 
 /// The pairing in the sink's answer, for the tailnet name the app started the sink with.
@@ -203,23 +218,12 @@ pub(crate) fn pairing_of(answer: &serde_json::Value, tailnet: &str) -> Result<Pa
             "the sink answers for another tailnet name than the one in the settings".into(),
         );
     }
-    let qr: Vec<String> = answer["qr"]
-        .as_array()
-        .ok_or_else(bad)?
-        .iter()
-        .filter_map(|r| r.as_str().map(str::to_owned))
-        .collect();
-    let square = (21..=MAX_QR).contains(&qr.len())
-        && qr
-            .iter()
-            .all(|r| r.len() == qr.len() && r.bytes().all(|c| c == b'0' || c == b'1'));
-    if !square {
-        return Err(bad());
-    }
+    // Made here from the checked parts, not taken from the answer.
+    let link = format!("https://{tailnet}/#streamtap-pair=1&code={code}");
+    let qr = qr_rows(&link)?;
     Ok(Pairing {
         tailnet: tailnet.to_owned(),
-        // Made here from the checked parts, not taken from the answer.
-        link: format!("https://{tailnet}/#streamtap-pair=1&code={code}"),
+        link,
         code: code.to_owned(),
         ttl: answer["ttl"].as_u64().unwrap_or(60).min(600),
         qr,
@@ -277,51 +281,122 @@ mod tests {
         }
     }
 
-    fn qr(n: usize) -> Vec<String> {
-        vec!["10".repeat(n).chars().take(n).collect(); n]
-    }
-
     #[test]
-    fn a_pairing_is_checked_and_its_link_is_made_here() {
+    fn a_pairing_is_checked_and_its_link_and_qr_code_are_made_here() {
         let code = "0123456789abcdef0123456789abcdef";
-        let good = json!({ "ok": true, "tailnet": "pc.example.ts.net", "code": code, "ttl": 60, "qr": qr(33),
-            "link": "https://evil.example/#streamtap-pair=1&code=x" });
+        let good = json!({ "ok": true, "tailnet": "pc.example.ts.net", "code": code, "ttl": 60,
+            "qr": ["1"], "link": "https://evil.example/#streamtap-pair=1&code=x" });
         let p = pairing_of(&good, "pc.example.ts.net").expect("a pairing");
         assert_eq!(
             p.link,
             format!("https://pc.example.ts.net/#streamtap-pair=1&code={code}")
         );
-        assert_eq!((p.ttl, p.qr.len()), (60, 33));
+        assert_eq!(p.qr, qr_rows(&p.link).unwrap());
+        assert!(p.qr.len() >= 21 && p.qr.iter().all(|r| r.len() == p.qr.len()));
+        assert_eq!(p.ttl, 60);
         assert_eq!(format!("{p:?}"), "Pairing(pc.example.ts.net, code hidden)");
         assert!(pairing_of(&good, "other.example.ts.net").is_err());
         for (what, bad) in [
-            (
-                "no code",
-                json!({ "tailnet": "pc.example.ts.net", "qr": qr(33) }),
-            ),
+            ("no code", json!({ "tailnet": "pc.example.ts.net" })),
             (
                 "a code of another form",
-                json!({ "tailnet": "pc.example.ts.net", "code": "<b>", "qr": qr(33) }),
-            ),
-            (
-                "no QR code",
-                json!({ "tailnet": "pc.example.ts.net", "code": code }),
-            ),
-            (
-                "a QR code that is not square",
-                json!({ "tailnet": "pc.example.ts.net", "code": code, "qr": ["101", "010"] }),
-            ),
-            (
-                "a QR code with other characters",
-                json!({ "tailnet": "pc.example.ts.net", "code": code, "qr": vec!["x".repeat(21); 21] }),
-            ),
-            (
-                "a QR code larger than any",
-                json!({ "tailnet": "pc.example.ts.net", "code": code, "qr": qr(178) }),
+                json!({ "tailnet": "pc.example.ts.net", "code": "<b>" }),
             ),
         ] {
             assert!(pairing_of(&bad, "pc.example.ts.net").is_err(), "{what}");
         }
+    }
+
+    /// A stand-in for the running sink on loopback: takes one WebSocket, hands its `Origin` and its first message
+    /// to `seen`, and answers with `answer` (or closes without one).
+    // The handshake callback's error type is tungstenite's, not ours.
+    #[allow(clippy::result_large_err)]
+    fn fake_sink(
+        answer: Option<serde_json::Value>,
+    ) -> (u16, std::thread::JoinHandle<(String, serde_json::Value)>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut origin = String::new();
+            let mut ws = tungstenite::accept_hdr(
+                stream,
+                |req: &tungstenite::handshake::server::Request,
+                 res: tungstenite::handshake::server::Response| {
+                    origin = req.headers()["origin"].to_str().unwrap().to_owned();
+                    Ok(res)
+                },
+            )
+            .unwrap();
+            let data = loop {
+                if let tungstenite::Message::Binary(b) = ws.read().unwrap() {
+                    break b;
+                }
+            };
+            let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+            let header: serde_json::Value = serde_json::from_slice(&data[4..4 + len]).unwrap();
+            match answer {
+                Some(a) => ws.send(tungstenite::Message::text(a.to_string())).unwrap(),
+                None => {
+                    let _ = ws.close(None);
+                }
+            }
+            let _ = ws.flush();
+            // Until the app is done with the connection.
+            while ws.read().is_ok() {}
+            (origin, header)
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn the_app_asks_the_sink_itself_over_loopback_with_the_token_in_the_message() {
+        let token = Token::from("0123456789abcdef0123");
+        let (port, sink) = fake_sink(Some(
+            json!({ "ok": true, "tailnet": "pc.example.ts.net", "devices": [] }),
+        ));
+        let answer = ask(port, &token, &Op::List).expect("an answer");
+        assert_eq!(answer["devices"], json!([]));
+        let (origin, header) = sink.join().unwrap();
+        assert_eq!(
+            origin,
+            "chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia"
+        );
+        assert_eq!(
+            header,
+            json!({ "type": "control", "token": "0123456789abcdef0123", "op": "devices", "device": "" })
+        );
+
+        let id = "ab".repeat(16);
+        let (port, sink) = fake_sink(Some(json!({ "ok": true, "revoked": false })));
+        let err = ask(port, &token, &Op::Revoke(id.clone())).unwrap_err();
+        assert_eq!(err, format!("no paired device has the id {id}"));
+        assert_eq!(sink.join().unwrap().1["op"], "revoke");
+
+        let (port, sink) = fake_sink(Some(
+            json!({ "ok": false, "error": "this sink was started without --tailnet" }),
+        ));
+        assert_eq!(
+            ask(port, &token, &Op::Pair).unwrap_err(),
+            "this sink was started without --tailnet"
+        );
+        assert_eq!(sink.join().unwrap().1["op"], "pair");
+
+        let (port, sink) = fake_sink(None);
+        assert!(ask(port, &token, &Op::List)
+            .unwrap_err()
+            .contains("closed without an answer"));
+        sink.join().unwrap();
+    }
+
+    #[test]
+    fn no_sink_on_the_port_is_an_error_not_a_wait() {
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let token = Token::from("0123456789abcdef0123");
+        let err = ask(port, &token, &Op::List).unwrap_err();
+        assert!(err.contains("no sink answers"), "{err}");
     }
 
     #[test]
@@ -362,12 +437,7 @@ mod tests {
     fn only_an_id_becomes_an_argument() {
         let token = Token::from("0123456789abcdef0123");
         for id in ["--port", "x", "", "AB".repeat(16).as_str()] {
-            let err = ask(
-                Path::new("no-such-program"),
-                1,
-                &token,
-                &Op::Revoke(id.into()),
-            );
+            let err = ask(1, &token, &Op::Revoke(id.into()));
             assert_eq!(err.unwrap_err(), "not a device id", "{id:?}");
         }
     }

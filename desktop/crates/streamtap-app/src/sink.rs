@@ -401,22 +401,16 @@ pub(crate) fn run_mux(sink: &Path, dir: &Path, register: impl FnOnce(&Arc<MuxHan
     )
 }
 
-/// Opens a file or folder with the system's default handler. The program is
-/// started directly with the path as its only argument (no shell).
+/// Opens a file or folder with the system's default handler. On Windows the app asks the shell itself
+/// (`ShellExecuteExW`; a folder is shown through `SHOpenFolderAndSelectItems`): no `explorer.exe` and no other
+/// program is started by the app. The call runs on a thread of its own, which ends with it: the shell
+/// initialises COM on the calling thread, and no thread of the async runtime is left with that.
+/// Elsewhere `open` (macOS) or `xdg-open` gets the path as its only argument (no shell).
 pub(crate) fn open_path(path: &Path) -> Result<(), String> {
-    #[cfg(windows)]
-    let program = "explorer.exe";
-    #[cfg(target_os = "macos")]
-    let program = "open";
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    let program = "xdg-open";
-    command(program)
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+    let target = path.to_owned();
+    std::thread::spawn(move || open::that_detached(&target))
+        .join()
+        .map_err(|_| format!("cannot open {}: the call failed", path.display()))?
         .map_err(|e| format!("cannot open {}: {e}", path.display()))
 }
 

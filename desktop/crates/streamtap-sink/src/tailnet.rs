@@ -620,7 +620,7 @@ fn qr_rows(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// `--json`: the sink's answer as one line of JSON on stdout, for a program (the desktop app) in place of the
+/// `--json`: the sink's answer as one line of JSON on stdout, for a program or a script in place of the
 /// text for a person. A pairing also carries its link and the modules of the link's QR code (`qr`).
 fn print_json(op: &str, device: &str, mut answer: serde_json::Value) -> Result<(), SinkError> {
     if op == "pair" {
