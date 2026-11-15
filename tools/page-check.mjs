@@ -224,18 +224,20 @@ try {
       check("popup in German: no sideways scrolling on the phone", sideways <= 0, `${sideways}px`);
       await axe(p, "popup target-tailnet, phone, light, German");
       if (shots) await shoot(p, devices[1], "target-tailnet-phone-light-de");
-      // The way there and back in a real browser: a tap on an entry, then the browser's own back.
+      // The way there and back in a real browser: a tap on an entry, then the browser's own back. A tap changes
+      // the hash; the page follows in the `hashchange` event, after the click has returned: each check waits for
+      // the state it names (up to 5 s) instead of reading it at once, which a loaded runner loses.
+      const until = (fn) => p.waitForFunction(fn, null, { timeout: 5000 }).then(() => true, () => false);
       await p.goto(popup_url);
       await p.click("#nav-sources");
-      check("popup: a tap on an entry opens its page", await p.evaluate(() => !document.getElementById("page-sources").hidden && document.getElementById("page-home").hidden));
-      check("popup: focus is on the way back", await p.evaluate(() => document.activeElement.id === "back-sources"));
+      check("popup: a tap on an entry opens its page", await until(() => !document.getElementById("page-sources").hidden && document.getElementById("page-home").hidden));
+      check("popup: focus is on the way back", await until(() => document.activeElement.id === "back-sources"));
       await p.goBack();
-      check("popup: the browser's back key returns to the start page", await p.evaluate(() => !document.getElementById("page-home").hidden && document.getElementById("page-sources").hidden));
+      check("popup: the browser's back key returns to the start page", await until(() => !document.getElementById("page-home").hidden && document.getElementById("page-sources").hidden));
       await p.click("#nav-about");
+      await until(() => !document.getElementById("page-about").hidden);
       await p.click("#back-about");
-      const home = await p
-        .waitForFunction(() => !document.getElementById("page-home").hidden && location.hash === "", null, { timeout: 5000 })
-        .then(() => true, () => false);
+      const home = await until(() => !document.getElementById("page-home").hidden && location.hash === "");
       check("popup: the page's own back returns to the start page", home);
     } finally {
       await ctx.close();

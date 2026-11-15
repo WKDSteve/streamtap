@@ -58,6 +58,7 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { createServer } from "node:net";
 import vm from "node:vm";
 import { splitFmp4 } from "./fmp4-split.mjs";
 
@@ -116,6 +117,8 @@ const check = (ok, what) => {
   Object.assign(FakeSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
   const sockets = [];
   const gates = new Map(); // data: URL -> promise its decode waits for
+  // Decodes and settings reads still running: `tick` waits for them instead of for a fixed time.
+  let inflight = 0;
   let connect = null;
   const ctx = vm.createContext({
     console,
@@ -125,15 +128,39 @@ const check = (ok, what) => {
     WebSocket: FakeSocket,
     fetch: async (u) => {
       if (gates.has(u)) await gates.get(u);
-      return fetch(u);
+      inflight++;
+      try {
+        // Read here, so the link's own `arrayBuffer()` of the answer has nothing left to wait for.
+        return new Response(await (await fetch(u)).arrayBuffer());
+      } finally {
+        inflight--;
+      }
     },
     chrome: {
       runtime: { onConnect: { addListener: (f) => (connect = f) } },
-      storage: { local: { get: (d, cb) => setTimeout(() => cb({ ...d, sinkPort: 1, sinkToken: "t" }), 0) } },
+      storage: {
+        local: {
+          get: (d, cb) => {
+            inflight++;
+            setTimeout(() => {
+              inflight--;
+              cb({ ...d, sinkPort: 1, sinkToken: "t" });
+            }, 0);
+          },
+        },
+      },
     },
   });
   vm.runInContext(linkSrc, ctx, { filename: "sink-link.js" });
-  const tick = () => sleep(30);
+  // One step of the link settles: 30 ms, then until no decode and no settings read is open (a gated decode is
+  // not waited for: a scenario holds it on purpose), then a few turns for what they start. A loaded runner gets
+  // there later, never wrong.
+  const tick = async () => {
+    await sleep(30);
+    const deadline = Date.now() + 10_000;
+    while (inflight > 0 && Date.now() < deadline) await sleep(5);
+    for (let i = 0; i < 3; i++) await sleep(0);
+  };
   const mkPort = (tabId) => {
     const p = {};
     connect({
@@ -652,15 +679,34 @@ const newDirs = (prefix) => {
   seen = new Set(all);
   return fresh;
 };
-// How long a reconnect takes is the machine's business: wait for the directory, then for what follows it to land.
-const waitForDirs = async (prefix, n) => {
-  const deadline = Date.now() + 30_000;
+// How long a socket, a reconnect or a write takes is the machine's business (16 runners share one PC): the
+// scenarios wait for the state they need, up to 30 s each, and never for a fixed time that a loaded runner misses.
+const waitUntil = async (cond, ms = 30_000) => {
+  const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
-    if (readdirSync(captures).filter((d) => !seen.has(d) && d.includes(prefix)).length >= n) break;
-    await sleep(100);
+    if (cond()) return true;
+    await sleep(50);
   }
-  await sleep(1000);
+  return cond();
 };
+// The tab's socket is open and has taken at least `n` frames (init chunks and media; not hello, not events).
+const sentAtLeast = (tab, n) => () => {
+  const s = status(tab);
+  return !!s && s.connected && s.sent >= n;
+};
+// Complete lines of a capture's index (a line the sink is still writing does not count).
+const rowCount = (d) => {
+  const file = join(captures, d, "index.jsonl");
+  return existsSync(file) ? readFileSync(file, "utf8").split("\n").length - 1 : 0;
+};
+// The fresh directories of `prefix` (oldest first) hold at least `want[i]` rows each, and there are no more of them.
+const waitForRows = (prefix, want) =>
+  waitUntil(() => {
+    const dirs = readdirSync(captures)
+      .filter((d) => !seen.has(d) && d.includes(prefix))
+      .sort();
+    return dirs.length === want.length && dirs.every((d, i) => rowCount(d) >= want[i]);
+  });
 const half = Math.ceil(segments.length / 2);
 
 // --- reconnect --------------------------------------------------------------
@@ -668,13 +714,13 @@ const half = Math.ceil(segments.length / 2);
   const p = fakePort(1, "reconnect-a");
   seg(p, init, true);
   for (const s of segments.slice(0, half)) seg(p, s, false);
-  await sleep(800);
+  await waitUntil(sentAtLeast(1, 1 + half));
   check(status(1).connected && status(1).dropped === 0, `reconnect: phase 1 sent, nothing dropped (${JSON.stringify(status(1))})`);
   closeSockets(1);
   await sleep(1300); // past the first retry delay
   for (const s of segments.slice(half)) seg(p, s, false);
   p.onMessage({ t: "event", header: { name: "endofstream", sb: null } });
-  await waitForDirs("reconnec", 2);
+  await waitForRows("reconnec", [1 + half, 1 + segments.length - half]);
   check(status(1).dropped === 0, `reconnect: phase 2 sent, nothing dropped (${JSON.stringify(status(1))})`);
   p.onDisconnect();
   await sleep(500);
@@ -690,14 +736,23 @@ const half = Math.ceil(segments.length / 2);
 
 // --- first-fail -------------------------------------------------------------
 {
-  portOverride = port + 1; // nothing listens there: the first socket fails
+  // A port that was free a moment ago: nothing listens there, so the first socket fails. Not `port + 1`, where
+  // the sink of another runner on the same PC may listen.
+  portOverride = await new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port: free } = probe.address();
+      probe.close(() => resolve(free));
+    });
+  });
   const p = fakePort(2, "firstfail-a");
   seg(p, init, true);
-  await sleep(600);
+  await waitUntil(() => status(2).dropped >= 1);
   check(!status(2).connected && status(2).dropped >= 1, `first-fail: first socket failed, init dropped (${JSON.stringify(status(2))})`);
   await sleep(1300);
   for (const s of segments.slice(0, 2)) seg(p, s, false);
-  await sleep(800);
+  await waitForRows("firstfai", [3]);
   p.onDisconnect();
   await sleep(500);
   const dirs = newDirs("firstfai");
@@ -713,14 +768,14 @@ const half = Math.ceil(segments.length / 2);
   const p = fakePort(3, "switch-a");
   seg(p, init, true, "A");
   seg(p, segments[0], false);
-  await sleep(800);
+  await waitUntil(sentAtLeast(3, 2));
   closeSockets(3);
   await sleep(1300);
   // Queued while the new socket connects: old media, then the new init and new media.
   seg(p, segments[1], false);
   seg(p, init, true, "B");
   seg(p, segments[2], false);
-  await waitForDirs("switch-a", 2);
+  await waitForRows("switch-a", [2, 4]);
   p.onDisconnect();
   await sleep(500);
   const dirs = newDirs("switch-a");
@@ -743,11 +798,11 @@ const half = Math.ceil(segments.length / 2);
   p.onMessage({ t: "segment", header: header(true, false, init), payload: dataUrl(init.subarray(0, cut)) });
   p.onMessage({ t: "segment", header: header(false, true, init), payload: dataUrl(init.subarray(cut)) });
   p.onMessage({ t: "segment", header: header(false, false, segments[0]), payload: dataUrl(segments[0]) });
-  await sleep(800);
+  await waitUntil(sentAtLeast(4, 3));
   closeSockets(4);
   await sleep(1300);
   p.onMessage({ t: "segment", header: header(false, false, segments[1]), payload: dataUrl(segments[1]) });
-  await waitForDirs("splitrep", 2);
+  await waitForRows("splitrep", [3, 3]);
   p.onDisconnect();
   await sleep(500);
   const dirs = newDirs("splitrep");
@@ -764,7 +819,7 @@ const half = Math.ceil(segments.length / 2);
   const p = fakePort(5, "evicted-a");
   seg(p, init, true);
   seg(p, segments[0], false);
-  await sleep(800);
+  await waitUntil(sentAtLeast(5, 2));
   // What a full kept-init budget leaves behind: no kept copy, the link marked.
   vm.runInThisContext(`{ const l = [...sinkLinks.get(5).values()][0]; linkKeep(l, 1, null); l.evicted.add(1); }`);
   closeSockets(5);
@@ -777,9 +832,9 @@ const half = Math.ceil(segments.length / 2);
   seg(p, segments[1], false);
   seg(p, init, true);
   seg(p, segments[2], false);
-  await sleep(1000);
+  await waitUntil(() => status(5).connected);
   seg(p, segments[3], false);
-  await sleep(800);
+  await waitForRows("evicted-", [2, 3]);
   p.onDisconnect();
   await sleep(500);
   const dirs = newDirs("evicted-");
@@ -802,7 +857,7 @@ const half = Math.ceil(segments.length / 2);
   seg(p, segments[0], false);
   seg(p, init, true);
   seg(p, segments[1], false);
-  await sleep(1000);
+  await waitForRows("unkept-a", [2]);
   p.onDisconnect();
   await sleep(500);
   const dirs = newDirs("unkept-a");
@@ -827,7 +882,7 @@ const half = Math.ceil(segments.length / 2);
   ports[0].onDisconnect();
   await sleep(300);
   seg(extra, init, true);
-  await sleep(800);
+  await waitUntil(() => status(200).connected);
   check(status(200).connected, "limit: the parked port connects once a slot is free");
   for (const p of ports.slice(1)) p.onDisconnect();
   extra.onDisconnect();
