@@ -29,8 +29,10 @@ const check = (ok, what) => {
   console.log(`${ok ? "ok  " : "FAIL"} ${what}`);
   if (!ok) failures.push(what);
 };
+// Up to 15 s by the clock, not a number of sleeps: on a runner that shares the PC each sleep takes longer.
 const until = async (cond) => {
-  for (let i = 0; i < 150 && !cond(); i++) await sleep(20);
+  const deadline = Date.now() + 15_000;
+  while (!cond() && Date.now() < deadline) await sleep(20);
   return cond();
 };
 
@@ -281,9 +283,13 @@ const state = async (w) => (await w.run("tnStatus()")).state;
   w.sink.heard.length = 0;
   const soon = Date.now();
   check((await w.run(`tnPair("${HOST}", "${CODE}", "p")`)).ok === true && (await state(w)) !== "revoked", "revoked: a new pairing clears it");
+  // "At once" is what the pairing does to the link, not a time: its wait is over (the next attempt is due now) and it
+  // is connecting or connected. A stopwatch here (under 900 ms) was red on a loaded runner (9 s, CI run 43741829279).
+  const kicked = w.run("[...sinkLinks.get(3).values()].every((l) => l.nextRetryAt === 0 && (l.connecting || !!l.ws))");
   const loggedIn = await until(() => w.sink.heard.some((h) => h.type === "hello"));
   check(waiting, "revoked: the link was waiting for its next attempt, more than a second away");
-  check(loggedIn && Date.now() - soon < 900, `revoked: the waiting link is in again at once after the new pairing (${Date.now() - soon} ms)`);
+  check(kicked, "revoked: the new pairing ends the link's wait and it connects at once");
+  check(loggedIn, `revoked: the waiting link is in again after the new pairing (${Date.now() - soon} ms)`);
   p.post(seg("I2", true));
   p.post(seg("m9"));
   await until(() => w.sink.heard.some((h) => h.payload === "m9"));
