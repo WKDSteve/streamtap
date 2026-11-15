@@ -17,11 +17,13 @@ mod phones;
 mod registration;
 mod secret;
 mod sink;
+#[cfg(windows)]
+mod uninstall;
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, ExitCode, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -715,7 +717,12 @@ async fn phone_revoke(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     phone_job(state, move |shared, exe| phone_revoked(shared, exe, &id)).await
 }
 
-fn main() {
+fn main() -> ExitCode {
+    // What the entry in Settings > Apps runs: the app removes its install and never opens its window.
+    #[cfg(windows)]
+    if std::env::args().skip(1).any(|arg| arg == "--uninstall") {
+        return appkit_uninstall::run(&uninstall::PRODUCT, std::env::args().skip(1));
+    }
     let app = tauri::Builder::default()
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
@@ -765,6 +772,7 @@ fn main() {
             }
         }
     });
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

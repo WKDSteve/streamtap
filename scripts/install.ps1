@@ -10,8 +10,8 @@ exactly what that folder holds:
   %LOCALAPPDATA%\streamtap\extension\ the browser extension, to be loaded unpacked in Chrome
   %LOCALAPPDATA%\streamtap\           uninstall.ps1, LICENSE, README.md, VERSION
 
-plus a Start menu entry "streamtap" and an entry in Settings > Apps (which runs the installed
-uninstall.ps1). No administrator rights. The files are all copied first and then swapped in; a copy
+plus a Start menu entry "streamtap" and an entry in Settings > Apps (which runs the installed app as
+"streamtap-app.exe --uninstall": no PowerShell and no console window). No administrator rights. The files are all copied first and then swapped in; a copy
 or a swap that fails puts the old ones back, so the install is never a mix of versions. An install
 from an earlier build-install.ps1 (programs directly in the install folder) is moved to bin\.
 
@@ -305,13 +305,19 @@ if ($DesktopShortcut) {
     $desk.Save()
 }
 
-# The entry of Settings > Apps runs the copy of uninstall.ps1 with the places of this install.
+# The entry of Settings > Apps runs the installed app itself: it removes the install it lies in, in
+# its own process, and asks in a window (crates/streamtap-app/src/uninstall.rs). No PowerShell is
+# started and no console window shows. The install is the folder above the app's bin\; the other
+# places are named only when they are not the user's own (a test, a folder of your choice).
 $uninstallKey = "$RegistryRoot\Microsoft\Windows\CurrentVersion\Uninstall\streamtap"
 Write-Output "==> Settings > Apps entry ($uninstallKey)"
-$ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-# -PauseOnError: Settings opens a console window that would close before an error could be read.
-$command = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`"" +
-" -InstallDir `"$InstallDir`" -StartMenuDir `"$StartMenuDir`" -DesktopDir `"$DesktopDir`" -RegistryRoot `"$RegistryRoot`" -PauseOnError"
+$command = "`"$app`" --uninstall"
+# An account without such a folder (a service account) has no place of its own to compare with.
+$ownStartMenu = [Environment]::GetFolderPath('Programs')
+$ownDesktop = [Environment]::GetFolderPath('Desktop')
+if (-not $ownStartMenu -or $StartMenuDir -ne $ownStartMenu.TrimEnd('\')) { $command += " --start-menu-dir `"$StartMenuDir`"" }
+if (-not $ownDesktop -or $DesktopDir -ne $ownDesktop.TrimEnd('\')) { $command += " --desktop-dir `"$DesktopDir`"" }
+if ($RegistryRoot -ne 'HKCU:\Software') { $command += " --registry-root `"$RegistryRoot`"" }
 $size = [int](((Get-ChildItem -LiteralPath $InstallDir -Recurse -File | Measure-Object -Property Length -Sum).Sum) / 1KB)
 # There is one entry: an install in another folder loses it (its files stay there), so say so.
 $previous = Get-ItemProperty -LiteralPath $uninstallKey -ErrorAction SilentlyContinue

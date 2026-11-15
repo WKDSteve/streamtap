@@ -113,7 +113,16 @@ function Test-SameProgram([string] $Dir, [string] $From) {
     return $true
 }
 
-# Run the UninstallString of the Settings > Apps entry the way Windows does: the command line as it
+# The installed copy of uninstall.ps1 as one command line of Windows PowerShell 5.1, with the places
+# of this install and -PauseOnError: the way of a console window that closes when the script ends.
+# (The entry of Settings > Apps runs the app itself; scripts/test-release.ps1 runs that with a real
+# build. The programs here are stand-ins and remove nothing.)
+function Get-ScriptLine {
+    "`"$windowsPowerShell`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $install 'uninstall.ps1')`"" +
+    " -InstallDir `"$install`" -StartMenuDir `"$startMenu`" -DesktopDir `"$desktop`" -RegistryRoot `"$regRoot`" -PauseOnError"
+}
+
+# Run a command line the way Windows does: as it
 # stands, not split into arguments here. Enter is pressed after $EnterAfterMs (a pause on an error
 # waits for it); Waited says whether the process was still there then.
 function Invoke-CommandLine([string] $CommandLine, [int] $EnterAfterMs = 0, [string] $WorkDir = '') {
@@ -282,7 +291,10 @@ try {
     $version = (Get-Content -LiteralPath (Join-Path (Split-Path -Parent $here) 'desktop\crates\streamtap-app\tauri.conf.json') -Raw | ConvertFrom-Json).version
     Write-Check ($null -ne $entry -and $entry.DisplayName -eq 'streamtap' -and $entry.DisplayVersion -eq $version -and $entry.InstallLocation -eq $install) 'the Settings > Apps entry names streamtap, its version and the folder'
     Write-Check ($null -ne $entry -and $entry.DisplayIcon -eq "$(Join-Path $bin 'streamtap-app.exe'),0") 'and the icon of the installed app'
-    Write-Check ($null -ne $entry -and $entry.UninstallString -like "*$(Join-Path $install 'uninstall.ps1')*" -and $entry.UninstallString -like "*-RegistryRoot `"$regRoot`"*") 'the entry runs the installed uninstall.ps1 with the places of this install'
+    $entryCommand = "`"$(Join-Path $bin 'streamtap-app.exe')`" --uninstall --start-menu-dir `"$startMenu`" --desktop-dir `"$desktop`" --registry-root `"$regRoot`""
+    Write-Check ($null -ne $entry -and $entry.UninstallString -ceq $entryCommand) 'the entry runs the installed app with --uninstall and the places of this install'
+    if ($null -ne $entry -and $entry.UninstallString -cne $entryCommand) { Write-Output "  it is: $($entry.UninstallString)" }
+    Write-Check ($null -ne $entry -and $entry.UninstallString -notmatch '(powershell|pwsh|cmd)\.exe|\.ps1|-File') 'and names no PowerShell, no shell and no script'
     Write-Check ((Get-Content -LiteralPath $config -Raw) -match 'keep-me') 'the settings are untouched'
     Write-Check ($r.Text -match 'Chrome: starts .*checkout' -and $r.Text -match 'Register again') 'a browser that starts the checkout''s host is named, with what to do'
     Write-Check ($r.Text -match 'Load unpacked' -and $r.Text.Contains((Join-Path $install 'extension'))) 'the output names the extension folder to load unpacked'
@@ -365,22 +377,22 @@ try {
     Write-Check ($r.Code -ne 0 -and $r.Text -match "streamtap-sink \(PID $($runner.Id)\)") 'install refuses while the sink runs from there, and names the PID'
     $r = Invoke-Script $uninstallSrc $places
     Write-Check ($r.Code -ne 0 -and $r.Text -match "PID $($runner.Id)") 'uninstall refuses while the sink runs from there'
-    # What Settings > Apps runs: the error is shown and the window waits for Enter.
-    $uninstallString = [string](Get-ItemProperty -LiteralPath $uninstallKey).UninstallString
+    # With -PauseOnError (a console window that would close): the error is shown and waits for Enter.
+    $uninstallString = Get-ScriptLine
     # Enter comes after 8 s: an uninstall that does not wait has long ended by then.
     $r = Invoke-CommandLine $uninstallString -EnterAfterMs 8000
-    Write-Check ($r.Code -ne 0 -and $r.Waited -and $r.Text -match 'uninstall failed: .*PID') 'from Settings > Apps the refusal is shown and waits for Enter'
+    Write-Check ($r.Code -ne 0 -and $r.Waited -and $r.Text -match 'uninstall failed: .*PID') 'with -PauseOnError the refusal is shown and waits for Enter'
     Write-Check ((Test-Path -LiteralPath (Join-Path $bin 'streamtap-app.exe')) -and (Test-Path -LiteralPath $link) -and (Test-Path -LiteralPath (Get-KeyPath 'Microsoft\Edge'))) 'and nothing was removed'
     Stop-Process -Id $runner.Id -Force
     $runner.WaitForExit()
     $runner = $null
 
-    # 6. The entry's command line as Windows runs it (Windows PowerShell 5.1, the installed copy of
+    # 6. The script as one command line (Windows PowerShell 5.1, the installed copy of
     # uninstall.ps1, the places with spaces) removes the install and the script itself, and what an
     # install that was cut short leaves (.new and .old files).
     foreach ($name in 'bin\streamtap-app.exe.old', 'uninstall.ps1.new', 'extension\src\background.js.new') { Set-Content -LiteralPath (Join-Path $install $name) -Value 'left' }
     $r = Invoke-CommandLine $uninstallString
-    Write-Check ($r.Code -eq 0) 'uninstall with the command line of the Settings > Apps entry'
+    Write-Check ($r.Code -eq 0) 'uninstall with the installed script as one command line'
     if ($r.Code -ne 0) { Write-Output $r.Text }
     Write-Check (-not (Test-Path -LiteralPath $install)) 'the install folder is gone, the script with it'
     Write-Check (-not (Test-Path -LiteralPath $link)) 'the Start menu entry is gone'
@@ -406,7 +418,7 @@ try {
     # everything in it and the Settings > Apps entry do (an entry left would run a script that is gone).
     $r = Invoke-Script $installer $installArgs
     Write-Check ($r.Code -eq 0) 'install before the run from inside the folder'
-    $uninstallString = [string](Get-ItemProperty -LiteralPath $uninstallKey).UninstallString
+    $uninstallString = Get-ScriptLine
     $r = Invoke-CommandLine $uninstallString -WorkDir $install
     Write-Check ($r.Code -eq 0 -and $r.Text -match 'kept the empty folder') 'uninstall from inside the install folder keeps only the empty folder'
     if ($r.Code -ne 0) { Write-Output $r.Text }

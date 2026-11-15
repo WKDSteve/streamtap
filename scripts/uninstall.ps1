@@ -6,9 +6,13 @@ Remove streamtap for the current user on Windows, without administrator rights.
 Takes away what scripts/install.ps1 made (also through build-install.ps1): the programs in bin\, the
 extension folder and the copy of this script, LICENSE, README.md and VERSION in
 %LOCALAPPDATA%\streamtap (and the .new and .old files of an install that was cut short), the Start
-menu entry and the entry in Settings > Apps (which runs this
-script from there). A browser's native messaging key is removed only when its manifest names a
+menu entry and the entry in Settings > Apps. A browser's native messaging key is removed only when its manifest names a
 host inside the install folder; a registration of another copy (a checkout) stays.
+
+This is the way for the terminal, and the only one that removes data. The entry in Settings > Apps
+does the rest without a script and without a console window: it runs the installed app as
+"streamtap-app.exe --uninstall" (desktop/crates/streamtap-app/src/uninstall.rs, which keeps the checks
+of this script).
 
 Your data stays unless you ask: -RemoveData also removes the files the app makes in its settings
 folder %APPDATA%\io.github.wkdsteve.streamtap (config.json with the token, pairings.json,
@@ -30,8 +34,8 @@ captures, never a file the app did not make).
 Remove although the session is elevated (for a build machine).
 
 .PARAMETER PauseOnError
-On an error, print it and wait for Enter (the Settings > Apps entry passes it: its console window
-would close before the message could be read).
+On an error, print it and wait for Enter (for a console window that would close before the message
+could be read, as one a shortcut opens).
 
 .PARAMETER InstallDir
 The install folder (default $env:STREAMTAP_INSTALL_DIR, else %LOCALAPPDATA%\streamtap).

@@ -117,6 +117,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "appkit-uninstall"
+version = "0.0.0"
+source = "git+https://github.com/WKDSteve/appkit?tag=v0.55.0#070cc02f1b5827553b500f269f65279f369f5906"
+
+[[package]]
 name = "atk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3520,6 +3525,7 @@ checksum = "ff7589a1859b09232522bb9edf076ca7fcf14ded96685d3fa629db73023ffbb7"
 name = "streamtap-app"
 version = "0.1.0"
 dependencies = [
+ "appkit-uninstall",
  "serde",
  "serde_json",
  "streamtap-host",

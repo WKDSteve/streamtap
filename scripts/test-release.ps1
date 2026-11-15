@@ -16,7 +16,12 @@ build you name with -BuildDir: nothing is built) and checks:
   that names a file that is not there);
 - the zip unpacked into a folder, and its install.ps1 run into temp places (a throw-away registry
   root, a temp Start menu and install folder; the account's own are never touched), then the
-  installed uninstall.ps1 run.
+  installed uninstall.ps1 run;
+- the entry of Settings > Apps: its command is the installed app with --uninstall and names no
+  PowerShell, no shell and no script; with -AppExe (or -BuildDir) that command is run as it stands
+  against a temp install: refused while a program runs from it, then the programs, the extension, the
+  shortcuts, the browser registration that leads there and the entry are gone, the registration of
+  another copy stays, and the app has moved its own file to the temp folder of the test.
 
 With -Zip the same checks on the zip itself run too, against the programs of -BuildDir (the release
 workflow checks the zip it is about to publish this way).
@@ -25,6 +30,10 @@ Exit 0 when all checks pass.
 
 .PARAMETER BuildDir
 A folder with streamtap-app.exe, streamtap-sink.exe and streamtap-host.exe (default: stand-ins).
+
+.PARAMETER AppExe
+A real streamtap-app.exe that runs the entry of Settings > Apps (default: the one of -BuildDir; with
+neither, that part is skipped and says so). The CI passes its debug build.
 
 .PARAMETER Zip
 A release zip made from -BuildDir, checked as well.
@@ -36,6 +45,7 @@ it the zip's own VERSION is believed, which checks less.
 [CmdletBinding()]
 param(
     [string] $BuildDir = '',
+    [string] $AppExe = '',
     [string] $Zip = '',
     [string] $Label = ''
 )
@@ -89,6 +99,63 @@ function Invoke-Child([string] $Script, [string[]] $Arguments, [string] $Shell =
         $env:CLAUDECODE = $saved
     }
     return [pscustomobject]@{ Code = $code; Text = $output }
+}
+
+# Run the UninstallString of the Settings > Apps entry: the program it names, with what follows as it
+# stands, and --yes (no window asks, the output and the exit code are the answer). The temp folder of
+# the program is one of the test: the app moves its own file there.
+function Invoke-Entry([string] $Command) {
+    if ($Command -notmatch '^"([^"]+)"(.*)$') { return [pscustomobject]@{ Code = -1; Text = "not a command: $Command" } }
+    $exe = $Matches[1]
+    $arguments = @($Matches[2].Trim(), '--yes')
+    if ($elevated) { $arguments += '--allow-elevated' }
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $exe
+    $info.Arguments = $arguments -join ' '
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $info.StandardErrorEncoding = [Text.Encoding]::UTF8
+    # From inside the folder that is to go, as a terminal standing in it would.
+    $info.WorkingDirectory = Split-Path -Parent $exe
+    $info.EnvironmentVariables.Remove('CLAUDECODE')
+    $info.EnvironmentVariables['TEMP'] = $script:appTemp
+    $info.EnvironmentVariables['TMP'] = $script:appTemp
+    $process = [Diagnostics.Process]::Start($info)
+    try {
+        $out = $process.StandardOutput.ReadToEndAsync()
+        $err = $process.StandardError.ReadToEndAsync()
+        # A window that asks would wait for ever: that is a failure, not a hang of the test.
+        if (-not $process.WaitForExit(60000)) {
+            $process.Kill()
+            return [pscustomobject]@{ Code = -1; Text = 'did not end within a minute (does a window ask?)' }
+        }
+        return [pscustomobject]@{ Code = $process.ExitCode; Text = ($out.Result + $err.Result) }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+# Every file below $Dir, relative, sorted, as one text: the shape of a folder.
+function Get-Tree([string] $Dir) {
+    $prefix = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\') + '\'
+    (@(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($prefix.Length) } | Sort-Object)) -join '|'
+}
+
+# A browser registration the way the app writes it: a manifest in the data folder of the test (UTF-8
+# without a BOM, as serde_json writes it), and a key below the registry root of the test that names it.
+function Add-Registration([string] $Browser, [string] $Vendor, [string] $HostExe) {
+    $folder = Join-Path $tmp 'roaming\native-messaging'
+    New-Item -ItemType Directory -Force -Path $folder | Out-Null
+    $manifest = Join-Path $folder "$Browser.json"
+    $json = '{"name":"io.github.wkdsteve.streamtap","path":"' + $HostExe.Replace('\', '\\') + '","type":"stdio"}'
+    [IO.File]::WriteAllText($manifest, $json, (New-Object Text.UTF8Encoding($false)))
+    $key = "$regRoot\$Vendor\NativeMessagingHosts\io.github.wkdsteve.streamtap"
+    New-Item -Path $key -Value $manifest -Force | Out-Null
+    return [pscustomobject]@{ Key = $key; Manifest = $manifest }
 }
 
 function Get-Sha([string] $Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -187,13 +254,15 @@ function Copy-FakeRoot([string] $Name) {
     return $fake
 }
 
-$envNames = 'STREAMTAP_INSTALL_DIR', 'STREAMTAP_START_MENU_DIR', 'STREAMTAP_REGISTRY_ROOT', 'STREAMTAP_DATA_DIR', 'STREAMTAP_LOCAL_DATA_DIR'
+$envNames = 'STREAMTAP_INSTALL_DIR', 'STREAMTAP_START_MENU_DIR', 'STREAMTAP_DESKTOP_DIR', 'STREAMTAP_REGISTRY_ROOT', 'STREAMTAP_DATA_DIR', 'STREAMTAP_LOCAL_DATA_DIR'
 $savedEnv = @{}
 foreach ($name in $envNames) { $savedEnv[$name] = [Environment]::GetEnvironmentVariable($name) }
 try {
     # Whatever a call forgets to pass, it must not reach the real folders or keys of this account.
     $install = Join-Path $tmp 'install'
     $startMenu = Join-Path $tmp 'start-menu'
+    $desktopDir = Join-Path $tmp 'desktop'
+    [Environment]::SetEnvironmentVariable('STREAMTAP_DESKTOP_DIR', $desktopDir)
     [Environment]::SetEnvironmentVariable('STREAMTAP_INSTALL_DIR', $install)
     [Environment]::SetEnvironmentVariable('STREAMTAP_START_MENU_DIR', $startMenu)
     [Environment]::SetEnvironmentVariable('STREAMTAP_REGISTRY_ROOT', $regRoot)
@@ -381,7 +450,8 @@ try {
     Write-Check (-not $r.Ok -and $r.Text -match 'give -StageDir') '-NoZip without a stage folder is refused'
 
     # 8. The unpacked zip installs and uninstalls (Windows PowerShell 5.1 runs the install: the one Windows has).
-    $places = @('-InstallDir', $install, '-StartMenuDir', $startMenu, '-RegistryRoot', $regRoot)
+    $places = @('-InstallDir', $install, '-StartMenuDir', $startMenu, '-DesktopDir', $desktopDir, '-RegistryRoot', $regRoot)
+    $entryKey = "$regRoot\Microsoft\Windows\CurrentVersion\Uninstall\streamtap"
     $r = Invoke-Child (Join-Path $dir1 'install.ps1') $places -Shell $windowsPowerShell
     Write-Check ($r.Code -eq 0) 'install.ps1 of the unpacked zip installs'
     if ($r.Code -ne 0) { Write-Output $r.Text }
@@ -391,9 +461,91 @@ try {
     $entry = Get-ItemProperty -LiteralPath "$regRoot\Microsoft\Windows\CurrentVersion\Uninstall\streamtap" -ErrorAction SilentlyContinue
     Write-Check ($null -ne $entry -and $entry.DisplayVersion -eq $version -and $entry.InstallLocation -eq $install) 'the Settings > Apps entry says the version of the zip'
     Write-Check (Test-ExtensionComplete (Join-Path $install 'extension')) 'the installed extension is complete: Load unpacked can take it'
+    $entryCommand = "`"$(Join-Path $install 'bin\streamtap-app.exe')`" --uninstall --start-menu-dir `"$startMenu`" --desktop-dir `"$desktopDir`" --registry-root `"$regRoot`""
+    Write-Check ($null -ne $entry -and $entry.UninstallString -ceq $entryCommand) 'the entry runs the installed app with --uninstall (the places only because they are not the account''s own)'
+    if ($null -ne $entry -and $entry.UninstallString -cne $entryCommand) { Write-Output "  it is: $($entry.UninstallString)" }
+    Write-Check ($null -ne $entry -and $entry.UninstallString -notmatch '(powershell|pwsh|cmd)\.exe|\.ps1|-File') 'and names no PowerShell, no shell and no script'
     $r = Invoke-Child (Join-Path $install 'uninstall.ps1') $places
     Write-Check ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $install) -and -not (Test-Path -LiteralPath (Join-Path $startMenu 'streamtap.lnk'))) 'the installed uninstall.ps1 removes it all'
-    Write-Check (-not (Test-Path -LiteralPath "$regRoot\Microsoft\Windows\CurrentVersion\Uninstall\streamtap")) 'and the Settings > Apps entry'
+    Write-Check (-not (Test-Path -LiteralPath $entryKey)) 'and the Settings > Apps entry'
+
+    # 8b. The entry of Settings > Apps, run as it stands: the real app removes the install it lies in.
+    if (-not $AppExe -and $PSBoundParameters.ContainsKey('BuildDir')) { $AppExe = Join-Path $BuildDir 'streamtap-app.exe' }
+    if (-not $AppExe) {
+        Write-Output 'skip the entry of Settings > Apps run by the app itself (no -AppExe, no -BuildDir)'
+    }
+    else {
+        if (-not (Test-Path -LiteralPath $AppExe -PathType Leaf)) { throw "no such program: $AppExe" }
+        $script:appTemp = Join-Path $tmp 'app temp'
+        New-Item -ItemType Directory -Path $script:appTemp | Out-Null
+        $real = Join-Path $tmp 'real payload'
+        Copy-Item -LiteralPath $dir1 -Destination $real -Recurse
+        Copy-Item -LiteralPath $AppExe -Destination (Join-Path $real 'bin\streamtap-app.exe') -Force
+        # The host of this install is a program that can simply wait (a real host would talk to a browser).
+        Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\cmd.exe') -Destination (Join-Path $real 'bin\streamtap-host.exe') -Force
+        $realInstaller = Join-Path $real 'install.ps1'
+        $app = Join-Path $install 'bin\streamtap-app.exe'
+        $hostExe = Join-Path $install 'bin\streamtap-host.exe'
+        $r = Invoke-Child $realInstaller ($places + '-DesktopShortcut') -Shell $windowsPowerShell
+        Write-Check ($r.Code -eq 0 -and (Test-Path -LiteralPath $app) -and (Test-Path -LiteralPath (Join-Path $desktopDir 'streamtap.lnk'))) 'an install with the real app'
+        if ($r.Code -ne 0) { Write-Output $r.Text }
+        $command = [string](Get-ItemProperty -LiteralPath $entryKey).UninstallString
+        $wanted = Get-Tree $install
+
+        # The browsers as the app registers them: Chrome starts the host of this install, Edge the one of a checkout.
+        $chrome = Add-Registration 'chrome' 'Google\Chrome' $hostExe
+        $edge = Add-Registration 'edge' 'Microsoft\Edge' (Join-Path $tmp 'checkout\streamtap-host.exe')
+
+        # Refused before anything goes: a program that runs from the install, a registry root of another hive.
+        $keepRunning = Start-Process -FilePath $hostExe -ArgumentList '/c', 'ping -n 60 127.0.0.1 >NUL' -WindowStyle Hidden -PassThru
+        try {
+            Start-Sleep -Milliseconds 300
+            $r = Invoke-Entry $command
+            Write-Check ($r.Code -ne 0 -and $r.Text -match 'running from' -and $r.Text -match "PID $($keepRunning.Id)" -and (Get-Tree $install) -ceq $wanted -and (Test-Path -LiteralPath $chrome.Key)) 'the entry refuses while a program runs from the install, names the PID and takes nothing'
+            if ($r.Code -eq 0 -or $r.Text -notmatch 'running from') { Write-Output $r.Text }
+        }
+        finally {
+            & taskkill.exe /T /F /PID $keepRunning.Id 2>&1 | Out-Null
+            $keepRunning.WaitForExit(10000) | Out-Null
+        }
+        Start-Sleep -Milliseconds 300
+        $r = Invoke-Entry "`"$app`" --uninstall --start-menu-dir `"$startMenu`" --desktop-dir `"$desktopDir`" --registry-root `"HKLM:\Software\x`""
+        Write-Check ($r.Code -ne 0 -and $r.Text -match 'below HKCU' -and (Get-Tree $install) -ceq $wanted) 'and a registry root outside HKCU'
+
+        # The whole of it: bin\ and the extension, the rest of a cut short install, a program of the layout
+        # before bin\, both shortcuts, the registration that leads here, the entry; and the app itself,
+        # which is moved to the temp folder.
+        foreach ($name in 'bin\streamtap-sink.exe.old', 'uninstall.ps1.new', 'streamtap-host.exe') { Set-Content -LiteralPath (Join-Path $install $name) -Value 'left' }
+        Set-Content -LiteralPath (Join-Path $script:appTemp 'streamtap-app-removed-1.exe') -Value 'left by an earlier removal'
+        $r = Invoke-Entry $command
+        Write-Check ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $install)) 'the entry removes the install: the programs, the extension, the files and the folder'
+        if ($r.Code -ne 0) { Write-Output $r.Text }
+        Write-Check (-not (Test-Path -LiteralPath (Join-Path $startMenu 'streamtap.lnk')) -and -not (Test-Path -LiteralPath (Join-Path $desktopDir 'streamtap.lnk'))) 'the Start menu entry and the desktop shortcut'
+        Write-Check (-not (Test-Path -LiteralPath $entryKey)) 'and the Settings > Apps entry itself'
+        Write-Check (-not (Test-Path -LiteralPath $chrome.Key) -and -not (Test-Path -LiteralPath $chrome.Manifest) -and $r.Text -match 'removed the Chrome registration') 'the registration of the installed host is gone, its manifest too'
+        Write-Check ((Test-Path -LiteralPath $edge.Key) -and (Test-Path -LiteralPath $edge.Manifest) -and $r.Text -match 'kept the Edge registration') 'the registration of the checkout stays, and is named'
+        $moved = @(Get-ChildItem -LiteralPath $script:appTemp -Force)
+        Write-Check ($moved.Count -eq 1 -and $moved[0].Name -match '^streamtap-app-removed-[0-9]+\.exe$' -and $moved[0].Name -ne 'streamtap-app-removed-1.exe' -and (Get-Sha $moved[0].FullName) -eq (Get-Sha $AppExe)) 'the app moved itself to the temp folder (it cannot delete its own file) and took the one an earlier removal left'
+        if ($moved.Count -ne 1) { Write-Output "  the temp folder holds: $(($moved | ForEach-Object { $_.Name }) -join ', ')" }
+        Write-Check ($r.Text -match 'removed the Settings > Apps entry' -and $r.Text -match 'were not touched') 'and says what it removed and what stays'
+
+        # A folder that is no install loses nothing: no VERSION in it, or the app not in its bin\.
+        $loose = Join-Path $tmp 'loose'
+        New-Item -ItemType Directory -Path (Join-Path $loose 'bin'), (Join-Path $loose 'extension') | Out-Null
+        Copy-Item -LiteralPath $AppExe -Destination (Join-Path $loose 'bin\streamtap-app.exe')
+        Set-Content -LiteralPath (Join-Path $loose 'README.md') -Value 'mine'
+        Set-Content -LiteralPath (Join-Path $loose 'extension\work.js') -Value 'mine'
+        $before = Get-Tree $loose
+        $r = Invoke-Entry "`"$(Join-Path $loose 'bin\streamtap-app.exe')`" --uninstall --start-menu-dir `"$startMenu`" --desktop-dir `"$desktopDir`" --registry-root `"$regRoot`""
+        Write-Check ($r.Code -ne 0 -and $r.Text -match 'not an install of streamtap' -and (Get-Tree $loose) -ceq $before) 'the app in a folder that is no install removes nothing'
+        if ($r.Code -eq 0) { Write-Output $r.Text }
+        Set-Content -LiteralPath (Join-Path $loose 'VERSION') -Value '0.0.0'
+        Copy-Item -LiteralPath $AppExe -Destination (Join-Path $loose 'streamtap-app.exe')
+        $before = Get-Tree $loose
+        $r = Invoke-Entry "`"$(Join-Path $loose 'streamtap-app.exe')`" --uninstall --start-menu-dir `"$startMenu`" --desktop-dir `"$desktopDir`" --registry-root `"$regRoot`""
+        Write-Check ($r.Code -ne 0 -and $r.Text -match 'does not lie in the folder bin' -and (Get-Tree $loose) -ceq $before) 'and so does the app outside the bin\ of an install'
+        if ($r.Code -eq 0) { Write-Output $r.Text }
+    }
 
     # 9. The zip the workflow is about to publish.
     if ($Zip) {

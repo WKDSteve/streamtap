@@ -134,7 +134,7 @@ Close a streamtap app started from the checkout first: the build refuses while
 `streamtap-app.exe`, `streamtap-sink.exe` and `streamtap-host.exe` to `%LOCALAPPDATA%\streamtap\bin`,
 the extension (load it unpacked from `extension\`) and a copy of
 `uninstall.ps1` to `%LOCALAPPDATA%\streamtap`, adds a Start menu entry *streamtap* and an entry in
-*Settings > Apps* (which runs that copy). It refuses while one of the programs runs from the checkout
+*Settings > Apps* (which runs the installed app as `streamtap-app.exe --uninstall`). It refuses while one of the programs runs from the checkout
 or the install folder and names the PIDs: close the app first, it stops its sink.
 Your settings, token and pairings (`%APPDATA%\io.github.wkdsteve.streamtap`) and
 your captures are not touched; `uninstall.ps1` never removes a capture, not even

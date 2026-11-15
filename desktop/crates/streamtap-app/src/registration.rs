@@ -55,6 +55,23 @@ impl Browser {
     fn key_path(self) -> String {
         format!(r"{}\{HOST_NAME}", self.hosts_key())
     }
+
+    /// The key of the host below `HKCU\Software`, as the uninstall names it.
+    #[cfg(windows)]
+    pub(crate) fn key_below_software(self) -> String {
+        let key = self.key_path();
+        key.strip_prefix(r"Software\").unwrap_or(&key).to_owned()
+    }
+
+    /// The name of the browser in a sentence.
+    #[cfg(windows)]
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::Chrome => "Chrome",
+            Self::Edge => "Edge",
+            Self::Brave => "Brave",
+        }
+    }
 }
 
 /// What a browser's key says.

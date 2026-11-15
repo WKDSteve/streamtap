@@ -78,7 +78,8 @@ version does not remove the extension from your browser.
 
 ## Uninstall
 
-*Settings > Apps > streamtap*, or:
+*Settings > Apps > streamtap* (the app removes itself and asks first in a window; no PowerShell
+window opens), or in a terminal:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\streamtap\uninstall.ps1"

@@ -525,7 +525,7 @@ machine); `-BuildOnly` builds anywhere.
 | the extension, unpacked (`manifest.json`, `popup\`, `src\`, `icons\`; no tests, no README) | `%LOCALAPPDATA%\streamtap\extension` | removed with everything in it |
 | a copy of `uninstall.ps1`, `LICENSE`, `README.md`, `VERSION` | `%LOCALAPPDATA%\streamtap` | removed; the folder only when nothing else is in it |
 | Start menu entry `streamtap.lnk` | the user's Start menu programs folder | removed when it starts the installed app |
-| *Settings > Apps* entry (runs the installed `uninstall.ps1` with the places of this install) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\streamtap` | removed last, when its `InstallLocation` is this folder |
+| *Settings > Apps* entry (runs the installed app as `streamtap-app.exe --uninstall`: it removes the install it lies in, in its own process and with a question in a window; no PowerShell, no console window; `uninstall.ps1` is the way for the terminal and for `-RemoveData`) | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\streamtap` | removed last, when its `InstallLocation` is this folder |
 | browser registrations (`NativeMessagingHosts`) | written by the app, not by the script | removed when the manifest names a host in the install folder; another copy's stays |
 | settings, token, pairings, host manifests | `%APPDATA%\io.github.wkdsteve.streamtap` | kept; `-RemoveData` removes `config.json`, `pairings.json`, `bridge.json`, `devices.json` and `native-messaging\*.json` |
 | WebView cache | `%LOCALAPPDATA%\io.github.wkdsteve.streamtap\EBWebView` | kept; `-RemoveData` removes it |

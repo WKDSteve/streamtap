@@ -9,7 +9,7 @@ while one of them runs from this checkout and names the PIDs); then the build is
 of the release zip (scripts/package-release.ps1 -NoZip: bin\*.exe, the extension, uninstall.ps1, ...)
 and installed by scripts/install.ps1, the one installer the zip uses as well: programs in
 %LOCALAPPDATA%\streamtap\bin, the extension in %LOCALAPPDATA%\streamtap\extension, a Start menu
-entry "streamtap" and an entry in Settings > Apps (which runs the installed uninstall.ps1). No
+entry "streamtap" and an entry in Settings > Apps (which runs "streamtap-app.exe --uninstall"). No
 administrator rights; a file built on this machine carries no Mark-of-the-Web. The files are all
 copied first and then swapped in; a copy or a swap that fails puts the old ones back, so the
 install is never a mix of versions.

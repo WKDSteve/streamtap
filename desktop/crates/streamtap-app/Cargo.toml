@@ -25,6 +25,10 @@ winreg = "0.56"
 # Reads the DACL of config.json to warn when broad groups can read it (SRV-14). Safe wrapper over the
 # security APIs (MIT); its dependencies (winapi 0.3, bitflags 1) are already in the tree.
 windows-permissions = "0.2"
+# `streamtap-app --uninstall`, what the entry in Settings > Apps runs: the app removes its install in its own
+# process, no PowerShell and no console window (src/uninstall.rs). The Windows calls live in the crate (MIT, no
+# dependency of its own), by tag like the sink's appkit crates; Cargo.lock pins the commit.
+appkit-uninstall = { git = "https://github.com/WKDSteve/appkit", tag = "v0.55.0" }
 
 [dev-dependencies]
 # WebSocket client for the end-to-end test against the real sink (already in the tree through the sink).
