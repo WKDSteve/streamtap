@@ -681,13 +681,21 @@ const newDirs = (prefix) => {
 };
 // How long a socket, a reconnect or a write takes is the machine's business (16 runners share one PC): the
 // scenarios wait for the state they need, up to 30 s each, and never for a fixed time that a loaded runner misses.
+// A condition that throws counts as not yet true (a tab whose link is not made yet has no status).
 const waitUntil = async (cond, ms = 30_000) => {
+  const holds = () => {
+    try {
+      return !!cond();
+    } catch {
+      return false;
+    }
+  };
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
-    if (cond()) return true;
+    if (holds()) return true;
     await sleep(50);
   }
-  return cond();
+  return holds();
 };
 // The tab's socket is open and has taken at least `n` frames (init chunks and media; not hello, not events).
 const sentAtLeast = (tab, n) => () => {
@@ -748,7 +756,7 @@ const half = Math.ceil(segments.length / 2);
   });
   const p = fakePort(2, "firstfail-a");
   seg(p, init, true);
-  await waitUntil(() => status(2).dropped >= 1);
+  await waitUntil(() => (status(2)?.dropped ?? 0) >= 1);
   check(!status(2).connected && status(2).dropped >= 1, `first-fail: first socket failed, init dropped (${JSON.stringify(status(2))})`);
   await sleep(1300);
   for (const s of segments.slice(0, 2)) seg(p, s, false);
@@ -832,7 +840,7 @@ const half = Math.ceil(segments.length / 2);
   seg(p, segments[1], false);
   seg(p, init, true);
   seg(p, segments[2], false);
-  await waitUntil(() => status(5).connected);
+  await waitUntil(() => !!status(5)?.connected);
   seg(p, segments[3], false);
   await waitForRows("evicted-", [2, 3]);
   p.onDisconnect();
@@ -882,7 +890,7 @@ const half = Math.ceil(segments.length / 2);
   ports[0].onDisconnect();
   await sleep(300);
   seg(extra, init, true);
-  await waitUntil(() => status(200).connected);
+  await waitUntil(() => !!status(200)?.connected);
   check(status(200).connected, "limit: the parked port connects once a slot is free");
   for (const p of ports.slice(1)) p.onDisconnect();
   extra.onDisconnect();
