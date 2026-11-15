@@ -75,6 +75,8 @@ jobs:
       - run: node ../extension/scripts/test-file-target.mjs --write "$RUNNER_TEMP/rec.streamtap" && target/debug/streamtap-sink replay "$RUNNER_TEMP/rec.streamtap" --out "$RUNNER_TEMP/replayed"
       # The entry of Settings > Apps, run as it stands by the app of this build (streamtap-app --uninstall) against a
       # temp install and a throw-away registry root: scripts/test-release.ps1 with -AppExe.
+      # `cargo test` builds the test programs, not the app itself.
+      - run: cargo build -p streamtap-app --locked
       - name: The app removes its own install
         shell: pwsh
         run: pwsh -NoProfile -File ../scripts/test-release.ps1 -AppExe target/debug/streamtap-app.exe
