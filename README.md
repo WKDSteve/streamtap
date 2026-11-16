@@ -62,6 +62,9 @@ streamtap/
   README.md
 ```
 
+The programs streamtap starts (the sink, `ffmpeg`, `ffprobe`) and how each is tied to the window:
+[docs/PROCESSES.md](docs/PROCESSES.md).
+
 ## Download and install (Windows, from a release)
 
 For private machines. **Not for a managed work machine** (no unsigned program is built, installed or
