@@ -171,7 +171,8 @@ jobs:
 
   # The extension itself in a browser: TESTS/sheets/mse-capture.sheet.lua loads extension/ unpacked into Playwright's
   # full Chromium, against a real sink built here and the repository's own MSE fixture (tools/sheet-mse.mjs): never a
-  # page of somebody else, never DRM. That Chromium does not start on the maintainer's runner and branded Chrome refuses
+  # page of somebody else, never real DRM. drm-refused plays the same fixture after setting MediaKeys of ClearKey (built
+  # into every browser, nothing encrypted): the extension must refuse it. That Chromium does not start on the maintainer's runner and branded Chrome refuses
   # an unpacked extension, so this one job runs on a hosted Linux VM for every event (tools/check-workflows.py,
   # HOSTED_CI_JOBS): a throwaway machine either way, nothing of the author's.
   extension-sheet:
@@ -208,6 +209,9 @@ jobs:
           path: .deps/lib.nvim
           persist-credentials: false
       - run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --sheet mse-capture --root . --strict
+        env:
+          LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
+      - run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --sheet drm-refused --root . --strict
         env:
           LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
 

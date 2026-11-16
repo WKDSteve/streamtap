@@ -14,8 +14,8 @@ return {
         ready = { stdout = "^file:", as = "link" },
       },
       -- A real streamtap-sink and a page with an MSE player of the repository's own fixture (tools/sheet-mse.mjs), for
-      -- the sheet that loads the extension. The sink listens on 17651 with the fixed token of the sheet; its captures
-      -- go to the folder of the run.
+      -- the sheets that load the extension (mse-capture, drm-refused). The sink listens on 17651 with the fixed token
+      -- of the sheets; its captures go to the folder of the run.
       ["mse"] = {
         build = { "cargo", "build", "--manifest-path", "desktop/Cargo.toml", "-p", "streamtap-sink", "--locked" },
         run = { "node", "tools/sheet-mse.mjs", "${temp}" },

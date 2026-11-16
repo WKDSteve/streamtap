@@ -1,13 +1,18 @@
-// tools/sheet-mse.mjs -- the app of the test sheet mse-capture (.testing.lua): a real streamtap-sink and a page with an
-// MSE player of the fixture TESTS/sheets/fixtures/vp9-frag.mp4, both on the loopback, in a folder of the run.
+// tools/sheet-mse.mjs -- the app of the test sheets mse-capture and drm-refused (.testing.lua): a real streamtap-sink and
+// a page with an MSE player of the fixture TESTS/sheets/fixtures/vp9-frag.mp4, both on the loopback, in a folder of the
+// run.
 //
 //   node tools/sheet-mse.mjs <run-folder>
 //
 // Prints the page's address (`http://127.0.0.1:<port>/`) once both are up; ends with its stdin, and takes the sink
-// with it. The page is the fixture's own: never a page of somebody else, never DRM (the rule of streamtap).
-//   GET /          the player: one SourceBuffer, the fixture appended whole (init and media in one append)
-//   GET /media.mp4 the fixture
-//   GET /index     every line of the index.jsonl files of the run's captures, as text
+// with it. The page is the fixture's own: never a page of somebody else, never real DRM (the rule of streamtap).
+//   GET /           the player: one SourceBuffer, the fixture appended whole (init and media in one append)
+//   GET /drm        the same player after it set MediaKeys of ClearKey, the key system every browser has built in: what
+//                   the extension must refuse (the fixture itself is not encrypted, no licence server, no CDM)
+//   GET /drm-state  what the page /drm got to: "loading", "appended" or "error: ..." (it reports it with a POST)
+//   GET /media.mp4  the fixture
+//   GET /index      every line of the index.jsonl files of the run's captures, as text
+// /index and /drm-state answer any origin: the sheet drm-refused reads them from the extension's own page.
 // The sink listens on the fixed port SINK_PORT with the fixed token SINK_TOKEN: the sheet stores both in the
 // extension (as the popup does), and a loopback sink of a test run guards nothing worth a secret.
 import { spawn } from 'node:child_process';
@@ -38,28 +43,47 @@ const fixture = readFileSync(join(root, 'TESTS', 'sheets', 'fixtures', 'vp9-frag
 const captures = join(run, 'captures');
 mkdirSync(captures, { recursive: true });
 
-const PAGE = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>streamtap MSE fixture</title></head>
+const CODEC = 'video/mp4; codecs="vp09.00.10.08"';
+
+// The player; with `drm` it first sets MediaKeys of ClearKey on the video (as a page with DRM does before it appends),
+// and reports each state to the server, so a sheet in another tab can wait for it.
+const page = (drm) => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>streamtap MSE fixture${drm ? ' with EME' : ''}</title></head>
 <body>
 <video id="v" muted width="160" height="120"></video>
 <p id="state">loading</p>
 <script>
-  const state = (t) => { document.getElementById('state').textContent = t; };
-  const ms = new MediaSource();
-  document.getElementById('v').src = URL.createObjectURL(ms);
-  ms.addEventListener('sourceopen', async () => {
-    try {
-      const sb = ms.addSourceBuffer('video/mp4; codecs="vp09.00.10.08"');
-      const bytes = await (await fetch('/media.mp4')).arrayBuffer();
-      sb.addEventListener('updateend', () => { ms.endOfStream(); state('appended'); }, { once: true });
-      sb.appendBuffer(bytes);
-    } catch (e) {
-      state('error: ' + e.message);
-    }
-  }, { once: true });
+  const state = (t) => {
+    document.getElementById('state').textContent = t;
+    ${drm ? "fetch('/drm-state', { method: 'POST', body: t });" : ''}
+  };
+  const v = document.getElementById('v');
+  const play = () => {
+    const ms = new MediaSource();
+    v.src = URL.createObjectURL(ms);
+    ms.addEventListener('sourceopen', async () => {
+      try {
+        const sb = ms.addSourceBuffer('${CODEC}');
+        const bytes = await (await fetch('/media.mp4')).arrayBuffer();
+        sb.addEventListener('updateend', () => { ms.endOfStream(); state('appended'); }, { once: true });
+        sb.appendBuffer(bytes);
+      } catch (e) {
+        state('error: ' + e.message);
+      }
+    }, { once: true });
+  };
+  ${
+    drm
+      ? `navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ initDataTypes: ['cenc', 'keyids'], videoCapabilities: [{ contentType: '${CODEC}' }] }])
+    .then((access) => access.createMediaKeys())
+    .then((keys) => v.setMediaKeys(keys))
+    .then(play, (e) => state('error: ' + e.message));`
+      : 'play();'
+  }
 </script>
 </body></html>
 `;
+let drmState = 'loading';
 
 function indexLines() {
   const lines = [];
@@ -90,14 +114,28 @@ await new Promise((done) => {
 });
 
 const server = createServer((req, res) => {
-  if (req.url === '/') {
+  if (req.url === '/' || req.url === '/drm') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(PAGE);
+    res.end(page(req.url === '/drm'));
+  } else if (req.url === '/drm-state' && req.method === 'POST') {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      if (body.length < 512) body += chunk;
+    });
+    req.on('end', () => {
+      drmState = body.slice(0, 512);
+      res.writeHead(204);
+      res.end();
+    });
+  } else if (req.url === '/drm-state') {
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*' });
+    res.end(drmState);
   } else if (req.url === '/media.mp4') {
     res.writeHead(200, { 'content-type': 'video/mp4' });
     res.end(fixture);
   } else if (req.url === '/index') {
-    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*' });
     res.end(indexLines());
   } else {
     res.writeHead(404);

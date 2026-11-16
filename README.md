@@ -184,7 +184,10 @@ The test sheets of testing.nvim (`TESTS/sheets/`, apps in `.testing.lua`) run
 with `testing sheets run --sheet <name>`. One of them, `mse-capture`, loads
 the extension itself into Playwright's full Chromium and checks that a real
 sink writes the repository's own MSE fixture (`TESTS/sheets/fixtures/`,
-generated with ffmpeg, VP9 in fragmented MP4) with the track id the hook read.
+generated with ffmpeg, VP9 in fragmented MP4) with the track id the hook read;
+`drm-refused` plays the same fixture after setting MediaKeys of ClearKey and
+checks that the extension refuses it (red badge, the popup says DRM, the sink
+gets nothing of that tab).
 Branded Chrome refuses an unpacked extension and Playwright's Chromium does
 not start on the self-hosted runner, so CI runs that sheet in the one job on a
 hosted Linux VM (`extension-sheet`; `tools/check-workflows.py` allows exactly

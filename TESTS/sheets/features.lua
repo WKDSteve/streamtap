@@ -25,6 +25,11 @@ return {
     docs = "extension/README.md",
   },
   {
+    id = "streamtap.drm",
+    title = "A page with DRM (EME) is detected and left alone: red badge, the popup says so, nothing is copied",
+    docs = "extension/README.md",
+  },
+  {
     id = "streamtap.captures-list",
     title = "The app lists the captures live and opens or deletes them",
     docs = "desktop/README.md",
