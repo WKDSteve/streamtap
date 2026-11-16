@@ -3,7 +3,8 @@
 -- Chromium start streamtap-host.exe, which finds no app (STREAMTAP_APP_DIR is an empty folder of the run, so it never
 -- reaches an app the person runs) and the popup says so. No counter-check without the host: Chromium would then start
 -- the installed app's host (Software\Google\Chrome), outside any folder of the run.
--- Windows only so far (the host's path); Playwright's full Chromium; not part of the CI.
+-- Playwright's full Chromium. CI runs it in the job extension-sheet (Linux: the host's manifest goes into the run's
+-- profile, no registry); on Windows the key lives under HKCU\Software\Chromium for the run only.
 --   testing sheets run --sheet host-no-app
 return {
   id = "streamtap.host-no-app",
@@ -14,7 +15,7 @@ return {
   extension = "extension",
   native_host = {
     name = "io.github.wkdsteve.streamtap",
-    path = "desktop/target/debug/streamtap-host.exe",
+    path = "desktop/target/debug/streamtap-host${exe}",
     env = { STREAMTAP_APP_DIR = "${temp}/no-app" },
   },
   sizes = { { cols = 800, rows = 600 } },

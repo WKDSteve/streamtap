@@ -157,7 +157,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
         with:
           repository: WKDSteve/testing.nvim
-          ref: af61348441e7fdf4c68fbbf9d9635d05cc8befb3
+          ref: 1a0ec9d5b18ffb50a5fde92e3316d251b0582b12
           path: .deps/testing.nvim
           persist-credentials: false
       - if: ${{ github.event_name != 'pull_request' }}
@@ -203,7 +203,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
         with:
           repository: WKDSteve/testing.nvim
-          ref: af61348441e7fdf4c68fbbf9d9635d05cc8befb3
+          ref: 1a0ec9d5b18ffb50a5fde92e3316d251b0582b12
           path: .deps/testing.nvim
           persist-credentials: false
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
@@ -216,6 +216,11 @@ jobs:
         env:
           LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
       - run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --sheet drm-refused --root . --strict
+        env:
+          LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
+      # The host of this build, which Chromium starts for the extension (testing.nvim's native_host: on Linux its manifest
+      # sits in the run's profile) and which finds no app in the empty folder of the run.
+      - run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --sheet host-no-app --root . --strict
         env:
           LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
 
