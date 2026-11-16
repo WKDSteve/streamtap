@@ -412,7 +412,7 @@ pub(crate) fn answer_plain_get(
     pushed_out: &AtomicBool,
 ) -> Plain {
     let mut buf = [0u8; MAX_HEAD];
-    let head = loop {
+    let (head, head_len) = loop {
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() || pushed_out.load(Ordering::SeqCst) {
             return Plain::Gone;
@@ -427,7 +427,7 @@ pub(crate) fn answer_plain_get(
             Ok(0) => return Plain::Gone,
             Ok(n) => {
                 if let Some(end) = buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
-                    break &buf[..end];
+                    break (&buf[..end], end + 4);
                 }
                 // A head larger than any browser sends for this page: the handshake refuses it.
                 if n == buf.len() {
@@ -470,15 +470,23 @@ pub(crate) fn answer_plain_get(
     } else {
         ("404 Not Found", "")
     };
-    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    let _ = write!(
-        stream,
+    // The head was only peeked so far. It is read before the answer: a socket closed with unread bytes is reset
+    // (RST) instead of closed, and the reset can throw away the part of the answer the client has not read yet.
+    let mut taken = [0u8; MAX_HEAD];
+    if stream.read_exact(&mut taken[..head_len]).is_err() {
+        return Plain::Gone;
+    }
+    let answer = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
          Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\n\
          Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = stream.flush();
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    // In one piece, then the end of the stream (FIN) before the socket is dropped.
+    if stream.write_all(answer.as_bytes()).is_ok() {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    }
     Plain::Answered
 }
 

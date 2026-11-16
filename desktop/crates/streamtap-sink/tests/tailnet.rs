@@ -579,8 +579,22 @@ fn the_pairing_link_opens_a_page_without_a_script() {
             "GET {path} HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-For: 100.64.0.7\r\n\r\n"
         )
         .unwrap();
+        // A slow client: the sink has answered and closed before the first read. A sink that closes with the
+        // request unread resets the connection, and the reset throws away what was not read yet (Windows).
+        std::thread::sleep(Duration::from_millis(300));
         let mut text = String::new();
-        let _ = s.read_to_string(&mut text);
+        if let Err(e) = s.read_to_string(&mut text) {
+            panic!("reading the answer to GET {path} failed after {text:?}: {e}");
+        }
+        // An answer of the page is whole: its body is as long as its head says.
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            if let Some(length) = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+            {
+                assert_eq!(Ok(body.len()), length.parse(), "the whole body: {text}");
+            }
+        }
         text
     };
     let page = get(NAME, "/");
