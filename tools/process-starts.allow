@@ -1,0 +1,12 @@
+# Files that start a process themselves (tools/check-process-starts.py, a copy of appkit's; docs/PROCESSES.md):
+# <path> <count of lines found> <reason>
+# streamtap is not built on appkit; its two helpers are the named exception of the plan "no visible shell and
+# background processes" (the sink, ffmpeg and ffprobe), each child without a console window and bound to the window.
+
+# The window starts the sink (serve, mux): CREATE_NO_WINDOW, put into a job with KILL_ON_JOB_CLOSE (jobs::KillOnClose).
+desktop/crates/streamtap-app/src/sink.rs 2 the window's helper for the sink (no window, bound to the window by its job)
+# The sink starts ffmpeg and ffprobe: an argv, CREATE_NO_WINDOW, a time limit.
+desktop/crates/streamtap-sink/src/proc.rs 2 the sink's helper for ffmpeg and ffprobe (no window, a time limit)
+
+# Tests only: the module is #[cfg(all(test, windows))], which the check does not take for a test module.
+desktop/crates/streamtap-app/src/jobs.rs 4 the tests of the job (a child that outlives its owner, ended by the job)

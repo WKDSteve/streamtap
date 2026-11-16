@@ -2,7 +2,8 @@
 
 Every program streamtap starts, with why, how long it lives and how it is started. **A process
 that is not in this list is a bug.** The list is taken from the code (`sink::command` and
-`jobs::KillOnClose` of `streamtap-app`, `proc.rs` of `streamtap-sink`) and checked against a
+`jobs::KillOnClose` of `streamtap-app`, `proc.rs` of `streamtap-sink`; `tools/process-starts.allow` names
+these files, and `tools/check-process-starts.py` in the CI refuses a start by hand anywhere else) and checked against a
 measurement with `app-proc-watch`.
 
 streamtap is not built on appkit, so it does not use `appkit_core::child`; its two helpers do the

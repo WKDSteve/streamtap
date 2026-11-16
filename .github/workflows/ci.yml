@@ -250,6 +250,9 @@ jobs:
       # scripts/uninstall-entry.ps1 is the file of appkit's release kit at the commit the workflows pin it to. Copy of
       # appkit's tool.
       - run: python tools/check-release-kit-copy.py
+      # No process is started by hand outside the files of tools/process-starts.allow (docs/PROCESSES.md). Copy of
+      # appkit's tool.
+      - run: python tools/check-process-starts.py
       # Every colour of the app's UI comes from palette.css (generated from the icon by the app icons tool of the
       # tasks vault); a hex colour or a colour function in any other stylesheet is refused. Copy of appkit's tool.
       - run: python tools/check-color-literals.py --root desktop/crates/streamtap-app/ui --tokens desktop/crates/streamtap-app/ui/palette.css
