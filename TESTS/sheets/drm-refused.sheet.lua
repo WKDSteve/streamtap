@@ -11,7 +11,9 @@
 local POPUP = "chrome-extension://oggpddakdbffbjhkjmcakidgmhpgakia/popup/popup.html?fixture=${link}"
 local FIXTURE = "new URLSearchParams(location.search).get('fixture')"
 local DRM_TAB = "Number(sessionStorage.getItem('drmTab'))"
-local INDEX = "fetch(" .. FIXTURE .. " + 'index').then((r) => r.text()).then((t) => t.split(String.fromCharCode(10))"
+local INDEX = "fetch("
+  .. FIXTURE
+  .. " + 'index').then((r) => r.text()).then((t) => t.split(String.fromCharCode(10))"
   .. ".filter(Boolean).map((l) => JSON.parse(l)))"
 
 return {
@@ -31,7 +33,9 @@ return {
       note = "port and token of the run's sink, as the popup's save stores them",
     },
     {
-      expect = "chrome.tabs.create({ url: " .. FIXTURE .. " + 'drm' })"
+      expect = "chrome.tabs.create({ url: "
+        .. FIXTURE
+        .. " + 'drm' })"
         .. ".then((t) => { sessionStorage.setItem('drmTab', String(t.id)); return true; })",
       note = "the page with EME in a tab of its own, the active one",
     },
@@ -41,13 +45,17 @@ return {
       note = "it set MediaKeys of ClearKey, then appended the fixture",
     },
     {
-      wait = "chrome.runtime.sendMessage({ kind: 'vc-get', tabId: " .. DRM_TAB .. " })"
+      wait = "chrome.runtime.sendMessage({ kind: 'vc-get', tabId: "
+        .. DRM_TAB
+        .. " })"
         .. ".then((s) => !!s && s.drm.some((d) => d.keySystem === 'setMediaKeys'))",
       timeout = 10000,
       note = "the service worker knows that the tab set MediaKeys",
     },
     {
-      expect = "chrome.action.getBadgeBackgroundColor({ tabId: " .. DRM_TAB .. " })"
+      expect = "chrome.action.getBadgeBackgroundColor({ tabId: "
+        .. DRM_TAB
+        .. " })"
         .. ".then((c) => c[0] === 176 && c[1] === 0 && c[2] === 32)",
       note = "its badge is red",
     },

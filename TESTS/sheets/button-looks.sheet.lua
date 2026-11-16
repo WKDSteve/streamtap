@@ -14,7 +14,11 @@ return {
     { scheme = "light" },
     { open = "${link}", note = "the page with the stand-in for the bridge" },
     { wait = "document.body.innerText.includes('A capture')", timeout = 10000, note = "the stand-in's data is drawn" },
-    { expect = "!document.getElementById('sink-toggle').disabled && document.getElementById('sink-toggle').classList.contains('primary')", note = "Start is a filled button that can be pressed" },
+    {
+      expect = "!document.getElementById('sink-toggle').disabled"
+        .. " && document.getElementById('sink-toggle').classList.contains('primary')",
+      note = "Start is a filled button that can be pressed",
+    },
     { hover = "header.bar h1", note = "the pointer on the title" },
     { expect = "!document.getElementById('sink-toggle').matches(':hover')" },
     { shot = "start-rest-light" },

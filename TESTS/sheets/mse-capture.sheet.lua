@@ -18,7 +18,8 @@ return {
       note = "the popup: the extension is loaded",
     },
     {
-      expect = "chrome.storage.local.set({ sinkPort: 17651, sinkToken: 'sheet-mse-capture-token', sinkPaired: false, tapMode: 'all' }).then(() => true)",
+      expect = "chrome.storage.local.set({ sinkPort: 17651, sinkToken: 'sheet-mse-capture-token', sinkPaired: false,"
+        .. " tapMode: 'all' }).then(() => true)",
       note = "port and token of the run's sink, as the popup's save stores them",
     },
     { open = "${link}", note = "the fixture page with the MSE player" },
@@ -28,12 +29,16 @@ return {
       note = "the player appended the fixture",
     },
     {
-      wait = "fetch('/index').then((r) => r.text()).then((t) => t.split(String.fromCharCode(10)).filter(Boolean).map((l) => JSON.parse(l)).some((row) => !row.is_init && Number.isInteger(row.track)))",
+      wait = "fetch('/index').then((r) => r.text())"
+        .. ".then((t) => t.split(String.fromCharCode(10)).filter(Boolean).map((l) => JSON.parse(l))"
+        .. ".some((row) => !row.is_init && Number.isInteger(row.track)))",
       timeout = 30000,
       note = "the sink wrote a media row with the track id",
     },
     {
-      expect = "fetch('/index').then((r) => r.text()).then((t) => t.split(String.fromCharCode(10)).filter(Boolean).map((l) => JSON.parse(l)).some((row) => row.is_init && row.kind === 'mp4'))",
+      expect = "fetch('/index').then((r) => r.text())"
+        .. ".then((t) => t.split(String.fromCharCode(10)).filter(Boolean).map((l) => JSON.parse(l))"
+        .. ".some((row) => row.is_init && row.kind === 'mp4'))",
       note = "and the init segment before it",
     },
   },
