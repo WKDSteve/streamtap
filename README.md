@@ -167,6 +167,7 @@ node extension/scripts/test-content.mjs
 node extension/scripts/test-pairing.mjs
 node desktop/scripts/test-sink-link.mjs
 node desktop/scripts/test-app-ui.mjs
+node desktop/scripts/test-check-recording.mjs    # the recording checker against lavfi recordings (ffmpeg; exit 3 = skip)
 python -m unittest discover tools
 python tools/check-control-chars.py
 python tools/check-workflows.py --online          # pins, runners, drafts only
@@ -192,6 +193,16 @@ Branded Chrome refuses an unpacked extension and Playwright's Chromium does
 not start on the self-hosted runner, so CI runs that sheet in the one job on a
 hosted Linux VM (`extension-sheet`; `tools/check-workflows.py` allows exactly
 that job off the self-hosted runner).
+`open-folder` and `open-result` drive the real app window (appkit's
+`sheet-driver`): the capture's folder in Explorer, and its result in the
+machine's default player, whose window the sheet closes again.
+
+A real recording is judged by a person only for what it shows. The rest is
+`node desktop/scripts/check-recording.mjs <capture>/out.mp4 --seconds <n>`:
+ffprobe reads the container, the length fits the recording time, one video
+and one audio track, no track pauses longer than a second (`--max-gap`), and
+ffmpeg's blackdetect does not find it black from start to end (a protected
+source records black). Exit 0 green, 1 red, 3 ffmpeg missing.
 
 ## Roadmap (short)
 

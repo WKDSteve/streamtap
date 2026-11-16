@@ -116,6 +116,10 @@ jobs:
       - run: node extension/scripts/test-file-target.mjs
       # The muxer of the target "a video on this device" on real fMP4 fixtures (ffprobe/ffmpeg checks where installed).
       - run: node extension/scripts/test-fmp4-mux.mjs
+      # The machine part of judging a recording (desktop/scripts/check-recording.mjs: container, length, tracks, pauses,
+      # black throughout) against lavfi recordings, each wrong one red. Without ffmpeg it exits 3: allowed on a pull
+      # request's hosted runner only, the self-hosted one has ffmpeg.
+      - run: node desktop/scripts/test-check-recording.mjs || { rc=$?; [ "$rc" = 3 ] && [ "$GITHUB_EVENT_NAME" = pull_request ]; }
       # The target "the sink over the tailnet": pairing, the login with a non-extractable key, every refusal, fake sink.
       - run: node extension/scripts/test-tailnet.mjs
       # The popup in a fake DOM: forged values come out as text, never as markup.
