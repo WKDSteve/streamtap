@@ -4,6 +4,8 @@
 //
 //   node desktop/scripts/test-sink-live.mjs [path to streamtap-sink]    (after cargo build; default target/debug)
 //
+// Then the link driver must refuse a fixture with too few media segments (exit 2 and a message, not a crash).
+//
 // fixtures/frag.mp4 is 4 s of test picture and tone, fragmented, made by:
 //   ffmpeg -f lavfi -i testsrc=duration=4:size=160x120:rate=10 -f lavfi -i sine=duration=4 -c:v libx264 -g 10 \
 //     -c:a aac -b:a 32k -movflags frag_keyframe+empty_moov+default_base_moof frag.mp4
@@ -72,8 +74,26 @@ for (const [script, args] of drivers) {
   }
 }
 
+// A fixture with two media segments (the one of the test sheets): a usage error, nothing sent to the sink.
+{
+  const short = join(here, "..", "..", "TESTS", "sheets", "fixtures", "vp9-frag.mp4");
+  console.log("== test-sink-link.mjs with a fixture of two media segments");
+  const run = spawnSync(
+    process.execPath,
+    [join(here, "test-sink-link.mjs"), short, "--token", token, "--captures", out, "--port", String(port)],
+    { encoding: "utf8", timeout: 60_000 },
+  );
+  const said = /has 2 media segment\(s\); the live scenarios need 4/.test(run.stderr ?? "");
+  if (run.status !== 2 || !said) {
+    console.error(`test-sink-live: a short fixture should be refused with exit 2 (got ${run.status}): ${run.stderr}`);
+    failed += 1;
+  } else {
+    console.log("ok   a short fixture is refused before any socket opens");
+  }
+}
+
 sink.kill();
 await new Promise((resolve) => (sink.exitCode === null ? sink.on("exit", resolve) : resolve()));
 rmSync(out, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 if (failed) process.exit(1);
-console.log("test-sink-live: both drivers green");
+console.log("test-sink-live: both drivers green, a short fixture refused");

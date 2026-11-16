@@ -645,6 +645,12 @@ const fakePort = (tabId, session) => {
 };
 
 const { init, segments, tfdtOf, timescale } = splitFmp4(file);
+// The scenarios use media segments 0 to 3: a shorter file is a usage error, said before any socket opens.
+const MIN_SEGMENTS = 4;
+if (segments.length < MIN_SEGMENTS) {
+  console.error(`test-sink-link.mjs: ${file} has ${segments.length} media segment(s); the live scenarios need ${MIN_SEGMENTS}`);
+  process.exit(2);
+}
 const dataUrl = (u8) => "data:application/octet-stream;base64," + Buffer.from(u8).toString("base64");
 const mime = 'video/mp4; codecs="avc1.64001e, mp4a.40.2"';
 let seq = 1;
