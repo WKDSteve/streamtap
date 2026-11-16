@@ -49,6 +49,23 @@ return {
         run = { "node", "tools/sheet-mse.mjs", "${temp}" },
         ready = { stdout = "^http://127%.0%.0%.1:%d+/$", as = "link" },
       },
+      -- The same sink and page, and the native messaging host of this build for the sheets that register it for one run
+      -- (testing.nvim's native_host): host-no-app.
+      ["mse-host"] = {
+        build = {
+          "cargo",
+          "build",
+          "--manifest-path",
+          "desktop/Cargo.toml",
+          "-p",
+          "streamtap-sink",
+          "-p",
+          "streamtap-host",
+          "--locked",
+        },
+        run = { "node", "tools/sheet-mse.mjs", "${temp}" },
+        ready = { stdout = "^http://127%.0%.0%.1:%d+/$", as = "link" },
+      },
       -- The app with a capture whose result is a few bytes (open-folder). It needs a sheet-driver of appkit from
       -- 2026-11-12 or later (a look into the window of another program).
       ["captures"] = captures({ "node", "tools/sheet-captures.mjs", "${temp}/app" }),
