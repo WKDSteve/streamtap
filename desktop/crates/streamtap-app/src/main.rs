@@ -548,17 +548,31 @@ fn mux_started(shared: &AppState, id: &str, handle: &Arc<sink::MuxHandle>) {
 }
 
 #[tauri::command]
-async fn open_result(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+async fn open_result(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> CmdResult<()> {
     let dir = paths::resolve_capture(&state.lock().settings.captures_dir, &id)?;
     let (file, _) =
         paths::result_file(&dir).ok_or("this capture has no result yet; mux it first")?;
-    sink::open_path(&file)
+    sink::open_path(&file, on_main_thread(&app))
 }
 
 #[tauri::command]
-async fn open_folder(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+async fn open_folder(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> CmdResult<()> {
     let dir = paths::resolve_capture(&state.lock().settings.captures_dir, &id)?;
-    sink::open_path(&dir)
+    sink::open_path(&dir, on_main_thread(&app))
+}
+
+/// Hands a job to the window's main thread (see `sink::open_path`). Async commands run on the async
+/// runtime, never on the main thread, so waiting for the job there cannot block it on itself.
+fn on_main_thread(app: &tauri::AppHandle) -> impl FnOnce(sink::MainJob) -> Result<(), String> + '_ {
+    move |job| app.run_on_main_thread(job).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

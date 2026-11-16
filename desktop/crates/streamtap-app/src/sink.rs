@@ -401,15 +401,40 @@ pub(crate) fn run_mux(sink: &Path, dir: &Path, register: impl FnOnce(&Arc<MuxHan
     )
 }
 
+/// A job handed to the thread that runs it (the window's main thread, `AppHandle::run_on_main_thread`).
+pub(crate) type MainJob = Box<dyn FnOnce() + Send>;
+
 /// Opens a file or folder with the system's default handler. On Windows the app asks the shell itself
 /// (`ShellExecuteExW`; a folder is shown through `SHOpenFolderAndSelectItems`): no `explorer.exe` and no other
-/// program is started by the app. The call runs on a thread of its own, which ends with it: the shell
-/// initialises COM on the calling thread, and no thread of the async runtime is left with that.
-/// Elsewhere `open` (macOS) or `xdg-open` gets the path as its only argument (no shell).
-pub(crate) fn open_path(path: &Path) -> Result<(), String> {
+/// program is started by the app. Elsewhere `open` (macOS) or `xdg-open` gets the path as its only argument
+/// (no shell).
+///
+/// `on_main` runs the call on the window's main thread. Microsoft asks for a thread with COM initialised
+/// (single-threaded apartment) and, unless that thread keeps a message loop, `SEE_MASK_NOASYNC`, because a
+/// handler may be a COM `DelegateExecute` server (the default player of Windows is a store app). The `open`
+/// crate sets neither on the file branch; the main thread is an STA with a message loop (tao and the
+/// `WebView2` runtime initialise it), so the call is right there without unsafe code of ours. A spawned thread
+/// that ends right after the call was neither.
+pub(crate) fn open_path(
+    path: &Path,
+    on_main: impl FnOnce(MainJob) -> Result<(), String>,
+) -> Result<(), String> {
+    open_with(path, on_main, |p| open::that_detached(p))
+}
+
+fn open_with(
+    path: &Path,
+    on_main: impl FnOnce(MainJob) -> Result<(), String>,
+    opener: impl FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+) -> Result<(), String> {
     let target = path.to_owned();
-    std::thread::spawn(move || open::that_detached(&target))
-        .join()
+    let (tx, rx) = std::sync::mpsc::channel();
+    on_main(Box::new(move || {
+        let _ = tx.send(opener(&target));
+    }))
+    .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    // The job is dropped unrun when the event loop is gone: the sender goes with it.
+    rx.recv()
         .map_err(|_| format!("cannot open {}: the call failed", path.display()))?
         .map_err(|e| format!("cannot open {}: {e}", path.display()))
 }
@@ -417,6 +442,51 @@ pub(crate) fn open_path(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn opening_runs_on_the_thread_the_app_hands_it_to() {
+        // A stand-in for the main thread: a named thread that runs what it is handed.
+        let (jobs, inbox) = std::sync::mpsc::channel::<MainJob>();
+        let main = std::thread::Builder::new()
+            .name("main-sta".into())
+            .spawn(move || inbox.into_iter().for_each(|job| job()))
+            .expect("thread");
+        let on_main = |job: MainJob| jobs.send(job).map_err(|e| e.to_string());
+        let ran_on = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&ran_on);
+        let r = open_with(Path::new("x.mp4"), on_main, move |p| {
+            assert_eq!(p, Path::new("x.mp4"));
+            *seen.lock().expect("lock") = std::thread::current().name().map(str::to_owned);
+            Ok(())
+        });
+        assert_eq!(r, Ok(()));
+        assert_eq!(ran_on.lock().expect("lock").as_deref(), Some("main-sta"));
+
+        // The handler's error and a job that is dropped unrun both come back as errors.
+        let err = open_with(
+            Path::new("x.mp4"),
+            |job| jobs.send(job).map_err(|e| e.to_string()),
+            |_| Err(std::io::Error::other("no handler")),
+        );
+        assert_eq!(err, Err("cannot open x.mp4: no handler".into()));
+        let gone = open_with(
+            Path::new("x.mp4"),
+            |job| {
+                drop(job);
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(gone, Err("cannot open x.mp4: the call failed".into()));
+        let refused = open_with(
+            Path::new("x.mp4"),
+            |_| Err("event loop closed".into()),
+            |_| Ok(()),
+        );
+        assert_eq!(refused, Err("cannot open x.mp4: event loop closed".into()));
+        drop(jobs);
+        main.join().expect("join");
+    }
 
     #[test]
     fn drm_lines_name_their_capture() {

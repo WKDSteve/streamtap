@@ -693,8 +693,9 @@ Security:
   Delete additionally refuses a live capture or one that is being muxed.
 - Children are started without a shell and, on Windows, without a console
   window (`CREATE_NO_WINDOW`). Open result / Open folder start no program on
-  Windows: the app asks the shell in its own process (`ShellExecuteExW`, a
-  folder through `SHOpenFolderAndSelectItems`); on macOS and Linux `open` /
+  Windows: the app asks the shell in its own process, on the window's main
+  thread, which has COM and a message loop (`ShellExecuteExW`, a folder through
+  `SHOpenFolderAndSelectItems`); on macOS and Linux `open` /
   `xdg-open` gets the path as one argument. The sink binds 127.0.0.1 only (its
   own rule).
 - The token is random per install (std `RandomState`, seeded by the OS, mixed
