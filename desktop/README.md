@@ -579,6 +579,9 @@ for `HKCU\Software`, below which the uninstall entry is written and the browser 
 read), and for `uninstall.ps1` also `-DataDir`, `-LocalDataDir`; each defaults to
 `STREAMTAP_INSTALL_DIR`, `STREAMTAP_START_MENU_DIR`, `STREAMTAP_REGISTRY_ROOT`,
 `STREAMTAP_DATA_DIR`, `STREAMTAP_LOCAL_DATA_DIR` before the real place.
+The app itself takes `STREAMTAP_APP_DIR` (as the host does): its settings, bridge and pairings go there and its data
+(the default captures folder) to its `data` folder, instead of `%APPDATA%` and `%LOCALAPPDATA%`; the test sheet
+`TESTS/sheets/open-folder.sheet.lua` runs the app that way against a folder of its own.
 `build-install.ps1 -BuildDir <dir>` installs prebuilt exes without building;
 `install.ps1 -PayloadDir <dir>` installs a staged or unpacked release folder.
 `scripts/test-install.ps1` (CI, job `hygiene`) installs stand-ins (copies of `cmd.exe`)

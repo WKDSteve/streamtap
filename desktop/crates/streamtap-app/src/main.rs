@@ -713,6 +713,27 @@ async fn phone_revoke(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     phone_job(state, move |shared| phone_revoked(shared, &id)).await
 }
 
+/// Overrides the folders of the app, as it does for `streamtap-host` (`relay::app_dir`): the settings, the bridge and
+/// the pairings in it, the data (the default captures folder) in its `data`. A test sheet runs the app against a
+/// folder of its own; the folders of Tauri come from the system's known folders, which do not follow `APPDATA`.
+const APP_DIR_ENV: &str = "STREAMTAP_APP_DIR";
+
+/// The config and data folders: from `over` (the value of [`APP_DIR_ENV`]) when it is set and not empty, else from
+/// `system` (Tauri's).
+fn app_dirs(
+    over: Option<std::ffi::OsString>,
+    system: impl FnOnce() -> tauri::Result<(PathBuf, PathBuf)>,
+) -> tauri::Result<(PathBuf, PathBuf)> {
+    match over.filter(|dir| !dir.is_empty()) {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            let data = dir.join("data");
+            Ok((dir, data))
+        }
+        None => system(),
+    }
+}
+
 fn main() -> ExitCode {
     // What the entry in Settings > Apps runs: the app removes its install and never opens its window.
     #[cfg(windows)]
@@ -721,8 +742,9 @@ fn main() -> ExitCode {
     }
     let app = tauri::Builder::default()
         .setup(|app| {
-            let config_dir = app.path().app_config_dir()?;
-            let data_dir = app.path().app_data_dir()?;
+            let (config_dir, data_dir) = app_dirs(std::env::var_os(APP_DIR_ENV), || {
+                Ok((app.path().app_config_dir()?, app.path().app_data_dir()?))
+            })?;
             let config_path = config_dir.join("config.json");
             let (settings, config_error) = match config::load_or_create(&config_path, &data_dir) {
                 Ok(s) => (s, None),
@@ -783,6 +805,27 @@ mod tests {
         let settings = Settings::defaults(&dir);
         let inner = Inner::new(settings, dir.join("config.json"), None);
         (AppState(Arc::new(Mutex::new(inner))), dir)
+    }
+
+    #[test]
+    fn the_app_dir_of_the_environment_holds_the_settings_and_the_data() {
+        let system = || -> tauri::Result<(PathBuf, PathBuf)> {
+            Ok((PathBuf::from("sys-config"), PathBuf::from("sys-data")))
+        };
+        let (config, data) = app_dirs(Some("C:/run/app".into()), system).unwrap();
+        assert_eq!(config, PathBuf::from("C:/run/app"));
+        assert_eq!(data, PathBuf::from("C:/run/app").join("data"));
+        let (config, data) = app_dirs(None, system).unwrap();
+        assert_eq!(
+            (config, data),
+            (PathBuf::from("sys-config"), PathBuf::from("sys-data"))
+        );
+        let (config, _) = app_dirs(Some("".into()), system).unwrap();
+        assert_eq!(
+            config,
+            PathBuf::from("sys-config"),
+            "an empty value is unset"
+        );
     }
 
     #[test]
