@@ -51,8 +51,10 @@ A new process start belongs in `tools/process-starts.allow` and `docs/PROCESSES.
 - For open-ended modernisation: `npx -y modern-web-guidance@latest legacy-scan <ui-dir> --json` (`.` from
   inside `extension/`, `desktop/crates/streamtap-app/ui` from the root), check each finding against
   `keepWhen`/`dropWhen`. Scanner 1.0.1 reports no finding for either UI (0 on 2026-11-21). The `setTimeout` calls
-  of the extension and the app's page are still reviewed by hand, tracked as `streamtap/settimeout-stellen-pruefen`;
-  leave them to that task.
+  of the shipped code were reviewed by hand (the scanner does not report them): each one that remains carries a comment
+  that says why it is a timer, and `extension/scripts/test-timers.mjs` fails on one without. A wait of 30 s or
+  more in the service worker is a `chrome.alarms` alarm, a timeout of a `fetch` is `AbortSignal.timeout()`, and the
+  app's poll stops while its window is hidden.
 - Rules: the maintainer's ruleset for the web platform (private, so not named or cited here by id).
 - `.claude/settings.json` turns the tool's telemetry off and allows only `npx -y modern-web-guidance@latest *`. No CI scanner
   here (no package manager for the UIs); the scan runs locally and in agent sessions.

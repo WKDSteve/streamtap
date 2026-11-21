@@ -118,6 +118,8 @@ jobs:
       - run: node extension/scripts/test-fmp4-mux.mjs
       # Baseline guard: no feature of Baseline 2023 that Chrome got only in 117-120 without detection or polyfill.
       - run: node extension/scripts/test-baseline.mjs
+      # Every setTimeout/setInterval of the shipped code says why it waits; the app's poll stops while its window is hidden.
+      - run: node extension/scripts/test-timers.mjs
       # The machine part of judging a recording (desktop/scripts/check-recording.mjs: container, length, tracks, pauses,
       # black throughout) against lavfi recordings, each wrong one red. Without ffmpeg it exits 3: allowed on a pull
       # request's hosted runner only, the self-hosted one has ffmpeg.

@@ -168,6 +168,7 @@ git ls-files -z 'extension/*.js' 'extension/*.mjs' 'desktop/scripts/*.mjs' 'desk
 node extension/scripts/test-hook.mjs
 node extension/scripts/test-content.mjs
 node extension/scripts/test-pairing.mjs
+node extension/scripts/test-timers.mjs           # every setTimeout of the shipped code says why it waits
 node desktop/scripts/test-sink-link.mjs
 node desktop/scripts/test-app-ui.mjs
 node desktop/scripts/test-check-recording.mjs    # the recording checker against lavfi recordings (ffmpeg; exit 3 = skip)
