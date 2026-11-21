@@ -36,7 +36,9 @@ A new process start belongs in `tools/process-starts.allow` and `docs/PROCESSES.
 - Browser Support, two targets:
   - the extension (`extension/`): Baseline 2023 (`extension/.mwgrc`), from its manifest minimums (Chrome 116,
     Firefox 128). Baseline 2023 also holds features that reached Chrome only in 117–120: use those only behind feature
-    detection, so Chrome 116 keeps working (decided 2026-11-21);
+    detection, so Chrome 116 keeps working (decided 2026-11-21). `extension/scripts/test-baseline.mjs` holds the twelve
+    (web-features) and fails on a use without a `baseline-guard: <feature id>` mark; a marked use needs its fallback
+    tested;
   - the app's page (`desktop/crates/streamtap-app/ui`, WebView2): Baseline Widely available (`.mwgrc` in the root).
 
   Neither UI has a `package.json`, so there is no `browserslist`. Newer features only behind feature detection with a

@@ -247,6 +247,10 @@ In the Chrome build the service worker and the pairing stay as above; the source
 - Test the sink link's lost-init and drain paths with a fake WebSocket (no
   sink needed): `node ../desktop/scripts/test-sink-link.mjs` without
   arguments.
+- Check that no feature of Baseline 2023 that Chrome got only in 117-120
+  (nesting, `URL.canParse`, `subgrid`, ...) is used without feature
+  detection or a shipped polyfill, so Chrome 116 keeps working:
+  `node scripts/test-baseline.mjs`.
 
 ## Result of the first live run (2026-10-30)
 
