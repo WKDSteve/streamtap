@@ -231,7 +231,11 @@ const SNAPSHOT = {
 
 // Loads app.js with `commands` as the app's Tauri commands; returns the element
 // lookup, what was copied to the clipboard and a way to run code inside the page.
-const loadApp = (commands) => {
+const loadApp = (commands, visibility = "visible") => {
+  const intervals = new Map(); // id -> { fn, ms, live }
+  let nextInterval = 0;
+  const pageListeners = {};
+  const doc = { visibilityState: visibility };
   const els = new Map();
   const byId = (id) => {
     if (!els.has(id)) els.set(id, new FakeEl(id));
@@ -251,7 +255,8 @@ const loadApp = (commands) => {
         },
       },
     },
-    document: {
+    document: Object.assign(doc, {
+      addEventListener: (type, fn) => (pageListeners[type] ??= []).push(fn),
       documentElement: new FakeEl("html"),
       activeElement: null,
       getElementById: byId,
@@ -259,21 +264,61 @@ const loadApp = (commands) => {
       createElementNS: () => new FakeEl(),
       querySelectorAll: () => [],
       querySelector: () => null,
-    },
+    }),
     navigator: { language: "en-US", clipboard: { writeText: async (text) => void copied.push(text) } },
     CSS: { escape: (s) => s },
-    setInterval: () => 0,
+    setInterval: (fn, ms) => {
+      intervals.set(++nextInterval, { fn, ms, live: true });
+      return nextInterval;
+    },
+    clearInterval: (id) => {
+      if (intervals.has(id)) intervals.get(id).live = false;
+    },
     setTimeout: () => 0,
     clearTimeout: () => {},
   });
   vm.runInContext(read("i18n.js"), context);
   vm.runInContext(read("app.js"), context);
-  return { byId, copied, page: (code) => vm.runInContext(code, context) };
+  return {
+    byId,
+    copied,
+    // Timers the page has running, and the window going hidden or visible.
+    livePolls: () => [...intervals.values()].filter((i) => i.live),
+    setVisibility: (state) => {
+      doc.visibilityState = state;
+      for (const fn of pageListeners.visibilitychange ?? []) fn({});
+    },
+    page: (code) => vm.runInContext(code, context) };
 };
 
 const settle = async () => {
   for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
 };
+
+// The snapshot is polled only while the window is visible; showing it again asks at once.
+{
+  let snapshots = 0;
+  const app = loadApp({ get_settings: () => SETTINGS, snapshot: () => (snapshots++, SNAPSHOT) });
+  await settle();
+  const first = snapshots;
+  check(app.livePolls().length === 1 && app.livePolls()[0].ms === 2000, "polling: one timer of 2 s while the window is visible");
+  app.setVisibility("hidden");
+  check(app.livePolls().length === 0, "polling: a hidden window runs no timer");
+  app.setVisibility("hidden");
+  check(app.livePolls().length === 0, "polling: hidden twice runs none either");
+  app.setVisibility("visible");
+  await settle();
+  check(snapshots > first, "polling: a window that is shown again asks at once");
+  check(app.livePolls().length === 1, `polling: and one timer runs again, not ${app.livePolls().length}`);
+  app.setVisibility("visible");
+  check(app.livePolls().length === 1, "polling: shown twice still runs one timer");
+  // A window that starts hidden does not poll until it is shown.
+  const hidden = loadApp({ get_settings: () => SETTINGS, snapshot: () => SNAPSHOT }, "hidden");
+  await settle();
+  check(hidden.livePolls().length === 0, "polling: a window that starts hidden runs no timer");
+  hidden.setVisibility("visible");
+  check(hidden.livePolls().length === 1, "polling: and starts it when it is shown");
+}
 
 // After a revoke the token field and Copy give the new token, also when the revoke
 // reports an error after the token changed (the sink did not start again).

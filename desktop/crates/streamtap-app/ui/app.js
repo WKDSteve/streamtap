@@ -73,6 +73,7 @@ const toast = (msg) => {
   box.textContent = msg;
   box.hidden = false;
   clearTimeout(toastTimer);
+  // UI delay: the message stays readable for 5 s, then goes away by itself (a new toast restarts the time).
   toastTimer = setTimeout(() => (box.hidden = true), 5000);
 };
 
@@ -767,7 +768,26 @@ const tick = async () => {
   polling = false;
 };
 
+// The sink pushes nothing to the page (no Tauri event is emitted yet), so the snapshot is polled. It is polled
+// only while the window is visible: a minimised or hidden window runs no timer, and showing it again asks at once.
+let pollTimer = 0;
+const startPolling = () => {
+  if (!pollTimer) pollTimer = setInterval(tick, POLL_MS);
+};
+const stopPolling = () => {
+  clearInterval(pollTimer);
+  pollTimer = 0;
+};
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    stopPolling();
+  } else {
+    tick();
+    startPolling();
+  }
+});
+
 // Until the stored preferences arrive, the page follows the webview's language.
 applyPrefs();
 tick();
-setInterval(tick, POLL_MS);
+if (document.visibilityState !== "hidden") startPolling();
