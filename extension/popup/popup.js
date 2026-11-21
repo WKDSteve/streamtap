@@ -347,11 +347,14 @@ const load = async () => {
     }
     pairLine.textContent = t("pairLine", { how: pairHow(s) });
   };
-  chrome.runtime.sendMessage({ kind: "vc-pair-status" }, showPair);
+  const askPair = () => chrome.runtime.sendMessage({ kind: "vc-pair-status" }, showPair);
+  askPair();
+  // The answer to a new try comes later (the host answers over the native port): the background tells the popup
+  // when the pairing state changed ("vc-changed", see the listener at the end of load), no waiting for a guess.
   $("pair-now").onclick = () =>
     chrome.runtime.sendMessage({ kind: "vc-pair-now" }, () => {
       void chrome.runtime.lastError;
-      setTimeout(() => chrome.runtime.sendMessage({ kind: "vc-pair-status" }, showPair), 800);
+      askPair();
     });
 
   const askSources = () => chrome.runtime.sendMessage({ kind: "vc-source-of", tabId: tab.id }, showSources);
@@ -481,11 +484,18 @@ const load = async () => {
       askTailnet();
     });
   };
+  // The save is finished some time after the click (the downloads API answers later): the background sends
+  // "vc-changed" when it has noted the result, so the popup asks again then instead of after a guessed delay.
   fileSave.onclick = () =>
     chrome.runtime.sendMessage({ kind: "vc-file-save", tabId: tab.id }, () => {
       void chrome.runtime.lastError;
-      setTimeout(askLink, 500);
+      askLink();
     });
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || msg.kind !== "vc-changed") return;
+    if (msg.topic === "pair") askPair();
+    else if (msg.topic === "file") askLink();
+  });
 };
 
 load();

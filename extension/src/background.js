@@ -12,6 +12,16 @@
 if (typeof importScripts === "function") importScripts("fmp4-mux.js", "file-target.js", "tailnet-target.js", "sink-link.js", "native-pairing.js", "source-policy.js");
 const FLAVOR = typeof STREAMTAP_FLAVOR === "object" && STREAMTAP_FLAVOR ? STREAMTAP_FLAVOR : { name: "chrome", sourcePolicyDefault: "", nativePairing: true };
 
+// Tells the open popup (if any) that something it shows changed; it asks again. Nobody listening is the normal
+// case: the error is read so it is not logged.
+const popupNotify = (topic) => {
+  try {
+    chrome.runtime.sendMessage({ kind: "vc-changed", topic }, () => void chrome.runtime.lastError);
+  } catch (e) {
+    // no receiver
+  }
+};
+
 const tabs = new Map(); // tabId -> { url, frames: Set, ms: Map<msId, {...}>, drm: [] }
 
 const tabState = (tabId, url) => {

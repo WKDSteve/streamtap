@@ -48,6 +48,9 @@ const makeWorld = (opts = {}) => {
   const sentToTabs = [];
   const reloads = [];
   const timers = [];
+  const notes = []; // what popupNotify (background.js) was asked to tell the popup
+  const alarms = []; // { name, when, live }
+  const alarmListeners = [];
   const logs = [];
   let nextConnectThrows = false;
   const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4, 5, 6, 7, 8]);
@@ -58,6 +61,8 @@ const makeWorld = (opts = {}) => {
     sentToTabs,
     reloads,
     timers,
+    alarms,
+    notes,
     logs,
     media: opts.media ?? [],
     active: opts.active ?? [],
@@ -97,9 +102,22 @@ const makeWorld = (opts = {}) => {
       query: async () => world.active.map((id) => ({ id })),
     },
   };
+  if (opts.alarms !== false) {
+    chrome.alarms = {
+      create: (name, info) => {
+        for (const a of alarms) if (a.name === name) a.live = false;
+        alarms.push({ name, when: info.when, live: true });
+      },
+      clear: (name) => {
+        for (const a of alarms) if (a.name === name) a.live = false;
+      },
+      onAlarm: { addListener: (f) => alarmListeners.push(f) },
+    };
+  }
   const ctx = vm.createContext({
     console: { log: (...a) => logs.push(a), debug: (...a) => logs.push(a), warn: (...a) => logs.push(a), error: (...a) => logs.push(a) },
     chrome,
+    popupNotify: (topic) => notes.push(topic),
     navigator: { userAgentData: { brands: opts.brands ?? [{ brand: "Chromium" }, { brand: "Google Chrome" }] } },
     crypto: { randomUUID: () => "11111111-2222-3333-4444-555555555555" },
     btoa: (s) => Buffer.from(s, "binary").toString("base64"),
@@ -125,6 +143,13 @@ const makeWorld = (opts = {}) => {
   };
   world.port = () => ports.at(-1);
   world.liveTimers = () => timers.filter((t) => t.live);
+  world.liveAlarms = () => alarms.filter((a) => a.live);
+  // The alarm goes off: the worker (re)starts if need be, the listener runs.
+  world.ring = async (name) => {
+    for (const a of alarms) if (a.name === name && a.live) a.live = false;
+    alarmListeners.forEach((f) => f({ name }));
+    await flush();
+  };
   // Runs the pending timers (once) whatever their delay.
   world.fire = async () => {
     for (const t of [...timers]) {
@@ -389,6 +414,30 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   check(manual.local.data.sinkToken === SECRET, "a token entered by hand is not touched by a pending state");
 }
 
+// --- the popup is told when the state changed (it waits for no timer) -------------------------
+{
+  const w = makeWorld();
+  w.start();
+  await flush();
+  check(w.notes.includes("pair"), "the popup is told that the connection started");
+  w.notes.length = 0;
+  w.port().emit({ v: 1, t: "state", pairing: "pending" });
+  await flush();
+  check(w.notes.length === 1 && w.notes[0] === "pair", "a new pairing state is told to the popup");
+  w.notes.length = 0;
+  w.port().emit({ v: 1, t: "error", code: "x" });
+  await flush();
+  check(w.notes.length === 1, "an error of the host is told to the popup");
+  w.notes.length = 0;
+  w.port().drop();
+  check(w.notes.length === 1, "a lost connection is told to the popup");
+  const gone = makeWorld();
+  gone.failConnect();
+  gone.start();
+  await flush();
+  check(gone.notes.includes("pair"), "a connect that fails is told to the popup");
+}
+
 // --- denial, revocation, retries ---------------------------------------------------------
 {
   const w = makeWorld();
@@ -397,11 +446,39 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   w.port().emit({ v: 1, t: "state", pairing: "denied" });
   await flush();
   w.port().drop();
-  const retry = w.liveTimers().at(-1);
-  check(retry && retry.ms >= 9 * 60 * 1000, `after a denial nobody asks again for minutes (delay ${retry && retry.ms} ms)`);
+  // A wait of minutes is an alarm, not a timer: a service worker is ended long before (MV3).
+  const retry = w.liveAlarms().at(-1);
+  check(retry && retry.when - Date.now() >= 9 * 60 * 1000, `after a denial nobody asks again for minutes (alarm in ${retry && retry.when - Date.now()} ms)`);
+  check(w.liveTimers().length === 0, "a wait of minutes is no setTimeout (the worker would lose it)");
   w.run("npRetryNow()");
   await flush();
   check(w.ports.length === 2, "the popup's pair-now asks again at once");
+  check(w.liveAlarms().length === 0, "pair-now takes the waiting alarm back");
+
+  // The alarm brings the connection back, and a second reconnect is not scheduled twice.
+  const alarmed = makeWorld();
+  alarmed.start();
+  await flush();
+  alarmed.port().emit({ v: 1, t: "state", pairing: "revoked" });
+  await flush();
+  alarmed.port().drop();
+  alarmed.port().drop();
+  check(alarmed.liveAlarms().length === 1, "one reconnect alarm, not one per disconnect");
+  await alarmed.ring("some-other-alarm");
+  check(alarmed.ports.length === 1, "an alarm of another name reconnects nothing");
+  alarmed.run("np.pausedUntil = 0"); // the alarm's time has come: the pause is over
+  await alarmed.ring("streamtap-np-retry");
+  check(alarmed.ports.length === 2, "the alarm reconnects");
+
+  // Without the alarms API (a build without the permission) the wait stays a timer.
+  const noAlarms = makeWorld({ alarms: false });
+  noAlarms.start();
+  await flush();
+  noAlarms.port().emit({ v: 1, t: "state", pairing: "denied" });
+  await flush();
+  noAlarms.port().drop();
+  const fallback = noAlarms.liveTimers().at(-1);
+  check(fallback && fallback.ms >= 9 * 60 * 1000, "no alarms API: the long wait falls back to a timer");
 
   // Revocation takes paired credentials back, a manual setup stays.
   const paired = makeWorld({ local: { sinkToken: SECRET, sinkPaired: true, tapMode: "selected", sinkPort: 17650 }, session: { tapTabs: [3], tapOrigins: { 3: "https://video.example" } } });
@@ -424,12 +501,22 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   gone.start();
   await flush();
   const delays = [];
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 3; i++) {
     gone.port().drop();
     delays.push(gone.liveTimers().at(-1).ms);
     await gone.fire();
   }
-  check(delays[0] >= 5000 && delays[1] > delays[0] && delays.every((d) => d <= 5 * 60 * 1000), `reconnects back off (${delays.join(", ")} ms)`);
+  check(delays[0] >= 5000 && delays[1] > delays[0] && delays[2] > delays[1] && delays.every((d) => d < 30 * 1000), `reconnects back off (${delays.join(", ")} ms)`);
+  check(gone.liveAlarms().length === 0, "short backoff waits (under 30 s) stay timers");
+  // The backoff reaches 40 s: from there an alarm (the worker idles out after about 30 s), and it keeps growing.
+  gone.port().drop();
+  const first = gone.liveAlarms().at(-1);
+  check(first && first.when - Date.now() >= 39 * 1000 && gone.liveTimers().length === 0, "a backoff of 30 s or more is an alarm, not a timer");
+  await gone.ring("streamtap-np-retry");
+  gone.run("np.pausedUntil = 0");
+  gone.port().drop();
+  const second = gone.liveAlarms().at(-1);
+  check(second && second.when - Date.now() >= 79 * 1000, `the alarm backoff grows (${second && second.when - Date.now()} ms)`);
   const throwing = makeWorld();
   throwing.failConnect();
   throwing.start();

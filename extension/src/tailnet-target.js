@@ -148,6 +148,8 @@ const tnAsk = (host, header) =>
       }
       resolve(answer);
     };
+    // Timeout of a WebSocket answer: fetch has AbortSignal.timeout, a socket has nothing like it. 15 s is
+    // under the 30 s a service worker idles, and the open socket keeps it alive meanwhile.
     const timer = setTimeout(() => finish(null), TN_ANSWER_MS);
     try {
       ws = new WebSocket(`wss://${host}/`);
@@ -275,6 +277,7 @@ class TailnetSocket {
     this._timer = null;
     // Revoked, another sink, or too old: no network until the person pairs again (or updates).
     if (!pairing || tn.blocked) {
+      // A zero delay, not a wait: onclose is set by the caller only after the constructor returned.
       setTimeout(() => this._end(tn.blocked || "not-paired"), 0);
       return;
     }
@@ -282,11 +285,13 @@ class TailnetSocket {
     try {
       this._ws = new WebSocket(`wss://${pairing.host}/`);
     } catch (e) {
+      // Same: the caller's handlers come after the constructor.
       setTimeout(() => this._end("unreachable"), 0);
       return;
     }
     const ws = this._ws;
     ws.binaryType = "arraybuffer";
+    // Timeout of the login (no fetch to give AbortSignal.timeout to); the socket keeps the worker alive meanwhile.
     this._timer = setTimeout(() => this._end("unreachable"), TN_ANSWER_MS);
     ws.onopen = () => ws.send(tnFrame({ type: "login", v: TN_PROTOCOL, device: pairing.device }));
     ws.onmessage = (ev) => {

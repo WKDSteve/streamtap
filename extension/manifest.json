@@ -7,6 +7,7 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz5iYI+AW0WFlCIPUBm0EYBjUi7qZsbIy2VKeupWvfJejXoqUKO1xhVTo8BR9NRJHBRQ0yj1TZeIUXGLZoV5VPih0RFFri1cA6r46J+HFY5MWHcoBrEoZ6xvrjjlfW8ja8CbtP1bWxfQC9AYPJgn9SRO/4SaxL1vqTLvq4spsIu4gSUDbulWqLWxMAJe5Ml8+94aBZwuwvTEOS6WV1lNvC7cXwDnUoNKd6wqP1oa8cYPnhr0Mw96X6Ay3LE+kiXiX6moenv3hUl5/DxPD5u6DJd5j9Yt+MkotrysfK3+1EMZZHEKwzQLQBWtKFxPIfvqz0IIyt2lJghSbtwyRUOTXbQIDAQAB",
   "permissions": [
     "storage",
+    "alarms",
     "nativeMessaging",
     "favicon"
   ],

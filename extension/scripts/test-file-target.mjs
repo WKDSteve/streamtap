@@ -31,8 +31,11 @@ const check = (ok, what) => {
 const MAGIC = "STREAMTAP-RECORDING/1\n";
 
 // A vm context with both scripts; `downloads: false` leaves the API out.
-const world = ({ downloads = true, target = "file" } = {}) => {
+const world = ({ downloads = true, target = "file", onChanged = false } = {}) => {
   const blobs = new Map();
+  const notes = []; // popupNotify (background.js)
+  const longWaits = []; // timers of a minute or more are recorded, never run
+  const changed = [];
   const saved = [];
   let connect = null;
   let n = 0;
@@ -47,6 +50,7 @@ const world = ({ downloads = true, target = "file" } = {}) => {
         setTimeout(() => cb(saved.length), 0);
       },
     };
+    if (onChanged) chrome.downloads.onChanged = { addListener: (f) => changed.push(f) };
   }
   const url = {
     createObjectURL: (b) => {
@@ -61,7 +65,8 @@ const world = ({ downloads = true, target = "file" } = {}) => {
     return new URL(...a);
   };
   Object.assign(URLx, url);
-  const ctx = vm.createContext({ console, Blob, TextEncoder, TextDecoder, BigInt, Math, DataView, Uint8Array, setTimeout, fetch, URL: URLx, chrome, WebSocket: { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 } });
+  const wait = (f, ms) => (ms >= 60000 ? void longWaits.push(ms) : setTimeout(f, ms));
+  const ctx = vm.createContext({ console, Blob, TextEncoder, TextDecoder, BigInt, Math, DataView, Uint8Array, setTimeout: wait, popupNotify: (t) => notes.push(t), fetch, URL: URLx, chrome, WebSocket: { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 } });
   vm.runInContext(src("fmp4-mux.js"), ctx, { filename: "fmp4-mux.js" });
   vm.runInContext(src("file-target.js"), ctx, { filename: "file-target.js" });
   vm.runInContext(src("sink-link.js"), ctx, { filename: "sink-link.js" });
@@ -77,7 +82,7 @@ const world = ({ downloads = true, target = "file" } = {}) => {
     p.post({ t: "hello", session: `file-${tabId}`, title: "test-file-target.mjs" });
     return p;
   };
-  return { ctx, saved, port, run: (code) => vm.runInContext(code, ctx) };
+  return { ctx, saved, blobs, notes, longWaits, changed, port, run: (code) => vm.runInContext(code, ctx) };
 };
 
 // A payload is its label, "|", then padding up to `size` bytes.
@@ -118,6 +123,65 @@ const tick = () => sleep(40);
 const until = async (cond) => {
   for (let i = 0; i < 100 && !cond(); i++) await sleep(20);
 };
+
+// The blob URL of a download is let go when the download ends (downloads.onChanged), not on a timer.
+{
+  const w = world({ onChanged: true });
+  const p = w.port(1);
+  p.post(seg("A", { init: true }));
+  p.post(seg("a1"));
+  await until(() => w.run("fileStatus(1)").media === 1);
+  p.gone();
+  await until(() => w.saved.length === 1);
+  await tick();
+  check(w.saved.length === 1 && w.blobs.size === 1, "revoke: the blob lives while the download runs");
+  check(w.longWaits.length === 0, `revoke: no timer of minutes for the blob (got ${w.longWaits})`);
+  check(w.changed.length === 1, "revoke: one onChanged listener");
+  w.changed[0]({ id: 99, state: { current: "complete" } });
+  check(w.blobs.size === 1, "revoke: the end of another download revokes nothing");
+  w.changed[0]({ id: 1, filesize: { current: 5 } });
+  check(w.blobs.size === 1, "revoke: a change that is not the end revokes nothing");
+  w.changed[0]({ id: 1, state: { current: "in_progress" } });
+  check(w.blobs.size === 1, "revoke: in_progress revokes nothing");
+  w.changed[0]({ id: 1, state: { current: "complete" } });
+  check(w.blobs.size === 0, "revoke: the blob is let go when the download completes");
+
+  const q = w.port(2);
+  q.post(seg("B", { init: true }));
+  q.post(seg("b1"));
+  await until(() => w.run("fileStatus(2)").media === 1);
+  q.gone();
+  await until(() => w.saved.length === 2);
+  await tick();
+  check(w.changed.length === 1, "revoke: the listener is added once");
+  w.changed[0]({ id: 2, state: { current: "interrupted" } });
+  check(w.blobs.size === 0, "revoke: an interrupted download lets the blob go too");
+}
+// The popup is told when a save has been noted (it asks again then, no guessed delay).
+{
+  const w = world();
+  const p = w.port(1);
+  p.post(seg("A", { init: true }));
+  p.post(seg("a1"));
+  await until(() => w.run("fileStatus(1)").media === 1);
+  check(w.notes.length === 0, "notify: nothing is told before a save");
+  p.gone();
+  await until(() => w.saved.length === 1);
+  await until(() => w.notes.length > 0);
+  check(w.notes.length === 1 && w.notes[0] === "file", `notify: a saved file is told to the popup (got ${w.notes})`);
+}
+// Without onChanged the blob is let go after the long wait (the fallback keeps the timer).
+{
+  const w = world();
+  const p = w.port(1);
+  p.post(seg("A", { init: true }));
+  p.post(seg("a1"));
+  await until(() => w.run("fileStatus(1)").media === 1);
+  p.gone();
+  await until(() => w.saved.length === 1);
+  await tick();
+  check(w.longWaits.length === 1 && w.longWaits[0] >= 60000, `revoke: without onChanged a timer lets the blob go (got ${w.longWaits})`);
+}
 
 // saved
 {
@@ -245,5 +309,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log("ok: all checks passed");
-// The blob URLs are let go on timers of two minutes: not waited for.
+// The fallback timers of the blob URLs (without onChanged) are not waited for.
 process.exit(0);

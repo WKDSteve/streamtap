@@ -124,7 +124,8 @@ instead and says why, so nothing is lost: on the PC `replay` and `mux` handle th
 1. Build and start the app (`..\scripts\build.ps1`), press **Connect browser**, **Register**
    for your browser (Chrome, Edge or Brave; per user, no admin) and **Start** the sink.
 2. **Reload the extension** on `chrome://extensions` (0.3 adds the `nativeMessaging` and
-   `favicon` permissions; Chrome asks again or disables the extension until you accept).
+   `favicon` permissions, a later version `alarms`, which has no warning and lets a reconnect wait of minutes
+   survive the service worker being ended; Chrome asks again or disables the extension until you accept).
 3. The app shows *"<browser> (profile …) wants to pair"*: **Approve**. The extension stores
    port and token itself; the popup's *Target* page shows `App pairing: paired`.
 4. The app lists the tabs that hold a video; **Capture** one. That tab is reloaded once and

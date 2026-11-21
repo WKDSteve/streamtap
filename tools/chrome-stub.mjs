@@ -44,6 +44,8 @@ export function chromeStub({ target }) {
       lastError: undefined,
       getManifest: () => ({ version: "0.0.0" }),
       sendMessage: (msg, cb) => cb && cb(answers[msg.kind]),
+      // The popup listens for the background's news ("vc-changed"); the stub has no background to send any.
+      onMessage: { addListener: () => {} },
     },
     tabs: { query: async () => [{ id: 1 }] },
     storage: { local: { get: (wanted, cb) => cb({ ...wanted, ...("sinkTarget" in wanted ? { sinkTarget: target } : {}) }), set: (_values, cb) => cb && cb() } },

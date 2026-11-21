@@ -29,6 +29,11 @@ const NP_BACKOFF_MIN_MS = 5000;
 const NP_BACKOFF_MAX_MS = 5 * 60 * 1000;
 const NP_PAUSE_MS = 10 * 60 * 1000; // after a denial or a revocation nobody asks again for this long
 const NP_SEND_GAP_MS = 1000; // at most one tab list per second
+// A wait of 30 s or more is an alarm: a service worker is ended after about 30 s without an event, and a setTimeout
+// dies with it. (Chrome 116-119 lifts an alarm under a minute to a minute, 120 and later allow 30 s; both are fine
+// for a reconnect.)
+const NP_ALARM_MIN_MS = 30 * 1000;
+const NP_RETRY_ALARM = "streamtap-np-retry";
 const NP_PAIRINGS = ["pending", "approved", "denied", "revoked"];
 
 const np = {
@@ -40,6 +45,7 @@ const np = {
   ready: Promise.resolve(),
   backoff: NP_BACKOFF_MIN_MS,
   retryTimer: null,
+  retryAlarm: false, // a reconnect is waiting as an alarm (long waits)
   pausedUntil: 0,
   sendTimer: null,
   lastSentAt: 0,
@@ -299,6 +305,8 @@ const npScheduleSend = (force) => {
   }
   if (force) np.forceNext = true;
   const wait = Math.max(0, np.lastSentAt + NP_SEND_GAP_MS - Date.now());
+  // Debounce, one second: coalesces a burst of registry changes into one list. Far below the alarm minimum, and
+  // a worker that is ended meanwhile sends the list again when its next event starts it (npInit).
   np.sendTimer = setTimeout(() => {
     np.sendTimer = null;
     const f = np.forceNext === true;
@@ -320,6 +328,7 @@ const npOnMessage = async (m) => {
       if (!NP_PAIRINGS.includes(m.pairing)) return;
       np.status.pairing = m.pairing;
       np.status.error = null;
+      npChanged();
       np.backoff = NP_BACKOFF_MIN_MS;
       if (m.pairing === "approved") {
         np.lastSig = "";
@@ -341,21 +350,63 @@ const npOnMessage = async (m) => {
       break;
     case "error":
       np.status.error = typeof m.code === "string" ? m.code.slice(0, 32) : "error";
+      npChanged();
       break;
     default:
       break;
   }
 };
 
+// The popup shows the pairing state; it asks again when told (popupNotify is background.js).
+const npChanged = () => {
+  if (typeof popupNotify === "function") popupNotify("pair");
+};
+
+const npAlarmsAvailable = () =>
+  typeof chrome !== "undefined" && Boolean(chrome.alarms && typeof chrome.alarms.create === "function" && chrome.alarms.onAlarm);
+
+// Takes back a waiting reconnect, timer or alarm.
+const npCancelReconnect = () => {
+  if (np.retryTimer) {
+    clearTimeout(np.retryTimer);
+    np.retryTimer = null;
+  }
+  if (np.retryAlarm) {
+    np.retryAlarm = false;
+    try {
+      chrome.alarms.clear(NP_RETRY_ALARM);
+    } catch (e) {
+      // no alarms API: nothing was scheduled
+    }
+  }
+};
+
 const npScheduleReconnect = () => {
-  if (np.retryTimer) return;
+  if (np.retryTimer || np.retryAlarm) return;
   const wait = Math.max(np.backoff, np.pausedUntil - Date.now());
   np.backoff = Math.min(np.backoff * 2, NP_BACKOFF_MAX_MS);
+  if (wait >= NP_ALARM_MIN_MS && npAlarmsAvailable()) {
+    // Backoff of 30 s and more and the pause after a denial: survives the worker being ended.
+    np.retryAlarm = true;
+    chrome.alarms.create(NP_RETRY_ALARM, { when: Date.now() + wait });
+    return;
+  }
+  // Retry: a short backoff (5 s up to 20 s) is under the time the worker idles; one that is ended before the timer
+  // fires connects again at its next start (npInit).
   np.retryTimer = setTimeout(() => {
     np.retryTimer = null;
     npConnect();
   }, wait);
 };
+
+// Registered when the script is loaded, as a service worker must (the alarm that wakes it finds the listener).
+if (typeof chrome !== "undefined" && chrome.alarms && chrome.alarms.onAlarm) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (!alarm || alarm.name !== NP_RETRY_ALARM) return;
+    np.retryAlarm = false;
+    npConnect();
+  });
+}
 
 const npConnect = () => {
   if (np.port) return;
@@ -368,11 +419,13 @@ const npConnect = () => {
     port = chrome.runtime.connectNative(NP_HOST);
   } catch (e) {
     np.status = { connected: false, pairing: null, error: "connect-failed" };
+    npChanged();
     npScheduleReconnect();
     return;
   }
   np.port = port;
   np.status = { connected: true, pairing: null, error: null };
+  npChanged();
   port.onMessage.addListener((m) => {
     npOnMessage(m).catch(() => {});
   });
@@ -389,6 +442,7 @@ const npConnect = () => {
       clearTimeout(np.sendTimer);
       np.sendTimer = null;
     }
+    npChanged();
     npScheduleReconnect();
   });
   npInstanceId()
@@ -412,10 +466,7 @@ const npStatus = () => ({
 const npRetryNow = () => {
   np.pausedUntil = 0;
   np.backoff = NP_BACKOFF_MIN_MS;
-  if (np.retryTimer) {
-    clearTimeout(np.retryTimer);
-    np.retryTimer = null;
-  }
+  npCancelReconnect();
   npConnect();
 };
 

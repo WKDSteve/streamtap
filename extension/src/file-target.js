@@ -79,7 +79,7 @@ class FileRecorder {
     this.restartAtOnce = true;
     if (!fileRecorders.has(tabId)) fileRecorders.set(tabId, new Set());
     fileRecorders.get(tabId).add(this);
-    // Opened like a socket: after the caller has set its handlers.
+    // Opened like a socket: after the caller has set its handlers (a zero delay, not a wait).
     setTimeout(() => {
       if (this.readyState !== FILE_CONNECTING) return;
       this.readyState = FILE_OPEN;
@@ -164,8 +164,9 @@ class FileRecorder {
     const done = (id) => {
       const failed = chrome.runtime.lastError || typeof id !== "number";
       fileNote(failed ? { error: "download", name, at: Date.now() } : { name, full: this.full, at: Date.now(), ...note });
-      // The download reads the blob; it is let go once that had time to finish.
-      setTimeout(() => URL.revokeObjectURL(href), FILE_REVOKE_MS);
+      // The download reads the blob; it is let go when the download has ended.
+      if (failed) URL.revokeObjectURL(href); // nothing started: nothing reads the blob
+      else fileRevokeWhenDone(id, href);
     };
     try {
       chrome.downloads.download({ url: href, filename: name, saveAs: false, conflictAction: "uniquify" }, done);
@@ -198,9 +199,36 @@ const fileVideoOf = async (frames) => {
   return { ok: true, blob: new Blob(r.parts, { type: "video/mp4" }), report };
 };
 
+// blob URLs of started downloads, by download id: revoked when the downloads API says the download ended.
+const fileHeld = new Map();
+let fileWatching = false;
+
+const fileRevokeWhenDone = (id, href) => {
+  const events = typeof chrome !== "undefined" && chrome.downloads && chrome.downloads.onChanged;
+  if (events && typeof events.addListener === "function") {
+    if (!fileWatching) {
+      fileWatching = true;
+      events.addListener((delta) => {
+        const held = fileHeld.get(delta && delta.id);
+        const state = delta && delta.state && delta.state.current;
+        if (held && (state === "complete" || state === "interrupted")) {
+          fileHeld.delete(delta.id);
+          URL.revokeObjectURL(held);
+        }
+      });
+    }
+    fileHeld.set(id, href);
+    return;
+  }
+  // No onChanged event in this browser (Firefox for Android has a part of the API only): nothing says when the
+  // download has read the blob, so it is let go after a generous wait.
+  setTimeout(() => URL.revokeObjectURL(href), FILE_REVOKE_MS);
+};
+
 const fileNote = (entry) => {
   fileSaved.unshift(entry);
   fileSaved.length = Math.min(fileSaved.length, 5);
+  if (typeof popupNotify === "function") popupNotify("file"); // background.js; the popup shows the last saves
 };
 
 // "Save now" from the popup: every recording of the tab is closed and saved; the links start a new recording at

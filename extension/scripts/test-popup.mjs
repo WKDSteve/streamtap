@@ -88,7 +88,7 @@ const run = async (o = {}) => {
   const nodes = pageNodes();
   const ids = Object.fromEntries(nodes.filter((n) => n.attrs.id).map((n) => [n.attrs.id, n]));
   const missing = [];
-  const env = { ids, sent: [], sets: [], missing, misses: [] };
+  const env = { ids, sent: [], sets: [], missing, misses: [], timeouts: [], onMessage: [] };
   const listeners = [];
   const trail = [o.hash || ""];
   const location = {
@@ -137,6 +137,7 @@ const run = async (o = {}) => {
         env.sent.push(msg);
         cb?.(answers[msg.kind]);
       },
+      onMessage: { addListener: (f) => env.onMessage.push(f) },
     },
     tabs: { query: async () => [{ id: 1 }] },
     storage: {
@@ -152,7 +153,8 @@ const run = async (o = {}) => {
     location,
     history,
     navigator: { language: o.lang || "en-US" },
-    setTimeout,
+    // The popup waits for nothing: a delay would be noted here (the test below says there is none).
+    setTimeout: (f, ms) => (env.timeouts.push(ms), 0),
     addEventListener: (kind, fn) => kind === "hashchange" && listeners.push(fn),
   });
   vm.runInContext(i18nSource, ctx);
@@ -328,6 +330,17 @@ const forged = {
   const p = await run({ pair: { connected: false } });
   p.ids["pair-now"].onclick();
   check(p.sent.some((m) => m.kind === "vc-pair-now"), "pair now asks the background");
+  const count = (kind) => p.sent.filter((m) => m.kind === kind).length;
+  check(count("vc-pair-status") === 2, "pair now asks for the state again at once");
+  check(p.timeouts.length === 0, `pairing: the popup waits for no timer (got ${p.timeouts})`);
+  // The answer of the host comes later: the background says so, and the popup asks again.
+  check(p.onMessage.length === 1, "the popup listens for the background's news");
+  p.onMessage[0]({ kind: "vc-changed", topic: "pair" });
+  check(count("vc-pair-status") === 3, "news about the pairing: the popup asks for the state");
+  p.onMessage[0]({ kind: "vc-changed", topic: "other" });
+  p.onMessage[0]({ kind: "something-else", topic: "pair" });
+  p.onMessage[0](null);
+  check(count("vc-pair-status") === 3, "other news changes nothing");
 }
 
 // The source section: forged overview values come out as text and form values.
@@ -448,6 +461,11 @@ const forged = {
   check(full.ids["file-state"].textContent.includes("memory full") && full.ids["file-save"].hidden === false, "device: a full memory is said, and the recording can be saved");
   full.ids["file-save"].onclick();
   check(full.sent.some((m) => m.kind === "vc-file-save" && m.tabId === 1), "device: save now asks the background for this tab");
+  const links = () => full.sent.filter((m) => m.kind === "vc-link-status").length;
+  const before = links();
+  check(full.timeouts.length === 0, `device: the popup waits for no timer after save now (got ${full.timeouts})`);
+  full.onMessage[0]({ kind: "vc-changed", topic: "file" });
+  check(links() === before + 1, "device: news that a file was saved makes the popup ask for the link again");
 }
 
 // --- both languages ------------------------------------------------------------
