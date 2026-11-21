@@ -50,8 +50,9 @@ A new process start belongs in `tools/process-starts.allow` and `docs/PROCESSES.
   the app's page.
 - For open-ended modernisation: `npx -y modern-web-guidance@latest legacy-scan <ui-dir> --json` (`.` from
   inside `extension/`, `desktop/crates/streamtap-app/ui` from the root), check each finding against
-  `keepWhen`/`dropWhen`. Known finding, tracked as `streamtap/settimeout-stellen-pruefen`: the `setTimeout` calls
-  of the extension and the app's page; leave them to that task.
+  `keepWhen`/`dropWhen`. Scanner 1.0.1 reports no finding for either UI (0 on 2026-11-21). The `setTimeout` calls
+  of the extension and the app's page are still reviewed by hand, tracked as `streamtap/settimeout-stellen-pruefen`;
+  leave them to that task.
 - Rules: rules-vault ruleset `web` (plus the app rules `WEB-*` in ruleset `native`).
 - `.claude/settings.json` turns the tool's telemetry off and allows only `npx -y modern-web-guidance@latest *`. No CI scanner
   here (no package manager for the UIs); the scan runs locally and in agent sessions.
