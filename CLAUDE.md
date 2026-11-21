@@ -42,7 +42,7 @@ A new process start belongs in `tools/process-starts.allow` and `docs/PROCESSES.
   - the app's page (`desktop/crates/streamtap-app/ui`, WebView2): Baseline Widely available (`.mwgrc` in the root).
 
   Neither UI has a `package.json`, so there is no `browserslist`. Newer features only behind feature detection with a
-  fallback; polyfills where browsers still in use need them (rather one too many), run only after the check: dynamic `import()`, or bundled in a `file://` page (rules-vault `BASE-02`) (the extension loads no remote code: a polyfill there must ship in
+  fallback; polyfills where browsers still in use need them (rather one too many), run only after the check: dynamic `import()`, or bundled in a `file://` page (the extension loads no remote code: a polyfill there must ship in
   the extension).
 - Before writing or changing HTML, CSS or client-side JS, use the `modern-web-guidance` skill (`search` → `retrieve` →
   verify). Not for Rust, backend, CI or build config. The tool finds `.mwgrc` from the current directory upwards and
@@ -53,6 +53,6 @@ A new process start belongs in `tools/process-starts.allow` and `docs/PROCESSES.
   `keepWhen`/`dropWhen`. Scanner 1.0.1 reports no finding for either UI (0 on 2026-11-21). The `setTimeout` calls
   of the extension and the app's page are still reviewed by hand, tracked as `streamtap/settimeout-stellen-pruefen`;
   leave them to that task.
-- Rules: rules-vault ruleset `web` (plus the app rules `WEB-*` in ruleset `native`).
+- Rules: the maintainer's ruleset for the web platform (private, so not named or cited here by id).
 - `.claude/settings.json` turns the tool's telemetry off and allows only `npx -y modern-web-guidance@latest *`. No CI scanner
   here (no package manager for the UIs); the scan runs locally and in agent sessions.
