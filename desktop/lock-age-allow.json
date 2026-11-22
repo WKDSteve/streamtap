@@ -1,0 +1,16 @@
+[
+  {
+    "crate": "url",
+    "version": "2.5.9",
+    "advisory": "RUSTSEC-2026-0592",
+    "reason": "the fix of the advisory (stack overflow in Url::origin on nested blob: URLs); there is no older fixed version. Decided by Stefan 2026-11-22",
+    "until": "2026-11-27"
+  },
+  {
+    "crate": "form_urlencoded",
+    "version": "1.2.3",
+    "advisory": "RUSTSEC-2026-0592",
+    "reason": "required by url 2.5.9, the fix of the advisory (same release of rust-url). Decided by Stefan 2026-11-22",
+    "until": "2026-11-27"
+  }
+]
