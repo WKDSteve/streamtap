@@ -61,9 +61,10 @@ jobs:
       short: ${{ steps.prepare.outputs.short }}
     steps:
       - id: prepare
-        uses: WKDSteve/appkit/release-kit/prepare@041b49c502d2dcea62a7f753cd98f6e2da14c70d # v0.74.0
+        uses: WKDSteve/appkit/release-kit/prepare@70df3786e91757f71666cfda1b254847c247c3fe # v0.75.0
         with:
           sha: ${{ github.event.inputs.sha }}
+          channels: latest
           token: ${{ github.token }}
 
   build:
@@ -163,7 +164,7 @@ jobs:
           path: dist
           merge-multiple: true
       - if: ${{ steps.tip.outputs.current == 'true' }}
-        uses: WKDSteve/appkit/release-kit/publish@041b49c502d2dcea62a7f753cd98f6e2da14c70d # v0.74.0
+        uses: WKDSteve/appkit/release-kit/publish@70df3786e91757f71666cfda1b254847c247c3fe # v0.75.0
         with:
           token: ${{ github.token }}
           tag: latest

@@ -243,3 +243,10 @@ MIT, see [LICENSE](LICENSE).
 - [hub-desktop](https://github.com/WKDSteve/hub-desktop): hub-desktop shows streamtap as a tile; it is a program with a window of its own. ([picture](assets/graphs/pair/hub-desktop--streamtap.png))
 - [takt](https://github.com/WKDSteve/takt): takt documents a protocol for external sources (`docs/SOURCES.md`) that providers such as streamtap are to deliver through. ([picture](assets/graphs/pair/takt--streamtap.png))
 <!-- connections:end -->
+
+## Release channels
+
+The rolling build has one channel, `latest`: the newest commit of `main` whose CI is green, rebuilt after every
+green CI run and only ever moving forward. Releases are separate (`vX.Y.Z`). The channels an app has switched on
+are the `channels:` line of the prepare step in `.github/workflows/rolling.yml`; `nightly` (the tip of `main`) and
+`stable` (a `latest` that has stayed up for 14 days) are not switched on.
