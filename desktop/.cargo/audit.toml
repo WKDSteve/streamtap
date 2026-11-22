@@ -9,4 +9,10 @@ ignore = [
     "RUSTSEC-2024-0370",
     # glib 0.18 VariantStrIter unsoundness: glib is the GTK backend, Linux only; no glib code runs on Windows.
     "RUSTSEC-2024-0429",
+    # chrono is unmaintained (all versions, no patched release). It sits in Cargo.lock only as the optional chrono_0_4
+    # integration of serde_with (a Tauri build-time dependency, tauri-utils); no feature turns it on, so it is not
+    # compiled into any target: `cargo tree -i chrono@0.4.45 --target all` prints nothing and cargo-deny (which reads
+    # the real graph, see deny.toml) does not report it. cargo-audit reads the whole lock file, hence the ignore.
+    # Look at it again when serde_with or Tauri drop the lock entry; remove the ignore then.
+    "RUSTSEC-2026-0543",
 ]
