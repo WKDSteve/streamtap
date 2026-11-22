@@ -321,7 +321,7 @@ class Rules(unittest.TestCase):
         self.found(sabotaged("rolling.yml", "needs.prepare.outputs.current == 'true'", "true"), "the tip")
 
     def test_a_rolling_build_that_ignores_a_failed_ci_is_found(self):
-        self.found(sabotaged("rolling.yml", "    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}", "    if: ${{ true }}"), "green CI builds")
+        self.found(sabotaged("rolling.yml", "    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}", "    if: ${{ true }}"), "green CI builds")
 
     def test_a_rolling_build_to_another_tag_is_found(self):
         self.found(sabotaged("rolling.yml", "tag: latest", "tag: nightly"), "latest")
@@ -339,7 +339,7 @@ class Rules(unittest.TestCase):
         self.found(sabotaged("rolling.yml", "ref: ${{ needs.prepare.outputs.sha }}", "ref: ${{ github.event.workflow_run.head_branch }}"), "checkout must take")
 
     def test_a_prepare_for_another_commit_is_found(self):
-        self.found(sabotaged("rolling.yml", "sha: ${{ github.event.workflow_run.head_sha }}", "sha: ${{ github.sha }}"), "head_sha")
+        self.found(sabotaged("rolling.yml", "sha: ${{ github.event.inputs.sha }}", "sha: ${{ github.sha }}"), "inputs.sha")
 
     def test_a_workflow_level_concurrency_is_found(self):
         self.found(sabotaged("rolling.yml", "permissions:\n  contents: read\n\nenv:", "concurrency:\n  group: rolling\n  cancel-in-progress: true\n\npermissions:\n  contents: read\n\nenv:"), "workflow-level concurrency")
@@ -351,7 +351,7 @@ class Rules(unittest.TestCase):
         self.found(sabotaged("rolling.yml", "      group: rolling-publish\n      cancel-in-progress: false", "      group: rolling-publish\n      cancel-in-progress: true"), "never be cancelled")
 
     def test_a_publish_without_the_tip_check_is_found(self):
-        self.found(sabotaged("rolling.yml", "git/ref/heads/main", "git/ref/heads/other"), "still the commit")
+        self.found(sabotaged("rolling.yml", "/compare/", "/other/"), "build that is up is newer")
 
     def test_a_publish_step_that_ignores_the_tip_check_is_found(self):
         self.found(sabotaged("rolling.yml", "      - name: Empty dist\n        if: ${{ steps.tip.outputs.current == 'true' }}\n", "      - name: Empty dist\n"), "only if it is still the tip")

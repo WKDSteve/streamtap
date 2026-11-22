@@ -431,7 +431,7 @@ def check_release(name, text, wf):
 def check_rolling(name, text, wf):
     problems = []
     events = triggers_of(wf)
-    for other in sorted(set(events) - {"workflow_run"}):
+    for other in sorted(set(events) - {"workflow_run", "workflow_dispatch"}):
         problems.append(f"{name}: starts on more than a finished CI of main ({other})")
     if events.get("workflow_run") != {"workflows": ["ci"], "types": ["completed"], "branches": ["main"]}:
         problems.append(f"{name}: must start on `workflow_run` of `ci` (completed, branch main)")
@@ -445,7 +445,7 @@ def check_rolling(name, text, wf):
         problems.append(f"{name}: job build must be cancelled by a newer build (concurrency rolling-build, cancel-in-progress: true)")
     if publish.get("concurrency") != {"group": "rolling-publish", "cancel-in-progress": "false"}:
         problems.append(f"{name}: job publish must never be cancelled (concurrency rolling-publish, cancel-in-progress: false)")
-    if prepare.get("if") != "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}":
+    if prepare.get("if") != "${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}":
         problems.append(f"{name}: missing: only a green CI builds (the if of prepare)")
     if build.get("if") != "${{ needs.prepare.outputs.current == 'true' }}":
         problems.append(f"{name}: missing: the build must wait for prepare's word that it is the tip")
@@ -456,8 +456,8 @@ def check_rolling(name, text, wf):
     step = publish_step(prepare, "prepare")
     if step is None:
         problems.append(f"{name}: missing: only the tip of main is built (prepare)")
-    elif with_of(step).get("sha") != "${{ github.event.workflow_run.head_sha }}":
-        problems.append(f"{name}: prepare must be asked about the commit of the CI run (head_sha)")
+    elif with_of(step).get("sha") != "${{ github.event.inputs.sha }}":
+        problems.append(f"{name}: prepare must be given only the commit named by hand (inputs.sha), it picks the newest green one itself")
     step = publish_step(publish)
     if step is None:
         problems.append(f"{name}: missing: the file goes up by the kit's publish action")
@@ -475,8 +475,8 @@ def check_rolling(name, text, wf):
     # A publish that waited behind a newer one stops when main has moved on.
     steps = steps_of(publish)
     tip = [s for s in steps if s.get("id") == "tip"]
-    if not tip or "git/ref/heads/main" not in str(tip[0].get("run", "")):
-        problems.append(f"{name}: publish must ask first whether main is still the commit it publishes (step tip)")
+    if not tip or "/compare/" not in str(tip[0].get("run", "")):
+        problems.append(f"{name}: publish must ask first whether the build that is up is newer (step tip, compare)")
     else:
         for step in steps[steps.index(tip[0]) + 1:]:
             if step.get("if") != TIP_IF:

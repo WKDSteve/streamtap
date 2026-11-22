@@ -10,7 +10,7 @@
 # Runs on the self-hosted Windows runner of the maintainer (`runs-on: [self-hosted, windows]`, by the
 # author's choice), so only Windows is built. appkit is public and read without credentials.
 #
-# Deciding (only the tip of main is built) and publishing (SHA256SUMS first, the words of the page
+# Deciding (the newest green commit of main is built) and publishing (SHA256SUMS first, the words of the page
 # last) are the actions prepare and publish of appkit's release-kit, pinned by commit (tools/check-workflows.py
 # checks the pin). The build is ours: its file goes to publish as an artifact.
 #
@@ -23,14 +23,18 @@ on:
     workflows: [ci]
     types: [completed]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: A green commit of main to build again (full id); empty - the newest green commit
+        required: false
 
-# Only the run of the TIP of main may build, and a newer tip replaces a build that is still running: the
-# pre-release must end on the newest commit. This is kept per job, never for the whole workflow: a
-# workflow-level `cancel-in-progress` would also kill a `publish` that is halfway through replacing the
-# zip and the checksums, and the pre-release would be left without a file. So `build` is cancelled by a
-# newer build (group `rolling-build-true`; a run that is not the tip has `current` false and lands in a
-# group of its own, it builds nothing), and `publish` is never cancelled: a newer publish waits for it,
-# and a late older one finds that main has moved on and does nothing (step "Is it still the tip").
+# `prepare` picks the newest green commit of main at the start of each run (appkit release-kit), and `latest` only
+# moves forward. Concurrency is kept per job, never for the whole workflow: a workflow-level `cancel-in-progress`
+# would also kill a `publish` that is halfway through replacing the zip and the checksums, and the pre-release would
+# be left without a file. So a newer `build` cancels an older one (group `rolling-build-true`; a run that builds
+# nothing has `current` false and lands in a group of its own), and `publish` is never cancelled: a newer publish
+# waits for it, and a late older one finds that a newer build is up and does nothing (step "Is it newer").
 permissions:
   contents: read
 
@@ -46,7 +50,7 @@ defaults:
 jobs:
   prepare:
     # Only a green run that came from a push to main (not a pull request).
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
     runs-on: [self-hosted, windows]
     timeout-minutes: 10
     permissions:
@@ -57,9 +61,9 @@ jobs:
       short: ${{ steps.prepare.outputs.short }}
     steps:
       - id: prepare
-        uses: WKDSteve/appkit/release-kit/prepare@20802f7ad082042bcdbaedcd27fa97eab75562e2 # v0.60.0
+        uses: WKDSteve/appkit/release-kit/prepare@041b49c502d2dcea62a7f753cd98f6e2da14c70d # v0.74.0
         with:
-          sha: ${{ github.event.workflow_run.head_sha }}
+          sha: ${{ github.event.inputs.sha }}
           token: ${{ github.token }}
 
   build:
@@ -123,21 +127,26 @@ jobs:
       id-token: write        # the attestation of the files (appkit release-kit, see its README)
       attestations: write
     steps:
-      # A publish that waited behind a newer one must not put its older commit over it.
-      - name: Is it still the tip
+      # A publish that waited behind a newer one must not put its older commit over it: latest only moves forward.
+      - name: Is it newer than the build that is up
         id: tip
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           set -eu
-          tip="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
-          if [ "$tip" = "$SHA" ]; then
-            echo "current=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "main has moved on to $tip: $SHA is not published"
-            echo "current=false" >> "$GITHUB_OUTPUT"
+          built="$(gh release download latest --repo "$GITHUB_REPOSITORY" --pattern version.json --output - 2>/dev/null | python -c 'import json,sys; print(json.load(sys.stdin).get("commit") or "")' || true)"
+          status=identical
+          if [ -n "$built" ] && [ "$built" != "$SHA" ]; then
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$built...$SHA" --jq .status || echo unknown)"
           fi
+          case "$status" in
+            ahead | identical) echo "current=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "the build that is up ($built) is not behind $SHA: $SHA is not published"
+              echo "current=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
       - if: ${{ steps.tip.outputs.current == 'true' }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0 (node24)
         with:
@@ -154,7 +163,7 @@ jobs:
           path: dist
           merge-multiple: true
       - if: ${{ steps.tip.outputs.current == 'true' }}
-        uses: WKDSteve/appkit/release-kit/publish@20802f7ad082042bcdbaedcd27fa97eab75562e2 # v0.60.0
+        uses: WKDSteve/appkit/release-kit/publish@041b49c502d2dcea62a7f753cd98f6e2da14c70d # v0.74.0
         with:
           token: ${{ github.token }}
           tag: latest
