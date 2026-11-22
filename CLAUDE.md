@@ -58,3 +58,4 @@ A new process start belongs in `tools/process-starts.allow` and `docs/PROCESSES.
 - Rules: the maintainer's ruleset for the web platform (private, so not named or cited here by id).
 - `.claude/settings.json` turns the tool's telemetry off and allows only `npx -y modern-web-guidance@latest *`. No CI scanner
   here (no package manager for the UIs); the scan runs locally and in agent sessions.
+- Git: in a cloud session (`CLAUDE_CODE_REMOTE` is set) never push to `main`, only to your own `claude/…` branch; a local session lands it by rebase and the device key re-signs it (`GIT-09`). "Push to main" (`GIT-01`) applies locally only.
