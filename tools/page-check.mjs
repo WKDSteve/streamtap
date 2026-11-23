@@ -128,6 +128,12 @@ try {
     check(`${theme}: the QR code is dark on light`, lightness.dark < 200 && lightness.light > 650, JSON.stringify(lightness));
   }
 
+  const smallFields = await page.evaluate(() =>
+    [...document.querySelectorAll("input:not([type=checkbox]):not([type=radio]), select")]
+      .filter((n) => n.getClientRects().length > 0 && parseFloat(getComputedStyle(n).fontSize) < 16)
+      .map((n) => `${n.id} ${getComputedStyle(n).fontSize}`)
+  );
+  check("app: fields of 16 px", smallFields.length === 0, smallFields.join(", "));
   // A long error text and a long host on a narrow window (CSS-08): the toast and the tab list wrap inside the window.
   await page.setViewportSize({ width: 420, height: 800 });
   await page.evaluate((word) => {
@@ -212,10 +218,19 @@ try {
                 .filter((n) => n.getBoundingClientRect().height < 48)
                 .map((n) => n.id || n.textContent.trim().slice(0, 20)),
               background: getComputedStyle(document.body).backgroundColor,
+              fields: [...document.querySelectorAll("input:not([type=checkbox]):not([type=radio]), textarea, select")]
+                .filter(visible)
+                .filter((n) => parseFloat(getComputedStyle(n).fontSize) < 16)
+                .map((n) => `${n.id} ${getComputedStyle(n).fontSize}`),
+              tokenSpellcheck: document.getElementById("token").getAttribute("spellcheck"),
             };
           }, TARGETS);
           check(`${label}: one page`, seen.pages.join() === `page-${view.name.split("-")[0]}`, seen.pages.join());
           if (view.hash === "#target") check(`${label}: only the block of the target`, seen.blocks.join() === `block-${view.name.split("-")[1]}`, seen.blocks.join());
+          // A field is at least 16 px (1rem) on every device: a smaller one is zoomed in by iOS and hard to read (FORM-05).
+          check(`${label}: fields of 16 px`, seen.fields.length === 0, seen.fields.join(", "));
+          // A token is not a word: the attribute says it, whatever a browser does with a password field by itself.
+          check(`${label}: the token field has no spell check`, seen.tokenSpellcheck === "false", String(seen.tokenSpellcheck));
           // Before axe: axe reads the style sheet of a file:// page itself and logs that it may not.
           check(`${label}: no console error`, errors.length === 0, errors.join("; "));
           check(`${label}: the colour scheme is the one asked for`, seen.dark === (scheme === "dark") && (seen.background === "rgb(255, 255, 255)") === (scheme === "light"), JSON.stringify(seen));

@@ -82,6 +82,8 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); border-co
 button.danger { color: var(--bad); border-color: var(--bad); }
 
 input, select {
+  /* 1rem: a field is as large as the text of a form on every device (FORM-05), whatever the page's size is. */
+  font-size: 1rem;
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 6px;
