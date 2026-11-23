@@ -51,7 +51,8 @@ fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 0 0 8px; p
 label { display: block; margin: 6px 0; }
 label.choice { display: flex; align-items: flex-start; gap: 6px; }
 label.choice small { display: block; color: var(--muted); font-size: inherit; }
-input[type="text"], input[type="number"], input[type="password"], textarea { width: 100%; box-sizing: border-box; font: inherit; margin-top: 2px; }
+/* A field is 1rem on every device (FORM-05): the page is 13 px, its fields are not. */
+input[type="text"], input[type="number"], input[type="password"], textarea { width: 100%; box-sizing: border-box; font: inherit; font-size: 1rem; margin-top: 2px; }
 textarea { min-height: 3em; }
 button { font: inherit; margin: 4px 4px 4px 0; }
 .block { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 6px; }
