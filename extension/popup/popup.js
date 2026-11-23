@@ -37,8 +37,14 @@ const num = (v, max, min = max) => {
 const secs = (v) => (typeof v === "number" && Number.isFinite(v) ? num(v, 1, 0) : String(v));
 
 // A field that failed says so (aria-invalid, its words under the fields, described by them) and takes the focus (FORM-06).
-const markInvalid = (fields, bad, focus) => {
-  for (const id of fields) $(id).setAttribute("aria-invalid", String(bad.includes(id)));
+// The words are the field's description only while it is invalid: text a field is described by is read out even when
+// it says something else (a state, "saved"), so it is listed for the failed field alone.
+const markInvalid = (fields, bad, focus, words) => {
+  for (const id of fields) {
+    $(id).setAttribute("aria-invalid", String(bad.includes(id)));
+    if (bad.includes(id)) $(id).setAttribute("aria-describedby", words);
+    else $(id).removeAttribute("aria-describedby");
+  }
   if (focus && bad.length) $(bad[0]).focus();
 };
 
@@ -399,10 +405,10 @@ const load = async () => {
   $("save").onclick = () => {
     const number = Number(port.value);
     if (!Number.isInteger(number) || number < 1 || number > 65535) {
-      markInvalid(["port"], ["port"], true);
+      markInvalid(["port"], ["port"], true, "sink-saved");
       return say($("sink-saved"), "locked", t("portInvalid"));
     }
-    markInvalid(["port"], [], false);
+    markInvalid(["port"], [], false, "sink-saved");
     // Not twice while the browser writes.
     $("save").disabled = true;
     chrome.storage.local.set({ sinkPort: number, sinkToken: token.value, sinkPaired: false, tapMode: "all" }, () => {
@@ -528,7 +534,7 @@ const load = async () => {
       dropDraft("tailnet-host", "tailnet-name");
     }
     // The field the answer is about is marked and takes the focus; askTailnet below sets the buttons for the state.
-    markInvalid(PAIR_FIELDS, ok || !Object.hasOwn(PAIR_FIELD_OF, reason) ? [] : [PAIR_FIELD_OF[reason]], true);
+    markInvalid(PAIR_FIELDS, ok || !Object.hasOwn(PAIR_FIELD_OF, reason) ? [] : [PAIR_FIELD_OF[reason]], true, "tailnet-result");
     $("block-tailnet").setAttribute("aria-busy", "false");
     for (const id of ["tailnet-pair", "tailnet-offer-pair"]) $(id).disabled = false;
     askTailnet();
@@ -539,7 +545,7 @@ const load = async () => {
     view.pairingOpen = true;
     showBlocks();
     say(tailnetResult, "", t("tnPairing"));
-    markInvalid(PAIR_FIELDS, [], false);
+    markInvalid(PAIR_FIELDS, [], false, "tailnet-result");
     // One try at a time: the buttons wait for the answer (it comes over the network).
     $("block-tailnet").setAttribute("aria-busy", "true");
     for (const id of ["tailnet-pair", "tailnet-offer-pair"]) $(id).disabled = true;
