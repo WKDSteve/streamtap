@@ -26,7 +26,7 @@ const say = (node, cls, words) => {
   I18N.fill(node, words);
 };
 
-// Numbers are written the way the browser's language writes them (5,0 MiB in German, 5.0 MiB in English), JS-04.
+// Numbers are written the way the browser's language writes them (5,0 MiB in German, 5.0 MiB in English).
 const formats = new Map();
 const num = (v, max, min = max) => {
   const key = `${min}-${max}`;
@@ -36,7 +36,7 @@ const num = (v, max, min = max) => {
 // A value from the page that is no number stays what it is (text), as before.
 const secs = (v) => (typeof v === "number" && Number.isFinite(v) ? num(v, 1, 0) : String(v));
 
-// A field that failed says so (aria-invalid, its words under the fields, described by them) and takes the focus (FORM-06).
+// A field that failed says so (aria-invalid, its words under the fields, described by them) and takes the focus.
 // The words are the field's description only while it is invalid: text a field is described by is read out even when
 // it says something else (a state, "saved"), so it is listed for the failed field alone.
 const markInvalid = (fields, bad, focus, words) => {
@@ -148,7 +148,7 @@ const render = (state) => {
 };
 
 // --- the draft ---------------------------------------------------------------------------------------------------
-// What is typed into a settings field and not saved survives closing the popup (FORM-07): it is kept in
+// What is typed into a settings field and not saved survives closing the popup: it is kept in
 // chrome.storage.session (memory of the browser, gone when it closes; Chrome 102, Firefox 115) and put back when the
 // popup opens again, until the field is saved. Not the token and not the pairing code: a secret is not kept anywhere
 // the user did not save it. Where the API is missing the draft is simply not kept.

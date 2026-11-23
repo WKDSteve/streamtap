@@ -28,7 +28,7 @@
 
 body { font: 0.8125rem/1.45 system-ui, sans-serif; margin: 0; padding: 10px; width: 380px; background: var(--bg); color: var(--text); }
 h1 { font-size: 0.9375rem; margin: 0; }
-/* Figures keep one width, so a changing size or count does not jiggle (CSS-09). */
+/* Figures keep one width, so a changing size or count does not jiggle. */
 table, #tab-line, #target-line, #link, #file-state { font-variant-numeric: tabular-nums; }
 /* Baseline 2024, not 2023 (Chrome 114, Firefox 121 have it, the target does not promise it): only where it is known. */
 @supports (text-wrap: balance) {
@@ -57,11 +57,11 @@ fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 0 0 8px; p
 label { display: block; margin: 6px 0; }
 label.choice { display: flex; align-items: flex-start; gap: 6px; padding: 3px 0; }
 label.choice small { display: block; color: var(--muted); font-size: inherit; }
-/* A field is 1rem on every device (FORM-05): the page is 13 px, its fields are not. */
+/* A field is 1rem on every device: the page is 13 px, its fields are not. */
 input[type="text"], input[type="number"], input[type="password"], textarea { width: 100%; box-sizing: border-box; font: inherit; font-size: 1rem; margin-top: 2px; }
 textarea { min-height: 3em; }
 button { font: inherit; margin: 4px 4px 4px 0; }
-/* A field that failed (FORM-06): its words stand under the fields, the field itself shows it too. */
+/* A field that failed: its words stand under the fields, the field itself shows it too. */
 [aria-invalid="true"] { border: 2px solid var(--bad); }
 .block { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 6px; }
 #file-state, #target-note { white-space: pre-line; }
@@ -69,7 +69,7 @@ button { font: inherit; margin: 4px 4px 4px 0; }
 .status > div, [role="status"], #link, #target-note, #about-version, #tailnet-offer-text { overflow-wrap: anywhere; }
 
 details { margin-top: 8px; }
-/* With a mouse a target is 24 px high at least (ACC-04); a phone has its 48 px below. */
+/* With a mouse a target is 24 px high at least; a phone has its 48 px below. */
 summary { cursor: pointer; color: var(--muted); padding: 4px 0; }
 .drm { background: var(--bad-bg); color: var(--bad); padding: 6px 8px; border-radius: 4px; margin: 6px 0; }
 .ms { border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; margin: 6px 0; overflow-x: auto; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail when what a UI ships has grown past its budget (WPERF-05).
+"""Fail when what a UI ships has grown past its budget.
 
     python tools/check-size.py [--root DIR] [--print]
 

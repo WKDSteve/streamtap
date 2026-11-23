@@ -262,7 +262,7 @@ jobs:
       - run: python tools/check-color-literals.py --root desktop/crates/streamtap-app/ui --tokens desktop/crates/streamtap-app/ui/palette.css
       # What the two UIs ship (the extension without its tests, the app's page) stays within the budgets of
       # tools/check-size.py: plain files without a bundler grow by every line, so a growth past the margin is decided
-      # on purpose (WPERF-05).
+      # on purpose.
       - run: python tools/check-size.py
       # The rules of the workflows (release.yml, rolling.yml, this one): actions pinned by commit, appkit's release-kit
       # on one commit, self-hosted runner only, no pull request trigger, a release stays a draft; --online asks each

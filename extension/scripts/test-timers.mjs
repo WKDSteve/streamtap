@@ -35,7 +35,7 @@ export const timers = (src) => {
     const last = /,\s*([A-Za-z_][A-Za-z_0-9]*|\d+)\s*\)\s*;?\s*$/.exec(code);
     const named = last && new RegExp(`\\bconst\\s+${last[1]}\\s*=\\s*(\\d+)\\s*;`).exec(src);
     const ms = last ? (named ? Number(named[1]) : /^\d+$/.test(last[1]) ? Number(last[1]) : null) : null;
-    // A wait of 30 s or more in the service worker is an alarm (CLAUDE.md, JS-05): the timer that stays says why not.
+    // A wait of 30 s or more in the service worker is an alarm (CLAUDE.md): the timer that stays says why not.
     const alarm = ms !== null && ms >= 30000 ? near.some((l) => /\/\/.*\balarm/i.test(l)) : true;
     found.push({ line: i + 1, why, ms, alarm });
   });

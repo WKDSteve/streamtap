@@ -432,7 +432,7 @@ const forged = {
     const said = r.ids["tailnet-result"].textContent;
     check(said !== "pairing failed" && said.length > 10, `tailnet: the refusal ${reason} has its own words`);
   }
-  // FORM-06: no second try while one is out, the failed field is marked and has the focus, the words stand above the button.
+  // Form errors: no second try while one is out, the failed field is marked and has the focus, the words stand above the button.
   {
     const ok = { available: true, paired: false, host: "", device: "", state: "not-paired", offer: "pc.example.ts.net" };
     const answered = await run({ target: "tailnet", tailnet: ok, pairAnswer: { ok: false, reason: "code" } });
@@ -509,7 +509,7 @@ const forged = {
   check(links() === before + 1, "device: news that a file was saved makes the popup ask for the link again");
 }
 
-// The draft: what is typed and not saved survives the popup (FORM-07), never a secret.
+// The draft: what is typed and not saved survives the popup, never a secret.
 {
   const d = await run({});
   d.ids.port.value = "1234";
@@ -538,7 +538,7 @@ const forged = {
 }
 
 // --- both languages ------------------------------------------------------------
-// Numbers follow the browser's language (JS-04): a German browser writes 1,5 and 5,0, an English one 1.5 and 5.0.
+// Numbers follow the browser's language: a German browser writes 1,5 and 5,0, an English one 1.5 and 5.0.
 {
   const buffer = { sbId: 1, mime: "video/mp4", mimes: [], kind: "mp4", inits: 1, media: 2, bytes: 5 << 20, firstSec: 0, lastEndSec: 1234.5, lastSec: 0 };
   const state = { drm: [], events: 1, frames: [], mediaSources: [{ msId: 1, ended: false, frameUrl: "https://a.example/", blobUrl: "", sourceBuffers: [buffer] }] };
@@ -615,7 +615,7 @@ const forged = {
   // Static text: what stands in popup.html without scripts is the English text of its key.
   const stale = [...html.matchAll(/data-i18n="(\w+)"[^>]*>([^<]*)</g)].filter(([, key, textInPage]) => en[key] !== textInPage.replace(/&amp;/g, "&")).map((m) => m[1]);
   check(stale.length === 0, `the text in popup.html is the English text of its key${stale.length ? ` (not: ${stale.join(", ")})` : ""}`);
-  // Names and commands are not translated by the browser (HTML-05): the brand and every command carry translate="no", and
+  // Names and commands are not translated by the browser: the brand and every command carry translate="no", and
   // no static text holds a command (it stands in an element of its own).
   const COMMAND = /streamtap-sink|tailscale (?:serve|funnel)|chrome:\/\/|ffmpeg|--tailnet/;
   const codes = [...html.matchAll(/<code\b[^>]*>/g)];
