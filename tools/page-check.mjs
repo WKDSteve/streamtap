@@ -133,6 +133,11 @@ try {
       .filter((n) => n.getClientRects().length > 0 && parseFloat(getComputedStyle(n).fontSize) < 16)
       .map((n) => `${n.id} ${getComputedStyle(n).fontSize}`)
   );
+  const appFigures = await page.evaluate(() => ({
+    missing: [".card .meta", ".card table", "#captures-count", "#sink-text"].filter((sel) => [...document.querySelectorAll(sel)].some((n) => n.getClientRects().length > 0 && !getComputedStyle(n).fontVariantNumeric.includes("tabular-nums"))),
+    plain: [...document.querySelectorAll("h1, h2, h3")].filter((n) => n.getClientRects().length > 0 && getComputedStyle(n).textWrap !== "balance").map((n) => n.textContent.slice(0, 20)),
+  }));
+  check("app: figures are tabular and headings balanced", appFigures.missing.length === 0 && appFigures.plain.length === 0, JSON.stringify(appFigures));
   check("app: fields of 16 px", smallFields.length === 0, smallFields.join(", "));
   const tinyTargets = await page.evaluate(() =>
     [...document.querySelectorAll("button, summary, input:not([type=hidden]), select, a[href]")]
@@ -241,6 +246,14 @@ try {
           if (view.hash === "#target") check(`${label}: only the block of the target`, seen.blocks.join() === `block-${view.name.split("-")[1]}`, seen.blocks.join());
           // A field is at least 16 px (1rem) on every device: a smaller one is zoomed in by iOS and hard to read (FORM-05).
           check(`${label}: fields of 16 px`, seen.fields.length === 0, seen.fields.join(", "));
+          // Figures of a size or count are tabular, headings are balanced where the browser knows it (CSS-09).
+          const figures = await p.evaluate(() => {
+            const wanted = ["table td", "#tab-line", "#target-line", "#file-state"];
+            const missing = wanted.filter((sel) => [...document.querySelectorAll(sel)].some((n) => n.getClientRects().length > 0 && !getComputedStyle(n).fontVariantNumeric.includes("tabular-nums")));
+            const balanced = CSS.supports("text-wrap", "balance") ? [...document.querySelectorAll("h1")].filter((n) => n.getClientRects().length > 0 && getComputedStyle(n).textWrap !== "balance") : [];
+            return { missing, balanced: balanced.map((n) => n.textContent) };
+          });
+          check(`${label}: figures are tabular and headings balanced`, figures.missing.length === 0 && figures.balanced.length === 0, JSON.stringify(figures));
           // A token is not a word: the attribute says it, whatever a browser does with a password field by itself.
           check(`${label}: the token field has no spell check`, seen.tokenSpellcheck === "false", String(seen.tokenSpellcheck));
           // Before axe: axe reads the style sheet of a file:// page itself and logs that it may not.
