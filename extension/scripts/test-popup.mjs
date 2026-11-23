@@ -520,6 +520,14 @@ const forged = {
   // Static text: what stands in popup.html without scripts is the English text of its key.
   const stale = [...html.matchAll(/data-i18n="(\w+)"[^>]*>([^<]*)</g)].filter(([, key, textInPage]) => en[key] !== textInPage.replace(/&amp;/g, "&")).map((m) => m[1]);
   check(stale.length === 0, `the text in popup.html is the English text of its key${stale.length ? ` (not: ${stale.join(", ")})` : ""}`);
+  // Names and commands are not translated by the browser (HTML-05): the brand and every command carry translate="no", and
+  // no static text holds a command (it stands in an element of its own).
+  const COMMAND = /streamtap-sink|tailscale (?:serve|funnel)|chrome:\/\/|ffmpeg|--tailnet/;
+  const codes = [...html.matchAll(/<code\b[^>]*>/g)];
+  const inCommand = [...new Set(inPage)].filter((k) => COMMAND.test(en[k]) || COMMAND.test(de[k]));
+  check(/<h1 translate="no">streamtap<\/h1>/.test(html), 'the name streamtap in popup.html is translate="no"');
+  check(codes.length > 0 && codes.every((m) => /\btranslate="no"/.test(m[0])), 'every command in popup.html is translate="no"');
+  check(inCommand.length === 0, `no static text holds a command${inCommand.length ? ` (${inCommand.join(", ")})` : ""}`);
 }
 
 // Across every popup of this run.
