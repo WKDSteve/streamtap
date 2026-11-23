@@ -198,6 +198,8 @@ pre {
   background: var(--text);
   color: var(--bg);
   z-index: 20;
+  /* An error text carries a path without a space: it wraps inside the window. */
+  overflow-wrap: anywhere;
 }
 .toast[hidden] { display: none; }
 
@@ -245,4 +247,5 @@ ul.plain { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
 .tabrow { padding: 6px 0; border-top: 1px solid var(--line); }
 .tabrow .tabtext { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .tabrow .tabtitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tabrow .tabtext .muted { overflow-wrap: anywhere; }
 .fav { width: 16px; height: 16px; flex: none; }

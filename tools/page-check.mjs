@@ -128,6 +128,29 @@ try {
     check(`${theme}: the QR code is dark on light`, lightness.dark < 200 && lightness.light > 650, JSON.stringify(lightness));
   }
 
+  // A long error text and a long host on a narrow window (CSS-08): the toast and the tab list wrap inside the window.
+  await page.setViewportSize({ width: 420, height: 800 });
+  await page.evaluate((word) => {
+    state.signature = "";
+    render(state.snap);
+    toast(`Mux: ${word}`);
+    for (const n of document.querySelectorAll(".tabrow .tabtext .muted")) n.textContent = word;
+  }, "x".repeat(120));
+  const wide = await page.evaluate(() => {
+    const rect = document.getElementById("toast").getBoundingClientRect();
+    const muted = [...document.querySelectorAll(".tabrow .tabtext .muted")];
+    return {
+      toast: Math.round(Math.max(0, rect.right - innerWidth, -rect.left)),
+      toastScroll: document.getElementById("toast").scrollWidth - document.getElementById("toast").clientWidth,
+      tabs: muted.length,
+      tabOver: muted.map((n) => n.scrollWidth - n.clientWidth).filter((x) => x > 0),
+      sideways: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    };
+  });
+  check("app: a toast with a path of 120 characters stays in the window", wide.toast === 0 && wide.toastScroll <= 0, JSON.stringify(wide));
+  check("app: a long host in the tab list wraps", wide.tabs > 0 && wide.tabOver.length === 0 && wide.sideways <= 0, JSON.stringify(wide));
+  await page.setViewportSize({ width: 1280, height: 720 });
+
   // ---- the extension's popup ----------------------------------------------------------------------------------
   // What a touch target is on the phone: a button, an entry of the start page, a text field, a choice with its label,
   // the head of a fold.
@@ -205,6 +228,16 @@ try {
           }
           await axe(p, label);
           if (shots) await shoot(p, device, `${view.name}-${device.name}-${scheme}`);
+          // Last, it changes the page: a path of 120 characters without a space (a file name, a URL) in every line of state
+          // must wrap inside its box, not push the page sideways (CSS-08).
+          if (scheme === "light") {
+            const wide = await p.evaluate((word) => {
+              const lines = [...document.querySelectorAll("main:not([hidden]) :is(div, p, span)[id]")].filter((n) => n.getClientRects().length > 0 && n.children.length === 0);
+              for (const n of lines) n.textContent = word;
+              return { names: lines.map((n) => n.id), over: lines.filter((n) => n.scrollWidth > n.clientWidth).map((n) => `${n.id} +${n.scrollWidth - n.clientWidth}px`), sideways: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+            }, "x".repeat(120));
+            check(`${label}: ${wide.names.length} lines of state wrap a path of 120 characters`, wide.names.length > 0 && wide.over.length === 0 && wide.sideways <= 0, `${wide.over.join(", ")}; the page scrolls ${wide.sideways}px`);
+          }
         } finally {
           await ctx.close();
         }

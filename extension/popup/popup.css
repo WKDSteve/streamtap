@@ -56,6 +56,8 @@ textarea { min-height: 3em; }
 button { font: inherit; margin: 4px 4px 4px 0; }
 .block { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 6px; }
 #file-state, #target-note { white-space: pre-line; }
+/* A line of state may carry a path or a URL without a space (a saved file, a host): it wraps inside the page. */
+.status > div, [role="status"], #link, #target-note, #about-version, #tailnet-offer-text { overflow-wrap: anywhere; }
 
 details { margin-top: 8px; }
 summary { cursor: pointer; color: var(--muted); }
