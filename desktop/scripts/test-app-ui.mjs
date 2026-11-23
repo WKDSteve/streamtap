@@ -59,6 +59,17 @@ check(I18N.lang === "en", "an unknown language falls back to English");
 
 const html = read("index.html");
 for (const m of html.matchAll(/data-i18n(?:-aria-label|-title)?="([^"]+)"/g)) check(m[1] in en, `index.html uses unknown key ${m[1]}`);
+// Names and commands are not translated by the browser (HTML-05): the brand and every command carry translate="no", and
+// no static text holds a command (it stands in an element of its own).
+{
+  const COMMAND = /tailscale (?:serve|funnel)|chrome:\/\/|ffmpeg|--tailnet/;
+  const codes = [...html.matchAll(/<code\b[^>]*>/g)];
+  const inCommand = [...new Set([...html.matchAll(/data-i18n="(\w+)"/g)].map((m) => m[1]))].filter((k) => COMMAND.test(en[k] ?? "") || COMMAND.test(de[k] ?? ""));
+  check(/<h1 translate="no">/.test(html), 'the name streamtap in index.html is translate="no"');
+  check(codes.length >= 3 && codes.every((m) => /\btranslate="no"/.test(m[0])), 'every command in index.html is translate="no"');
+  check(/<dt translate="no">ffmpeg<\/dt>/.test(html), 'the program name ffmpeg in index.html is translate="no"');
+  check(inCommand.length === 0, `no static text holds a command (${inCommand.join(", ")})`);
+}
 const app = read("app.js");
 for (const m of app.matchAll(/\bt\(\s*"([^"]+)"/g)) check(m[1] in en, `app.js uses unknown key ${m[1]}`);
 // The confirm dialog's heading and button keys (ask({ heading: "...", ok: "..." })).

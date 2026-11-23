@@ -12,7 +12,7 @@
 <a class="skip" href="#captures" data-i18n="skip">Skip to captures</a>
 
 <header class="bar">
-  <h1><img src="streamtap.svg" alt="" width="20" height="20">streamtap</h1>
+  <h1 translate="no"><img src="streamtap.svg" alt="" width="20" height="20">streamtap</h1>
   <div id="sink-status" class="status" role="status" aria-live="polite">
     <span id="sink-dot" class="dot dot-stopped" aria-hidden="true"></span>
     <span id="sink-text" data-i18n="sinkLoading">Sink: loading</span>
@@ -31,7 +31,7 @@
 
   <section id="browser" class="panel" aria-labelledby="browser-h" hidden>
     <h2 id="browser-h" data-i18n="connectBrowser">Connect browser</h2>
-    <p class="hint"><span data-i18n="browserIntro1">Register the connector for a browser once. After that the streamtap extension pairs itself with this app (you approve it here) and receives port and token without copy and paste. Chrome, Edge and Brave; reload the extension on </span><code>chrome://extensions</code><span data-i18n="browserIntro2"> after updating it. The extension popup stays available as a manual fallback.</span></p>
+    <p class="hint"><span data-i18n="browserIntro1">Register the connector for a browser once. After that the streamtap extension pairs itself with this app (you approve it here) and receives port and token without copy and paste. Chrome, Edge and Brave; reload the extension on </span><code translate="no">chrome://extensions</code><span data-i18n="browserIntro2"> after updating it. The extension popup stays available as a manual fallback.</span></p>
     <ul id="browser-reg" class="plain"></ul>
     <p id="browser-note" class="hint" hidden></p>
     <h3 data-i18n="pairedBrowsers">Paired browsers</h3>
@@ -57,9 +57,9 @@
     </form>
     <div id="serve-box" hidden>
       <h3 data-i18n="serveHeading">Forward it with Tailscale Serve</h3>
-      <p class="hint" data-i18n="serveHint">Run this once in a terminal on this PC; the app never starts Tailscale itself. Never use tailscale funnel for it: that is the public internet. A Headscale that hands out no certificate cannot do this.</p>
+      <p class="hint"><span data-i18n="serveHint1">Run this once in a terminal on this PC; the app never starts Tailscale itself. Never use </span><code translate="no">tailscale funnel</code><span data-i18n="serveHint2"> for it: that is the public internet. A Headscale that hands out no certificate cannot do this.</span></p>
       <div class="row">
-        <code id="serve-cmd" class="cmd"></code>
+        <code id="serve-cmd" class="cmd" translate="no"></code>
         <button id="serve-copy" type="button" data-i18n="copy">Copy</button>
       </div>
     </div>
@@ -139,7 +139,7 @@
     </div>
     <p class="hint" data-i18n="prefsHint">Applies at once, also while the sink runs.</p>
     <dl class="facts">
-      <dt>ffmpeg</dt><dd id="fact-ffmpeg">-</dd>
+      <dt translate="no">ffmpeg</dt><dd id="fact-ffmpeg">-</dd>
       <dt data-i18n="sinkProgram">Sink program</dt><dd id="fact-sink">-</dd>
     </dl>
   </section>

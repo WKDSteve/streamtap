@@ -11,7 +11,7 @@
          popup.js shows the page location.hash names (#target, #sources, #about), so the browser's back key is "back".
          Every text comes from i18n.js (data-i18n); what stands here in English is the text without scripts. -->
     <main id="page-home">
-      <header><h1>streamtap</h1></header>
+      <header><h1 translate="no">streamtap</h1></header>
       <div class="status">
         <div id="tab-line" class="muted" role="status" data-i18n="loading">loading…</div>
         <div id="source" class="muted"></div>
@@ -40,7 +40,7 @@
         <legend data-i18n="targetLegend">Where the capture goes</legend>
         <label class="choice"><input type="radio" name="target" value="sink" id="target-sink" /><span><span data-i18n="targetSink">the sink on the PC</span><small data-i18n="targetSinkHint">this browser runs on the PC; the app pairs it, or port and token by hand</small></span></label>
         <label class="choice"><input type="radio" name="target" value="tailnet" id="target-tailnet" /><span><span data-i18n="targetTailnet">the sink on the PC over the tailnet</span><small data-i18n="targetTailnetHint">Tailscale or Headscale; this device paired with the PC</small></span></label>
-        <label class="choice"><input type="radio" name="target" value="file" id="target-file" /><span><span data-i18n="targetFile">a file on this device</span><small data-i18n="targetFileHint">a recording; on the PC: streamtap-sink replay, then mux</small></span></label>
+        <label class="choice"><input type="radio" name="target" value="file" id="target-file" /><span><span data-i18n="targetFile">a file on this device</span><small><span data-i18n="targetFileHint1">a recording; on the PC: </span><code translate="no">streamtap-sink replay</code><span data-i18n="targetFileHint2">, then mux</span></small></span></label>
         <label class="choice"><input type="radio" name="target" value="video" id="target-video" /><span><span data-i18n="targetVideo">a video on this device</span><small data-i18n="targetVideoHint">an MP4 made here, without the PC; a capture it cannot make is saved as a recording, with the reason</small></span></label>
         <div id="target-note" class="muted"></div>
         <div id="target-saved" class="muted" role="status"></div>
