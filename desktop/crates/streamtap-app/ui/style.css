@@ -25,6 +25,10 @@ body {
 }
 
 h1, h2 { margin: 0; line-height: 1.2; }
+/* A heading breaks into lines of about one length (Baseline widely available since 2026-11-13, web-features 3.47). */
+h1, h2, h3 { text-wrap: balance; }
+/* Figures keep one width, so a growing size or duration does not jiggle (CSS-09). */
+.meta, .card table, .count, #sink-text, .facts { font-variant-numeric: tabular-nums; }
 h1 { font-size: 18px; }
 h1 img { margin-right: 6px; vertical-align: -4px; }
 h2 { font-size: 15px; }

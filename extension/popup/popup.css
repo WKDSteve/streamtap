@@ -28,6 +28,12 @@
 
 body { font: 13px/1.45 system-ui, sans-serif; margin: 0; padding: 10px; width: 380px; background: var(--bg); color: var(--text); }
 h1 { font-size: 15px; margin: 0; }
+/* Figures keep one width, so a changing size or count does not jiggle (CSS-09). */
+table, #tab-line, #target-line, #link, #file-state { font-variant-numeric: tabular-nums; }
+/* Baseline 2024, not 2023 (Chrome 114, Firefox 121 have it, the target does not promise it): only where it is known. */
+@supports (text-wrap: balance) {
+  h1, h2 { text-wrap: balance; }
+}
 p { margin: 6px 0; }
 .muted { color: var(--muted); }
 .locked { color: var(--bad); }
