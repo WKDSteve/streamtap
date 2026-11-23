@@ -12,5 +12,12 @@
     "advisory": "RUSTSEC-2026-0592",
     "reason": "required by url 2.5.9, the fix of the advisory (same release of rust-url). Decided by Stefan 2026-11-22",
     "until": "2026-11-27"
+  },
+  {
+    "crate": "cookie",
+    "version": "0.18.3",
+    "advisory": "RUSTSEC-2026-0594",
+    "reason": "the fix of the advisory (private cookie nonces repeat after fork); there is no older fixed version. Added 2026-11-23 on Stefan's request to fix the red cargo deny",
+    "until": "2026-11-30"
   }
 ]
