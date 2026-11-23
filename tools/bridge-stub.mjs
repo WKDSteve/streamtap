@@ -33,7 +33,10 @@ export function bridge() {
       host_path: "C:/host.exe",
       bridge_error: null,
       registrations: [{ browser: "chrome", registered: true, path: "C:/manifest.json" }],
-      link: { connections: [], approvals: [{ instance: "p-1", browser: "chrome", profile: "Default", connected: true }], store_error: null },
+      link: {
+        // A browser with one tab: the tab list of the panel "Connect browser".
+        connections: [{ id: "k1", approved: true, browser: "chrome", profile: "Default", tabs: [{ id: 7, title: "A video", host: "video.example.invalid", favicon: null, active: true, drm: false, tapping: false }] }],
+        approvals: [{ instance: "p-1", browser: "chrome", profile: "Default", connected: true }], store_error: null },
     },
   };
   // The phones of the sink (the panel asks only while the sink runs): one paired phone, and a pairing code whose QR
