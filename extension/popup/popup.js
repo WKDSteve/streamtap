@@ -141,6 +141,49 @@ const render = (state) => {
   out.replaceChildren(...parts);
 };
 
+// --- the draft ---------------------------------------------------------------------------------------------------
+// What is typed into a settings field and not saved survives closing the popup (FORM-07): it is kept in
+// chrome.storage.session (memory of the browser, gone when it closes; Chrome 102, Firefox 115) and put back when the
+// popup opens again, until the field is saved. Not the token and not the pairing code: a secret is not kept anywhere
+// the user did not save it. Where the API is missing the draft is simply not kept.
+const DRAFT_FIELDS = { port: "value", "tailnet-host": "value", "tailnet-name": "value", "own-hosts": "value", "learning-hosts": "value", "policy-on": "checked", "unlock-obfuscated": "checked", "unlock-social": "checked" };
+const draftArea = () => (typeof chrome.storage.session === "object" && chrome.storage.session && typeof chrome.storage.session.get === "function" ? chrome.storage.session : null);
+let draft = {};
+const readDraft = () =>
+  new Promise((resolve) => {
+    const area = draftArea();
+    if (!area) return resolve({});
+    area.get({ popupDraft: {} }, (v) => {
+      void chrome.runtime.lastError;
+      const kept = {};
+      const stored = v && v.popupDraft && typeof v.popupDraft === "object" ? v.popupDraft : {};
+      // Only the fields named above, each with the type of its property.
+      for (const [id, prop] of Object.entries(DRAFT_FIELDS)) if (Object.hasOwn(stored, id) && typeof stored[id] === (prop === "checked" ? "boolean" : "string")) kept[id] = stored[id];
+      resolve(kept);
+    });
+  });
+const writeDraft = () => {
+  const area = draftArea();
+  if (area) area.set({ popupDraft: draft }, () => void chrome.runtime.lastError);
+};
+// A field gets the stored value, or what was typed into it before the popup was closed.
+const setField = (id, stored) => {
+  $(id)[DRAFT_FIELDS[id]] = Object.hasOwn(draft, id) ? draft[id] : stored;
+};
+const dropDraft = (...ids) => {
+  for (const id of ids) delete draft[id];
+  writeDraft();
+};
+const watchDraft = () => {
+  for (const [id, prop] of Object.entries(DRAFT_FIELDS)) {
+    if (Object.hasOwn(draft, id)) $(id)[prop] = draft[id];
+    $(id).oninput = () => {
+      draft[id] = $(id)[prop];
+      writeDraft();
+    };
+  }
+};
+
 // --- sources -----------------------------------------------------------------------------------------------------
 const GROUP_KEYS = {
   own: "groupOwn",
@@ -178,12 +221,12 @@ const showSources = (o) => {
     const groups = (Array.isArray(v.groups) ? v.groups : []).map((g) => (Object.hasOwn(GROUP_KEYS, g) ? t(GROUP_KEYS[g]) : String(g)));
     say(line, known ? known[0] : "", groups.length ? t("sourceLineGroups", { groups: groups.join(", "), what }) : t("sourceLine", { what }));
   }
-  $("policy-on").checked = o.on === true;
+  setField("policy-on", o.on === true);
   const unlocked = new Set(Array.isArray(o.unlocked) ? o.unlocked : []);
-  $("unlock-obfuscated").checked = unlocked.has("obfuscated");
-  $("unlock-social").checked = unlocked.has("social");
-  $("own-hosts").value = (Array.isArray(o.own) ? o.own : []).join("\n");
-  $("learning-hosts").value = (Array.isArray(o.learning) ? o.learning : []).join("\n");
+  setField("unlock-obfuscated", unlocked.has("obfuscated"));
+  setField("unlock-social", unlocked.has("social"));
+  setField("own-hosts", (Array.isArray(o.own) ? o.own : []).join("\n"));
+  setField("learning-hosts", (Array.isArray(o.learning) ? o.learning : []).join("\n"));
 };
 
 // One host per line; the service worker cleans and bounds them again.
@@ -339,6 +382,8 @@ const load = async () => {
   const manifest = typeof chrome.runtime.getManifest === "function" ? chrome.runtime.getManifest() : null;
   $("about-version").textContent = t("aboutVersion", { version: manifest ? manifest.version : "" });
 
+  draft = await readDraft();
+  watchDraft();
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return render(null);
   chrome.runtime.sendMessage({ kind: "vc-get", tabId: tab.id }, (state) => render(state));
@@ -347,7 +392,7 @@ const load = async () => {
   const port = $("port");
   const token = $("token");
   chrome.storage.local.get({ sinkPort: 17650, sinkToken: "" }, (v) => {
-    port.value = v.sinkPort;
+    setField("port", v.sinkPort);
     token.value = v.sinkToken;
   });
   // A manual entry taps every tab (the old behaviour) and is not the app's to take back.
@@ -362,6 +407,7 @@ const load = async () => {
     $("save").disabled = true;
     chrome.storage.local.set({ sinkPort: number, sinkToken: token.value, sinkPaired: false, tapMode: "all" }, () => {
       $("save").disabled = false;
+      dropDraft("port");
       say($("sink-saved"), "", t("sinkSaved"));
     });
   };
@@ -401,6 +447,7 @@ const load = async () => {
         sourceLearningHosts: hostLines($("learning-hosts").value),
       },
       () => {
+        dropDraft("policy-on", "unlock-obfuscated", "unlock-social", "own-hosts", "learning-hosts");
         $("policy-saved").textContent = t("policySaved");
         askSources();
       }
@@ -466,7 +513,7 @@ const load = async () => {
     showTargetLine();
     if (!usable) return say(tailnetState, "", t("tnUnavailable"));
     if (s.offer) $("tailnet-offer-text").textContent = t("tnOffer", { pc: s.offer });
-    if (s.paired && !$("tailnet-host").value) $("tailnet-host").value = s.host;
+    if (s.paired && !$("tailnet-host").value) setField("tailnet-host", s.host);
     say(tailnetState, ...tailnetText(s));
   };
   const askTailnet = () => chrome.runtime.sendMessage({ kind: "vc-tailnet-status" }, showTailnet);
@@ -476,7 +523,10 @@ const load = async () => {
     const ok = Boolean(r && r.ok);
     const reason = r && r.reason;
     say(tailnetResult, ok ? "released" : "locked", ok ? t("tnPaired", { pc: r.host }) : t(Object.hasOwn(PAIR_ERROR_KEYS, reason) ? PAIR_ERROR_KEYS[reason] : "tnPairFailed"));
-    if (ok) $("tailnet-code").value = "";
+    if (ok) {
+      $("tailnet-code").value = "";
+      dropDraft("tailnet-host", "tailnet-name");
+    }
     // The field the answer is about is marked and takes the focus; askTailnet below sets the buttons for the state.
     markInvalid(PAIR_FIELDS, ok || !Object.hasOwn(PAIR_FIELD_OF, reason) ? [] : [PAIR_FIELD_OF[reason]], true);
     $("block-tailnet").setAttribute("aria-busy", "false");

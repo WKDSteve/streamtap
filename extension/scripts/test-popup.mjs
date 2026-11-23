@@ -88,7 +88,7 @@ const run = async (o = {}) => {
   const nodes = pageNodes();
   const ids = Object.fromEntries(nodes.filter((n) => n.attrs.id).map((n) => [n.attrs.id, n]));
   const missing = [];
-  const env = { ids, sent: [], sets: [], during: [], missing, misses: [], timeouts: [], onMessage: [] };
+  const env = { ids, sent: [], sets: [], drafts: [], during: [], missing, misses: [], timeouts: [], onMessage: [] };
   const listeners = [];
   const trail = [o.hash || ""];
   const location = {
@@ -143,6 +143,8 @@ const run = async (o = {}) => {
     },
     tabs: { query: async () => [{ id: 1 }] },
     storage: {
+      // chrome.storage.session, where the browser has it: the draft of what is typed and not saved.
+      ...(o.nosession ? {} : { session: { get: (_d, cb) => cb({ popupDraft: o.draft ?? {} }), set: (s, cb) => (env.drafts.push(structuredClone(s.popupDraft)), cb?.()) } }),
       local: {
         get: (d, cb) => cb("sinkTarget" in d ? { ...d, sinkTarget: env.sets.findLast((s) => "sinkTarget" in s)?.sinkTarget ?? o.target ?? "" } : d),
         set: (s, cb) => (env.sets.push(s), env.during.push({ kind: "set", save: ids.save?.disabled }), cb?.()),
@@ -500,6 +502,34 @@ const forged = {
   check(full.timeouts.length === 0, `device: the popup waits for no timer after save now (got ${full.timeouts})`);
   full.onMessage[0]({ kind: "vc-changed", topic: "file" });
   check(links() === before + 1, "device: news that a file was saved makes the popup ask for the link again");
+}
+
+// The draft: what is typed and not saved survives the popup (FORM-07), never a secret.
+{
+  const d = await run({});
+  d.ids.port.value = "1234";
+  d.ids.port.oninput();
+  d.ids["own-hosts"].value = "tv.example";
+  d.ids["own-hosts"].oninput();
+  d.ids["policy-on"].checked = true;
+  d.ids["policy-on"].oninput();
+  d.ids.token.value = "secret";
+  check(d.ids.token.oninput === undefined && d.ids["tailnet-code"].oninput === undefined, "draft: the token and the pairing code are not watched");
+  const last = d.drafts.at(-1);
+  check(last.port === "1234" && last["own-hosts"] === "tv.example" && last["policy-on"] === true && !JSON.stringify(d.drafts).includes("secret"), `draft: typed values are kept, no secret (got ${JSON.stringify(last)})`);
+  const back = await run({ draft: { port: "4321", "own-hosts": "x.example", "policy-on": true, "tailnet-name": "tablet", "tailnet-host": "pc.example.ts.net", token: "secret", "unlock-social": "yes", "learning-hosts": 5 }, overview: { verdict: null, on: false, unlocked: [], own: ["stored.example"], learning: ["l.example"] } });
+  check(back.ids.port.value === "4321" && back.ids["own-hosts"].value === "x.example" && back.ids["policy-on"].checked === true && back.ids["tailnet-name"].value === "tablet" && back.ids["tailnet-host"].value === "pc.example.ts.net", "draft: a reopened popup shows what was typed, over the stored values");
+  check(back.ids.token.value !== "secret" && back.ids["learning-hosts"].value === "l.example" && back.ids["unlock-social"].checked === false, "draft: a token, or a value of the wrong type, is not taken");
+  const saved = await run({ draft: { port: "4321", "own-hosts": "x.example" } });
+  saved.ids.port.value = "17700";
+  saved.ids.save.onclick();
+  check(!("port" in saved.drafts.at(-1)) && saved.drafts.at(-1)["own-hosts"] === "x.example", "draft: a saved field leaves the draft, the others stay");
+  saved.ids["policy-save"].onclick();
+  check(Object.keys(saved.drafts.at(-1)).length === 0, "draft: saving the sources clears theirs");
+  const none = await run({ nosession: true });
+  none.ids.port.value = "9";
+  none.ids.port.oninput();
+  check(none.ids.port.value === "9" && none.drafts.length === 0, "draft: without chrome.storage.session the popup works and keeps none");
 }
 
 // --- both languages ------------------------------------------------------------
