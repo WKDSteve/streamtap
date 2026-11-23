@@ -21,7 +21,7 @@ html, body { margin: 0; }
 body {
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.45 system-ui, "Segoe UI", sans-serif;
+  font: 0.875rem/1.45 system-ui, "Segoe UI", sans-serif;
 }
 
 h1, h2 { margin: 0; line-height: 1.2; }
@@ -29,9 +29,9 @@ h1, h2 { margin: 0; line-height: 1.2; }
 h1, h2, h3 { text-wrap: balance; }
 /* Figures keep one width, so a growing size or duration does not jiggle (CSS-09). */
 .meta, .card table, .count, #sink-text, .facts { font-variant-numeric: tabular-nums; }
-h1 { font-size: 18px; }
+h1 { font-size: 1.125rem; }
 h1 img { margin-right: 6px; vertical-align: -4px; }
-h2 { font-size: 15px; }
+h2 { font-size: 0.9375rem; }
 
 .skip {
   position: absolute;
@@ -158,14 +158,14 @@ label { font-weight: 600; }
   display: grid;
   gap: 6px;
 }
-.card h3 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.card h3 { margin: 0; font-size: 0.875rem; overflow-wrap: anywhere; }
 .card .sub { color: var(--muted); overflow-wrap: anywhere; }
 .badges { display: flex; flex-wrap: wrap; gap: 6px; }
 .badge {
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 0 8px;
-  font-size: 12px;
+  font-size: 0.75rem;
   line-height: 20px;
   white-space: nowrap;
 }
@@ -174,7 +174,7 @@ label { font-weight: 600; }
 .badge.muxed { color: var(--tertiary); border-color: var(--tertiary); }
 .meta { display: flex; flex-wrap: wrap; gap: 2px 14px; color: var(--muted); }
 .card details summary { cursor: pointer; color: var(--muted); padding: 4px 0; }
-.card table { border-collapse: collapse; width: 100%; margin-top: 4px; font-size: 12px; }
+.card table { border-collapse: collapse; width: 100%; margin-top: 4px; font-size: 0.75rem; }
 .card th, .card td { text-align: left; padding: 2px 8px 2px 0; overflow-wrap: anywhere; }
 .actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .mux { border-radius: 6px; padding: 6px 10px; background: var(--info-bg); }
@@ -189,7 +189,7 @@ pre {
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 6px;
-  font: 12px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font: 0.75rem/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -233,8 +233,8 @@ dialog p { overflow-wrap: anywhere; }
 @keyframes pulse { 50% { opacity: 0.45; } }
 
 /* Connect browser */
-h3 { font-size: 14px; margin: 14px 0 6px; }
-h4 { font-size: 13px; margin: 8px 0 4px; }
+h3 { font-size: 0.875rem; margin: 14px 0 6px; }
+h4 { font-size: 0.8125rem; margin: 8px 0 4px; }
 ul.plain { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
 .regrow, .tabrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .regrow .grow { flex: 1; }

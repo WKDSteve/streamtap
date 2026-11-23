@@ -53,8 +53,8 @@
         <div id="link" class="muted"></div>
         <details>
           <summary data-i18n="sinkManual">Port and token by hand (a paired app fills this in)</summary>
-          <label><span data-i18n="port">port</span> <input id="port" type="number" min="1" max="65535" aria-describedby="sink-saved" aria-invalid="false" /></label>
-          <label><span data-i18n="token">token</span> <input id="token" type="password" autocomplete="off" spellcheck="false" /></label>
+          <label><span data-i18n="port">port</span> <input id="port" type="number" min="1" max="65535" aria-invalid="false" /></label>
+          <label><span data-i18n="token">token</span> <input id="token" type="password" autocomplete="off" spellcheck="false" autocorrect="off" /></label>
           <div id="sink-saved" class="muted" role="status"></div>
           <button id="save" data-i18n="save">save</button>
         </details>
@@ -62,9 +62,9 @@
 
       <section id="block-tailnet" class="block" hidden>
         <div id="tailnet-state" class="muted" role="status"></div>
-        <label><span data-i18n="tnHost">PC in the tailnet</span> <input id="tailnet-host" type="text" aria-describedby="tailnet-result" aria-invalid="false" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="pc.example.ts.net" /></label>
-        <label><span data-i18n="tnCode">pairing code (or the whole link)</span> <input id="tailnet-code" type="text" aria-describedby="tailnet-result" aria-invalid="false" autocapitalize="none" autocomplete="off" spellcheck="false" maxlength="400" /></label>
-        <label><span data-i18n="tnName">name of this device</span> <input id="tailnet-name" type="text" aria-describedby="tailnet-result" aria-invalid="false" maxlength="40" placeholder="phone" data-i18n-placeholder="tnNamePlaceholder" /></label>
+        <label><span data-i18n="tnHost">PC in the tailnet</span> <input id="tailnet-host" type="text" aria-invalid="false" inputmode="url" autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false" placeholder="pc.example.ts.net" /></label>
+        <label><span data-i18n="tnCode">pairing code (or the whole link)</span> <input id="tailnet-code" type="text" aria-invalid="false" autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false" maxlength="400" /></label>
+        <label><span data-i18n="tnName">name of this device</span> <input id="tailnet-name" type="text" aria-invalid="false" maxlength="40" placeholder="phone" data-i18n-placeholder="tnNamePlaceholder" /></label>
         <div id="tailnet-result" class="muted" role="status"></div>
         <button id="tailnet-pair" data-i18n="tnPair">pair this device</button>
         <button id="tailnet-forget" hidden data-i18n="tnForget">forget this pairing</button>
@@ -81,8 +81,8 @@
       <label class="choice"><input id="unlock-obfuscated" type="checkbox" /><span data-i18n="unlockObfuscated">unlock: obfuscated services (YouTube and alike)</span></label>
       <label class="choice"><input id="unlock-social" type="checkbox" /><span data-i18n="unlockSocial">unlock: social media</span></label>
       <p class="muted" data-i18n="unlockHint">Unlock a group only where capturing it is allowed for you. DRM is never captured.</p>
-      <label><span data-i18n="ownHosts">own servers (one host per line)</span> <textarea id="own-hosts" rows="2" autocapitalize="none" spellcheck="false"></textarea></label>
-      <label><span data-i18n="learningHosts">learning platforms that allow downloads (one host per line)</span> <textarea id="learning-hosts" rows="2" autocapitalize="none" spellcheck="false"></textarea></label>
+      <label><span data-i18n="ownHosts">own servers (one host per line)</span> <textarea id="own-hosts" rows="2" autocapitalize="none" autocorrect="off" spellcheck="false"></textarea></label>
+      <label><span data-i18n="learningHosts">learning platforms that allow downloads (one host per line)</span> <textarea id="learning-hosts" rows="2" autocapitalize="none" autocorrect="off" spellcheck="false"></textarea></label>
       <button id="policy-save" data-i18n="policySave">save sources</button>
       <div id="policy-saved" class="muted" role="status"></div>
     </main>

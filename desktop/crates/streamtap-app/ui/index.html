@@ -48,7 +48,7 @@
       <div class="field wide">
         <label for="tailnet" data-i18n="tailnetName">Name of this PC in the tailnet</label>
         <div class="row">
-          <input id="tailnet" name="tailnet" type="text" spellcheck="false" autocapitalize="none" aria-describedby="tailnet-hint tailnet-error">
+          <input id="tailnet" name="tailnet" type="text" spellcheck="false" autocapitalize="none" autocorrect="off" aria-describedby="tailnet-hint">
           <button id="tailnet-save" type="submit" class="primary" data-i18n="save">Save</button>
         </div>
         <p id="tailnet-error" class="hint bad" role="alert" hidden></p>
@@ -98,11 +98,11 @@
     <form id="settings-form" autocomplete="off">
       <div class="field">
         <label for="port" data-i18n="port">Port</label>
-        <input id="port" name="port" type="number" min="1024" max="65535" inputmode="numeric" required aria-describedby="settings-error">
+        <input id="port" name="port" type="number" min="1024" max="65535" inputmode="numeric" required>
       </div>
       <div class="field wide">
         <label for="dir" data-i18n="capturesFolder">Captures folder</label>
-        <input id="dir" name="dir" type="text" spellcheck="false" required aria-describedby="settings-error">
+        <input id="dir" name="dir" type="text" spellcheck="false" autocorrect="off" required>
       </div>
       <div class="field wide">
         <label for="token" data-i18n="token">Token</label>

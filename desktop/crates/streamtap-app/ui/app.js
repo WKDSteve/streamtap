@@ -95,10 +95,16 @@ const run = async (label, fn) => {
 // A save of a form (FORM-06): the button waits for the answer (no second save while one is out), an error stands in the
 // form where it stays (not in a toast that goes after 5 s), the field it names is marked and takes the focus. The sink
 // answers with a sentence, not a field: the fields it names are found by their words; an error that names none marks none.
+const describing = (id, bad, error = "") => [id === "tailnet" ? "tailnet-hint" : "", bad ? error : ""].filter(Boolean).join(" ");
+const setDescribed = (id, ids) => (ids ? $(id).setAttribute("aria-describedby", ids) : $(id).removeAttribute("aria-describedby"));
 const saving = async (form, button, error, label, fields, fn) => {
   $(error).hidden = true;
   $(error).textContent = "";
-  for (const [id] of fields) $(id).setAttribute("aria-invalid", "false");
+  for (const [id] of fields) {
+    $(id).setAttribute("aria-invalid", "false");
+    // The words describe a field only while it is invalid (a described-by text is read out whatever it says).
+    setDescribed(id, describing(id, false));
+  }
   $(button).disabled = true;
   $(form).setAttribute("aria-busy", "true");
   try {
@@ -108,7 +114,10 @@ const saving = async (form, button, error, label, fields, fn) => {
     $(error).textContent = words;
     $(error).hidden = false;
     const bad = fields.filter(([, about]) => about.test(String(e))).map(([id]) => id);
-    for (const id of bad) $(id).setAttribute("aria-invalid", "true");
+    for (const id of bad) {
+      $(id).setAttribute("aria-invalid", "true");
+      setDescribed(id, describing(id, true, error));
+    }
     if (bad.length) $(bad[0]).focus();
   }
   $(form).setAttribute("aria-busy", "false");

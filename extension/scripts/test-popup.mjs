@@ -50,6 +50,9 @@ class FakeNode {
   setAttribute(name, value) {
     this.attrs[name] = String(value);
   }
+  removeAttribute(name) {
+    delete this.attrs[name];
+  }
   focus() {
     this.focused++;
   }
@@ -439,7 +442,7 @@ const forged = {
     check(answered.ids["tailnet-pair"].disabled === false && answered.ids["tailnet-offer-pair"].disabled === false, "tailnet: and free again with the answer");
     const marks = ["tailnet-host", "tailnet-code", "tailnet-name"].map((id) => answered.ids[id].attrs["aria-invalid"]).join();
     check(marks === "false,true,false" && answered.ids["tailnet-code"].focused === 1, `tailnet: a wrong code marks the code field and takes the focus (got ${marks})`);
-    check(answered.ids["tailnet-code"].attrs["aria-describedby"] === "tailnet-result", "tailnet: the field is described by its words");
+    check(answered.ids["tailnet-code"].attrs["aria-describedby"] === "tailnet-result" && !("aria-describedby" in answered.ids["tailnet-host"].attrs), "tailnet: only the failed field is described by the words");
     answered.ids["tailnet-pair"].onclick();
     check(answered.ids["tailnet-host"].focused === 0 && answered.ids["tailnet-code"].attrs["aria-invalid"] === "true", "tailnet: the mark stays while the answer says the same");
     const gone = await run({ target: "tailnet", tailnet: ok, pairAnswer: { ok: true, host: "pc.example.ts.net" } });
@@ -602,6 +605,13 @@ const forged = {
   const odd = keysEn.filter((k) => marks(en[k]) % 2 || marks(de[k]) % 2 || marks(en[k]) !== marks(de[k]));
   check(odd.length === 0, `the backticks of a text come in pairs, alike in both languages${odd.length ? ` (${odd.join(", ")})` : ""}`);
   check(keysEn.filter((k) => marks(en[k])).length >= 3 && !inPage.some((k) => marks(en[k] ?? "")), "texts with a command carry marks, the static texts of the page carry none");
+  // Text size is in rem, so the browser's font size preference reaches it (typography guide); and a field that holds an
+  // identifier, not prose, has no autocorrect.
+  const css = readFileSync(join(popupDir, "popup.css"), "utf8");
+  check(!/font(?:-size)?:\s*\d+(?:\.\d+)?px/.test(css), "popup.css sets no font size in px");
+  const ids = ["token", "tailnet-host", "tailnet-code", "own-hosts", "learning-hosts"];
+  const prose = ids.filter((id) => !new RegExp(`id="${id}"[^>]*autocorrect="off"`).test(html));
+  check(prose.length === 0, `fields with an identifier have autocorrect off${prose.length ? ` (not: ${prose.join(", ")})` : ""}`);
   // Static text: what stands in popup.html without scripts is the English text of its key.
   const stale = [...html.matchAll(/data-i18n="(\w+)"[^>]*>([^<]*)</g)].filter(([, key, textInPage]) => en[key] !== textInPage.replace(/&amp;/g, "&")).map((m) => m[1]);
   check(stale.length === 0, `the text in popup.html is the English text of its key${stale.length ? ` (not: ${stale.join(", ")})` : ""}`);

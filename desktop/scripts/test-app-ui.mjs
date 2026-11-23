@@ -91,6 +91,9 @@ for (const m of html.matchAll(/data-i18n(?:-aria-label|-title)?="([^"]+)"/g)) ch
   fill(node, "plain");
   check(node.textContent === "plain", "fill: a text without marks is set as it is");
 }
+// Text size is in rem, so the user's font size preference reaches it; a field with a folder or a name has no autocorrect.
+check(!/font(?:-size)?:\s*\d+(?:\.\d+)?px/.test(read("style.css")), "style.css sets no font size in px");
+check(["dir", "tailnet"].every((id) => new RegExp(`id="${id}"[^>]*autocorrect="off"`).test(html)), "the folder and tailnet fields have autocorrect off");
 const app = read("app.js");
 for (const m of app.matchAll(/\bt\(\s*"([^"]+)"/g)) check(m[1] in en, `app.js uses unknown key ${m[1]}`);
 // The confirm dialog's heading and button keys (ask({ heading: "...", ok: "..." })).
@@ -226,6 +229,9 @@ class FakeEl {
   }
   setAttribute(k, v) {
     this.attrs[k] = String(v);
+  }
+  removeAttribute(k) {
+    delete this.attrs[k];
   }
   append(...c) {
     this.children.push(...c);

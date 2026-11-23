@@ -129,11 +129,12 @@ try {
     words: document.getElementById("settings-error").textContent,
     port: document.getElementById("port").getAttribute("aria-invalid"),
     dir: document.getElementById("dir").getAttribute("aria-invalid"),
+    described: [document.getElementById("port").getAttribute("aria-describedby"), document.getElementById("dir").getAttribute("aria-describedby")].join(),
     focus: document.activeElement.id,
     button: document.getElementById("settings-save").disabled,
     toast: !document.getElementById("toast").hidden && document.getElementById("toast").textContent.includes("2000"),
   }));
-  check("app: a refused port is said at the form, marked and focused, and the button is free", refused.words.includes("port 2000") && refused.port === "true" && refused.dir === "false" && refused.focus === "port" && !refused.button && !refused.toast, JSON.stringify(refused));
+  check("app: a refused port is said at the form, marked and focused, and the button is free", refused.words.includes("port 2000") && refused.port === "true" && refused.dir === "false" && refused.focus === "port" && refused.described === "settings-error," && !refused.button && !refused.toast, JSON.stringify(refused));
   await page.fill("#port", "17650");
   await page.fill("#tailnet", "bad");
   await page.evaluate(() => document.getElementById("tailnet-form").requestSubmit());
