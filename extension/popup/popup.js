@@ -36,6 +36,12 @@ const num = (v, max, min = max) => {
 // A value from the page that is no number stays what it is (text), as before.
 const secs = (v) => (typeof v === "number" && Number.isFinite(v) ? num(v, 1, 0) : String(v));
 
+// A field that failed says so (aria-invalid, its words under the fields, described by them) and takes the focus (FORM-06).
+const markInvalid = (fields, bad, focus) => {
+  for (const id of fields) $(id).setAttribute("aria-invalid", String(bad.includes(id)));
+  if (focus && bad.length) $(bad[0]).focus();
+};
+
 const fmtBytes = (v) => {
   const n = Number(v) || 0;
   return n >= 1 << 20 ? num(n / (1 << 20), 1) + " MiB" : n >= 1024 ? num(n / 1024, 0) + " KiB" : num(n, 0) + " B";
@@ -206,6 +212,10 @@ const tailnetText = (s) => {
   return [cls, t(key, { pc: String(s.host), id: String(s.device).slice(0, 8) })];
 };
 
+// The field an answer of the pairing is about (the others are about the PC or the browser as a whole).
+const PAIR_FIELDS = ["tailnet-host", "tailnet-code", "tailnet-name"];
+const PAIR_FIELD_OF = { host: "tailnet-host", unreachable: "tailnet-host", code: "tailnet-code", name: "tailnet-name" };
+
 const PAIR_ERROR_KEYS = {
   host: "pairErrHost",
   code: "pairErrCode",
@@ -341,10 +351,20 @@ const load = async () => {
     token.value = v.sinkToken;
   });
   // A manual entry taps every tab (the old behaviour) and is not the app's to take back.
-  $("save").onclick = () =>
-    chrome.storage.local.set({ sinkPort: Number(port.value) || 17650, sinkToken: token.value, sinkPaired: false, tapMode: "all" }, () => {
-      $("sink-saved").textContent = t("sinkSaved");
+  $("save").onclick = () => {
+    const number = Number(port.value);
+    if (!Number.isInteger(number) || number < 1 || number > 65535) {
+      markInvalid(["port"], ["port"], true);
+      return say($("sink-saved"), "locked", t("portInvalid"));
+    }
+    markInvalid(["port"], [], false);
+    // Not twice while the browser writes.
+    $("save").disabled = true;
+    chrome.storage.local.set({ sinkPort: number, sinkToken: token.value, sinkPaired: false, tapMode: "all" }, () => {
+      $("save").disabled = false;
+      say($("sink-saved"), "", t("sinkSaved"));
     });
+  };
 
   const pairLine = $("pair");
   const showPair = (s) => {
@@ -457,6 +477,10 @@ const load = async () => {
     const reason = r && r.reason;
     say(tailnetResult, ok ? "released" : "locked", ok ? t("tnPaired", { pc: r.host }) : t(Object.hasOwn(PAIR_ERROR_KEYS, reason) ? PAIR_ERROR_KEYS[reason] : "tnPairFailed"));
     if (ok) $("tailnet-code").value = "";
+    // The field the answer is about is marked and takes the focus; askTailnet below sets the buttons for the state.
+    markInvalid(PAIR_FIELDS, ok || !Object.hasOwn(PAIR_FIELD_OF, reason) ? [] : [PAIR_FIELD_OF[reason]], true);
+    $("block-tailnet").setAttribute("aria-busy", "false");
+    for (const id of ["tailnet-pair", "tailnet-offer-pair"]) $(id).disabled = false;
     askTailnet();
     showTarget();
   };
@@ -465,6 +489,10 @@ const load = async () => {
     view.pairingOpen = true;
     showBlocks();
     say(tailnetResult, "", t("tnPairing"));
+    markInvalid(PAIR_FIELDS, [], false);
+    // One try at a time: the buttons wait for the answer (it comes over the network).
+    $("block-tailnet").setAttribute("aria-busy", "true");
+    for (const id of ["tailnet-pair", "tailnet-offer-pair"]) $(id).disabled = true;
     chrome.runtime.sendMessage({ kind: "vc-tailnet-pair", name: $("tailnet-name").value, ...msg }, paired);
   };
   $("tailnet-offer-pair").onclick = () => {

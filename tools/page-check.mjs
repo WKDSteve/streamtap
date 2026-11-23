@@ -117,6 +117,31 @@ try {
   });
   check("app: a saved setting is no longer an edit", saved === "false,false,true", saved);
 
+  // A save waits for its answer, and an error stands at the form with its field marked and focused (FORM-06).
+  await page.fill("#port", "2000");
+  const during = await page.evaluate(() => {
+    document.getElementById("settings-form").requestSubmit();
+    return { disabled: document.getElementById("settings-save").disabled, busy: document.getElementById("settings-form").getAttribute("aria-busy") };
+  });
+  check("app: the save button is locked while the save is out", during.disabled && during.busy === "true", JSON.stringify(during));
+  await page.waitForFunction(() => !document.getElementById("settings-error").hidden, null, { timeout: 5000 });
+  const refused = await page.evaluate(() => ({
+    words: document.getElementById("settings-error").textContent,
+    port: document.getElementById("port").getAttribute("aria-invalid"),
+    dir: document.getElementById("dir").getAttribute("aria-invalid"),
+    focus: document.activeElement.id,
+    button: document.getElementById("settings-save").disabled,
+    toast: !document.getElementById("toast").hidden && document.getElementById("toast").textContent.includes("2000"),
+  }));
+  check("app: a refused port is said at the form, marked and focused, and the button is free", refused.words.includes("port 2000") && refused.port === "true" && refused.dir === "false" && refused.focus === "port" && !refused.button && !refused.toast, JSON.stringify(refused));
+  await page.fill("#port", "17650");
+  await page.fill("#tailnet", "bad");
+  await page.evaluate(() => document.getElementById("tailnet-form").requestSubmit());
+  await page.waitForFunction(() => !document.getElementById("tailnet-error").hidden, null, { timeout: 5000 });
+  const badName = await page.evaluate(() => ({ port: document.getElementById("tailnet").getAttribute("aria-invalid"), focus: document.activeElement.id }));
+  check("app: a refused tailnet name marks its field and takes the focus", badName.port === "true" && badName.focus === "tailnet", JSON.stringify(badName));
+  await page.fill("#tailnet", "pc.example.ts.net");
+
   // The phones panel while the sink runs: the paired phone and a pairing code with its QR code. The stand-in's
   // snapshot is the object the page holds, so the sink is "started" by changing it.
   // Axe reads the style sheets of a file:// page itself and logs that it may not; only what the panel adds counts.

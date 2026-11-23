@@ -51,10 +51,16 @@ export function bridge() {
     qr: Array.from({ length: 25 }, (_, y) => Array.from({ length: 25 }, (_, x) => ((x * 7 + y * 3) % 5 < 2 ? "1" : "0")).join("")),
   };
   const answers = { snapshot, get_settings: settings, phone_devices: phones, phone_pair: pairing };
+  // A save answers with what was saved, as the app does; the sink refuses a port that is taken and a name it cannot use,
+  // with a sentence, as the app does.
   window.__TAURI__ = {
     core: {
-      // A save answers with what was saved, as the app does.
-      invoke: async (cmd, args) => (cmd === "save_settings" ? { ...settings, port: args.port, captures_dir: args.capturesDir, tailnet: args.tailnet } : answers[cmd] ?? null),
+      invoke: async (cmd, args) => {
+        if (cmd === "save_settings" && args.port === 2000) throw "the port 2000 is in use";
+        if (cmd === "save_settings" && args.tailnet === "bad") throw "the tailnet name is not a name";
+        if (cmd === "save_settings") return { ...settings, port: args.port, captures_dir: args.capturesDir, tailnet: args.tailnet };
+        return answers[cmd] ?? null;
+      },
     },
   };
 }

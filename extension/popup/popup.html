@@ -53,21 +53,21 @@
         <div id="link" class="muted"></div>
         <details>
           <summary data-i18n="sinkManual">Port and token by hand (a paired app fills this in)</summary>
-          <label><span data-i18n="port">port</span> <input id="port" type="number" min="1" max="65535" /></label>
+          <label><span data-i18n="port">port</span> <input id="port" type="number" min="1" max="65535" aria-describedby="sink-saved" aria-invalid="false" /></label>
           <label><span data-i18n="token">token</span> <input id="token" type="password" autocomplete="off" spellcheck="false" /></label>
-          <button id="save" data-i18n="save">save</button>
           <div id="sink-saved" class="muted" role="status"></div>
+          <button id="save" data-i18n="save">save</button>
         </details>
       </section>
 
       <section id="block-tailnet" class="block" hidden>
         <div id="tailnet-state" class="muted" role="status"></div>
-        <label><span data-i18n="tnHost">PC in the tailnet</span> <input id="tailnet-host" type="text" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="pc.example.ts.net" /></label>
-        <label><span data-i18n="tnCode">pairing code (or the whole link)</span> <input id="tailnet-code" type="text" autocapitalize="none" autocomplete="off" spellcheck="false" maxlength="400" /></label>
-        <label><span data-i18n="tnName">name of this device</span> <input id="tailnet-name" type="text" maxlength="40" placeholder="phone" data-i18n-placeholder="tnNamePlaceholder" /></label>
+        <label><span data-i18n="tnHost">PC in the tailnet</span> <input id="tailnet-host" type="text" aria-describedby="tailnet-result" aria-invalid="false" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="pc.example.ts.net" /></label>
+        <label><span data-i18n="tnCode">pairing code (or the whole link)</span> <input id="tailnet-code" type="text" aria-describedby="tailnet-result" aria-invalid="false" autocapitalize="none" autocomplete="off" spellcheck="false" maxlength="400" /></label>
+        <label><span data-i18n="tnName">name of this device</span> <input id="tailnet-name" type="text" aria-describedby="tailnet-result" aria-invalid="false" maxlength="40" placeholder="phone" data-i18n-placeholder="tnNamePlaceholder" /></label>
+        <div id="tailnet-result" class="muted" role="status"></div>
         <button id="tailnet-pair" data-i18n="tnPair">pair this device</button>
         <button id="tailnet-forget" hidden data-i18n="tnForget">forget this pairing</button>
-        <div id="tailnet-result" class="muted" role="status"></div>
       </section>
 
       <section id="block-device" class="block" hidden>

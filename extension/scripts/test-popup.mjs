@@ -88,7 +88,7 @@ const run = async (o = {}) => {
   const nodes = pageNodes();
   const ids = Object.fromEntries(nodes.filter((n) => n.attrs.id).map((n) => [n.attrs.id, n]));
   const missing = [];
-  const env = { ids, sent: [], sets: [], missing, misses: [], timeouts: [], onMessage: [] };
+  const env = { ids, sent: [], sets: [], during: [], missing, misses: [], timeouts: [], onMessage: [] };
   const listeners = [];
   const trail = [o.hash || ""];
   const location = {
@@ -135,6 +135,8 @@ const run = async (o = {}) => {
       getManifest: () => ({ version: "9.8.7" }),
       sendMessage: (msg, cb) => {
         env.sent.push(msg);
+        // What the buttons are while the request is out (the answer comes later in a real browser).
+        env.during.push({ kind: msg.kind, pair: ids["tailnet-pair"]?.disabled, offer: ids["tailnet-offer-pair"]?.disabled });
         cb?.(answers[msg.kind]);
       },
       onMessage: { addListener: (f) => env.onMessage.push(f) },
@@ -143,7 +145,7 @@ const run = async (o = {}) => {
     storage: {
       local: {
         get: (d, cb) => cb("sinkTarget" in d ? { ...d, sinkTarget: env.sets.findLast((s) => "sinkTarget" in s)?.sinkTarget ?? o.target ?? "" } : d),
-        set: (s, cb) => (env.sets.push(s), cb?.()),
+        set: (s, cb) => (env.sets.push(s), env.during.push({ kind: "set", save: ids.save?.disabled }), cb?.()),
       },
     },
   };
@@ -306,6 +308,16 @@ const forged = {
   const w = s.sets.at(-1);
   check(w.sinkPort === 17700 && w.sinkToken === "typed" && w.sinkPaired === false && w.tapMode === "all", "save writes port and token as a manual entry");
   check(s.ids["sink-saved"].textContent.startsWith("saved; reload"), "and says what to do next");
+  check(s.during.findLast((d) => d.kind === "set").save === true && s.ids.save.disabled === false, "save is locked while the browser writes and free after");
+  for (const bad of ["0", "70000", "1.5", "abc", ""]) {
+    const b = await run({});
+    b.ids.port.value = bad;
+    b.ids.save.onclick();
+    check(!b.sets.some((x) => "sinkPort" in x) && b.ids.port.attrs["aria-invalid"] === "true" && b.ids.port.focused === 1 && b.ids["sink-saved"].textContent.startsWith("port:"), `save: the port "${bad}" is refused at the field`);
+  }
+  s.ids.port.value = "17701";
+  s.ids.save.onclick();
+  check(s.ids.port.attrs["aria-invalid"] === "false", "save: a good port clears the mark");
 }
 
 // The pairing with the app.
@@ -412,6 +424,28 @@ const forged = {
     r.ids["tailnet-pair"].onclick();
     const said = r.ids["tailnet-result"].textContent;
     check(said !== "pairing failed" && said.length > 10, `tailnet: the refusal ${reason} has its own words`);
+  }
+  // FORM-06: no second try while one is out, the failed field is marked and has the focus, the words stand above the button.
+  {
+    const ok = { available: true, paired: false, host: "", device: "", state: "not-paired", offer: "pc.example.ts.net" };
+    const answered = await run({ target: "tailnet", tailnet: ok, pairAnswer: { ok: false, reason: "code" } });
+    answered.ids["tailnet-pair"].onclick();
+    const out = answered.during.findLast((d) => d.kind === "vc-tailnet-pair");
+    check(out.pair === true && out.offer === true, "tailnet: both pairing buttons are locked while the request is out");
+    check(answered.ids["tailnet-pair"].disabled === false && answered.ids["tailnet-offer-pair"].disabled === false, "tailnet: and free again with the answer");
+    const marks = ["tailnet-host", "tailnet-code", "tailnet-name"].map((id) => answered.ids[id].attrs["aria-invalid"]).join();
+    check(marks === "false,true,false" && answered.ids["tailnet-code"].focused === 1, `tailnet: a wrong code marks the code field and takes the focus (got ${marks})`);
+    check(answered.ids["tailnet-code"].attrs["aria-describedby"] === "tailnet-result", "tailnet: the field is described by its words");
+    answered.ids["tailnet-pair"].onclick();
+    check(answered.ids["tailnet-host"].focused === 0 && answered.ids["tailnet-code"].attrs["aria-invalid"] === "true", "tailnet: the mark stays while the answer says the same");
+    const gone = await run({ target: "tailnet", tailnet: ok, pairAnswer: { ok: true, host: "pc.example.ts.net" } });
+    gone.ids["tailnet-code"].setAttribute("aria-invalid", "true");
+    gone.ids["tailnet-pair"].onclick();
+    check(gone.ids["tailnet-code"].attrs["aria-invalid"] === "false", "tailnet: a pairing that worked clears the mark");
+    const whole = await run({ target: "tailnet", tailnet: ok, pairAnswer: { ok: false, reason: "busy" } });
+    whole.ids["tailnet-pair"].onclick();
+    check(["tailnet-host", "tailnet-code", "tailnet-name"].every((id) => whole.ids[id].attrs["aria-invalid"] === "false"), "tailnet: an answer about no field marks none");
+    check(html.indexOf('id="tailnet-result"') < html.indexOf('id="tailnet-pair"') && html.indexOf('id="sink-saved"') < html.indexOf('id="save"'), "the words of a try stand with the fields, above the button");
   }
   const odd = await run({ target: "tailnet", tailnet: { available: true, paired: false, host: "", device: "", state: "not-paired", offer: "" }, pairAnswer: { ok: false, reason: "toString" } });
   odd.ids["tailnet-pair"].onclick();
