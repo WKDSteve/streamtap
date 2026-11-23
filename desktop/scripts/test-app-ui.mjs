@@ -59,7 +59,7 @@ check(I18N.lang === "en", "an unknown language falls back to English");
 
 const html = read("index.html");
 for (const m of html.matchAll(/data-i18n(?:-aria-label|-title)?="([^"]+)"/g)) check(m[1] in en, `index.html uses unknown key ${m[1]}`);
-// Names and commands are not translated by the browser (HTML-05): the brand and every command carry translate="no", and
+// Names and commands are not translated by the browser: the brand and every command carry translate="no", and
 // no static text holds a command (it stands in an element of its own).
 {
   const COMMAND = /tailscale (?:serve|funnel)|chrome:\/\/|ffmpeg|--tailnet/;

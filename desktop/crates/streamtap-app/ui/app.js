@@ -26,7 +26,7 @@ const state = {
   // The phones panel: the paired phones (null: not known), the pairing code on show, why the sink could not be asked.
   phones: { list: null, pairing: null, expired: false, error: "", ticks: 0 },
   signature: "",
-  // Fields the user typed into and has not saved: a redraw must not write the stored value over them (FORM-07).
+  // Fields the user typed into and has not saved: a redraw must not write the stored value over them.
   dirty: new Set(),
   busy: false,
   // Language and theme as stored ("system" follows the webview / the OS).
@@ -92,7 +92,7 @@ const run = async (label, fn) => {
   await refresh();
 };
 
-// A save of a form (FORM-06): the button waits for the answer (no second save while one is out), an error stands in the
+// A save of a form: the button waits for the answer (no second save while one is out), an error stands in the
 // form where it stays (not in a toast that goes after 5 s), the field it names is marked and takes the focus. The sink
 // answers with a sentence, not a field: the fields it names are found by their words; an error that names none marks none.
 const describing = (id, bad, error = "") => [id === "tailnet" ? "tailnet-hint" : "", bad ? error : ""].filter(Boolean).join(" ");

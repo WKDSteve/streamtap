@@ -93,7 +93,7 @@ try {
     await page.mouse.move(0, 0);
   }
 
-  // What is typed and not saved survives a redraw, also when the focus is elsewhere (FORM-07).
+  // What is typed and not saved survives a redraw, also when the focus is elsewhere.
   await page.fill("#port", "17999");
   await page.fill("#dir", "D:/typed");
   await page.fill("#tailnet", "typed.example.ts.net");
@@ -117,7 +117,7 @@ try {
   });
   check("app: a saved setting is no longer an edit", saved === "false,false,true", saved);
 
-  // A save waits for its answer, and an error stands at the form with its field marked and focused (FORM-06).
+  // A save waits for its answer, and an error stands at the form with its field marked and focused.
   await page.fill("#port", "2000");
   const during = await page.evaluate(() => {
     document.getElementById("settings-form").requestSubmit();
@@ -197,7 +197,7 @@ try {
       .map(([n, r]) => `${n.id || n.textContent.trim().slice(0, 20)} ${Math.round(r.width)}x${Math.round(r.height)}`)
   );
   check("app: targets of 24 px", tinyTargets.length === 0, tinyTargets.join(", "));
-  // A long error text and a long host on a narrow window (CSS-08): the toast and the tab list wrap inside the window.
+  // A long error text and a long host on a narrow window: the toast and the tab list wrap inside the window.
   await page.setViewportSize({ width: 420, height: 800 });
   await page.evaluate((word) => {
     state.signature = "";
@@ -294,9 +294,9 @@ try {
           }, TARGETS);
           check(`${label}: one page`, seen.pages.join() === `page-${view.name.split("-")[0]}`, seen.pages.join());
           if (view.hash === "#target") check(`${label}: only the block of the target`, seen.blocks.join() === `block-${view.name.split("-")[1]}`, seen.blocks.join());
-          // A field is at least 16 px (1rem) on every device: a smaller one is zoomed in by iOS and hard to read (FORM-05).
+          // A field is at least 16 px (1rem) on every device: a smaller one is zoomed in by iOS and hard to read.
           check(`${label}: fields of 16 px`, seen.fields.length === 0, seen.fields.join(", "));
-          // Figures of a size or count are tabular, headings are balanced where the browser knows it (CSS-09).
+          // Figures of a size or count are tabular, headings are balanced where the browser knows it.
           const figures = await p.evaluate(() => {
             const wanted = ["table td", "#tab-line", "#target-line", "#file-state"];
             const missing = wanted.filter((sel) => [...document.querySelectorAll(sel)].some((n) => n.getClientRects().length > 0 && !getComputedStyle(n).fontVariantNumeric.includes("tabular-nums")));
@@ -315,13 +315,13 @@ try {
             check(`${label}: touch targets of 48 px`, seen.small.length === 0, seen.small.join(", "));
           } else {
             check(`${label}: the PC's style is in effect`, !seen.coarse);
-            // With a mouse a target is at least 24 px high and wide (WCAG 2.5.8, ACC-04); the phone's 48 px is checked above.
+            // With a mouse a target is at least 24 px high and wide (WCAG 2.5.8); the phone's 48 px is checked above.
             check(`${label}: targets of 24 px`, seen.tiny.length === 0, seen.tiny.join(", "));
           }
           await axe(p, label);
           if (shots) await shoot(p, device, `${view.name}-${device.name}-${scheme}`);
           // Last, it changes the page: a path of 120 characters without a space (a file name, a URL) in every line of state
-          // must wrap inside its box, not push the page sideways (CSS-08).
+          // must wrap inside its box, not push the page sideways.
           if (scheme === "light") {
             const wide = await p.evaluate((word) => {
               const lines = [...document.querySelectorAll("main:not([hidden]) :is(div, p, span)[id]")].filter((n) => n.getClientRects().length > 0 && n.children.length === 0);

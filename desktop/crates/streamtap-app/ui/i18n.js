@@ -434,7 +434,7 @@ const I18N = (() => {
 
 
   // A text may mark a command or a program with backticks (`ffmpeg`): it is shown in an element of its own that the
-  // browser's page translation leaves alone (<code translate="no">, HTML-05). Only a node that is filled with this
+  // browser's page translation leaves alone (<code translate="no">). Only a node that is filled with this
   // reads the marks; t() gives the text as it is. An odd number of backticks (a value that has one) is no mark: the
   // text is put in plain, without them. Nothing is parsed as markup.
   const fill = (node, text) => {

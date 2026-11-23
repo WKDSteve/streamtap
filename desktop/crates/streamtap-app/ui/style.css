@@ -27,7 +27,7 @@ body {
 h1, h2 { margin: 0; line-height: 1.2; }
 /* A heading breaks into lines of about one length (Baseline widely available since 2026-11-13, web-features 3.47). */
 h1, h2, h3 { text-wrap: balance; }
-/* Figures keep one width, so a growing size or duration does not jiggle (CSS-09). */
+/* Figures keep one width, so a growing size or duration does not jiggle. */
 .meta, .card table, .count, #sink-text, .facts { font-variant-numeric: tabular-nums; }
 h1 { font-size: 1.125rem; }
 h1 img { margin-right: 6px; vertical-align: -4px; }
@@ -86,7 +86,7 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); border-co
 button.danger { color: var(--bad); border-color: var(--bad); }
 
 input, select {
-  /* 1rem: a field is as large as the text of a form on every device (FORM-05), whatever the page's size is. */
+  /* 1rem: a field is as large as the text of a form on every device, whatever the page's size is. */
   font-size: 1rem;
   background: var(--bg);
   border: 1px solid var(--line);
@@ -109,7 +109,7 @@ option { background: var(--surface); color: var(--text); }
   padding: 12px 14px;
 }
 .panel[hidden] { display: none; }
-/* With a mouse a target is 24 px high at least (ACC-04). */
+/* With a mouse a target is 24 px high at least. */
 details.panel > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
 
 .notices { display: grid; gap: 8px; }
