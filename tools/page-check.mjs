@@ -45,7 +45,8 @@ async function axe(page, label) {
   check(`axe ${label}`, lines.length === 0, lines.join("; "));
 }
 
-const browser = await chromium.launch({ channel: "chrome", headless: true });
+// PAGE_CHECK_CHROME: the path of a Chrome or Chromium binary where no installed Chrome is (a container).
+const browser = await chromium.launch(process.env.PAGE_CHECK_CHROME ? { executablePath: process.env.PAGE_CHECK_CHROME, headless: true } : { channel: "chrome", headless: true });
 try {
   const context = await browser.newContext();
   const page = await context.newPage();
