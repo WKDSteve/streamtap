@@ -40,6 +40,7 @@ const el = (tag, props = {}, ...children) => {
   for (const [k, v] of Object.entries(props)) {
     if (k === "class") node.className = v;
     else if (k === "text") node.textContent = v;
+    else if (k === "rich") I18N.fill(node, v);
     else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
     else if (v === true) node.setAttribute(k, "");
     else if (v !== false && v != null) node.setAttribute(k, v);
@@ -176,8 +177,9 @@ const renderHeader = (snap) => {
   btn.classList.toggle("primary", s.state !== "running");
 };
 
-const notice = (kind, title, body, pre) =>
-  el("div", { class: `notice ${kind}` }, el("strong", { text: title }), body ? el("span", { text: body }) : null, pre ? el("pre", { text: pre }) : null);
+// `rich`: the texts are ours and may mark a command with backticks (I18N.fill); a text from the sink never is.
+const notice = (kind, title, body, pre, rich = false) =>
+  el("div", { class: `notice ${kind}` }, el("strong", { [rich ? "rich" : "text"]: title }), body ? el("span", { [rich ? "rich" : "text"]: body }) : null, pre ? el("pre", { text: pre }) : null);
 
 const renderNotices = (snap) => {
   const box = $("notices");
@@ -187,13 +189,13 @@ const renderNotices = (snap) => {
     box.append(notice("error", t("noticeConfigTitle"), t("noticeConfigBody", { error: snap.config_error })));
   }
   if (!snap.sink_path) {
-    box.append(notice("error", t("noSinkTitle"), t("noSinkBody")));
+    box.append(notice("error", t("noSinkTitle"), t("noSinkBody"), null, true));
   }
   if (s.state === "crashed") {
     box.append(notice("error", t("crashedTitle"), t("crashedBody"), snap.log.slice(-8).join("\n")));
   }
   if (!snap.ffmpeg) {
-    box.append(notice("warn", t("noFfmpegTitle"), t("noFfmpegBody")));
+    box.append(notice("warn", t("noFfmpegTitle"), t("noFfmpegBody"), null, true));
   }
   if (snap.captures_error) box.append(notice("error", t("capturesErrorTitle"), snap.captures_error));
 };
@@ -235,11 +237,11 @@ const muxMeaning = (job) => {
 
 const muxBox = (job) => {
   if (!job) return null;
-  if (job.state === "running") return el("div", { class: "mux", role: "status", text: t("muxRunningText") });
+  if (job.state === "running") return el("div", { class: "mux", role: "status", rich: t("muxRunningText") });
   if (job.state === "ok") return el("div", { class: "mux", role: "status", text: t("muxOkText") });
   const meaning = muxMeaning(job);
   const text = job.code == null ? t("muxFailed", { meaning }) : t("muxFailedCode", { code: job.code, meaning });
-  return el("div", { class: "mux failed", role: "alert" }, el("strong", { text }), job.stderr_tail ? el("pre", { text: job.stderr_tail }) : null);
+  return el("div", { class: "mux failed", role: "alert" }, el("strong", { rich: text }), job.stderr_tail ? el("pre", { text: job.stderr_tail }) : null);
 };
 
 const card = (c, job, detailsOpen) => {
@@ -396,7 +398,7 @@ const renderBrowser = (snap) => {
   if (b.bridge_error) notes.push(b.bridge_error);
   if (b.link.store_error) notes.push(b.link.store_error);
   note.hidden = !notes.length;
-  note.textContent = notes.join(" ");
+  I18N.fill(note, notes.join(" "));
 
   const list = $("approvals");
   list.replaceChildren(
