@@ -221,7 +221,10 @@ const fileRevokeWhenDone = (id, href) => {
     return;
   }
   // No onChanged event in this browser (Firefox for Android has a part of the API only): nothing says when the
-  // download has read the blob, so it is let go after a generous wait.
+  // download has read the blob, so it is let go after a generous wait. A timer of 120 s and not an alarm, on purpose
+  // (JS-05): the blob URL belongs to this worker and is gone when the worker ends, so a wait that dies with the worker
+  // loses nothing, while an alarm would wake a new worker that holds no href to revoke (and would have to keep every
+  // href in storage for it). Where the downloads API has onChanged (above), no wait is used at all.
   setTimeout(() => URL.revokeObjectURL(href), FILE_REVOKE_MS);
 };
 

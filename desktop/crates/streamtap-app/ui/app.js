@@ -9,6 +9,9 @@ const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
 const $ = (id) => document.getElementById(id);
 const t = I18N.t;
 
+// The sink pushes nothing to the page (no Tauri event is emitted yet), so the page asks: 2 s keeps a running capture's
+// size and segment count current without a visible lag, and the poll costs one local call (it stops while the window is
+// hidden, see startPolling).
 const POLL_MS = 2000;
 const LANGUAGES = ["system", "de", "en"];
 const THEMES = ["system", "light", "dark"];
