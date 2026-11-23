@@ -26,9 +26,19 @@ const say = (node, cls, words) => {
   node.textContent = words;
 };
 
+// Numbers are written the way the browser's language writes them (5,0 MiB in German, 5.0 MiB in English), JS-04.
+const formats = new Map();
+const num = (v, max, min = max) => {
+  const key = `${min}-${max}`;
+  if (!formats.has(key)) formats.set(key, new Intl.NumberFormat(navigator.language, { minimumFractionDigits: min, maximumFractionDigits: max }));
+  return formats.get(key).format(v);
+};
+// A value from the page that is no number stays what it is (text), as before.
+const secs = (v) => (typeof v === "number" && Number.isFinite(v) ? num(v, 1, 0) : String(v));
+
 const fmtBytes = (v) => {
   const n = Number(v) || 0;
-  return n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + " MiB" : n >= 1024 ? (n / 1024).toFixed(0) + " KiB" : n + " B";
+  return n >= 1 << 20 ? num(n / (1 << 20), 1) + " MiB" : n >= 1024 ? num(n / 1024, 0) + " KiB" : num(n, 0) + " B";
 };
 
 // --- pages -------------------------------------------------------------------------------------------------------
@@ -65,7 +75,7 @@ const back = () => {
 
 // --- this tab ----------------------------------------------------------------------------------------------------
 const bufferRow = (s) => {
-  const range = s.firstSec === null ? "–" : `${s.firstSec}s – ${s.lastEndSec ?? s.lastSec}s`;
+  const range = s.firstSec === null ? "–" : `${secs(s.firstSec)}s – ${secs(s.lastEndSec ?? s.lastSec)}s`;
   const mime = text("td", "mime", s.mime);
   if (s.mimes.length) mime.append(el("br"), text("span", "muted", t("wasMime", { mimes: s.mimes.join(" → ") })));
   return el(
@@ -231,7 +241,7 @@ const savedLine = (s) => {
   const r = s.report || {};
   const notes = [];
   if (s.full) notes.push(t("noteFull"));
-  if (r.gaps) notes.push(t("noteGaps", { gaps: r.gaps, seconds: Number(r.gapSeconds || 0).toFixed(1) }));
+  if (r.gaps) notes.push(t("noteGaps", { gaps: r.gaps, seconds: num(Number(r.gapSeconds || 0), 1) }));
   if (r.dupes) notes.push(t("noteDupes", { n: r.dupes }));
   if (r.overlaps) notes.push(t("noteOverlaps", { n: r.overlaps }));
   if (r.cut) notes.push(t("noteCut", { n: r.cut }));

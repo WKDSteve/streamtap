@@ -469,6 +469,19 @@ const forged = {
 }
 
 // --- both languages ------------------------------------------------------------
+// Numbers follow the browser's language (JS-04): a German browser writes 1,5 and 5,0, an English one 1.5 and 5.0.
+{
+  const buffer = { sbId: 1, mime: "video/mp4", mimes: [], kind: "mp4", inits: 1, media: 2, bytes: 5 << 20, firstSec: 0, lastEndSec: 1234.5, lastSec: 0 };
+  const state = { drm: [], events: 1, frames: [], mediaSources: [{ msId: 1, ended: false, frameUrl: "https://a.example/", blobUrl: "", sourceBuffers: [buffer] }] };
+  const saved = [{ name: "a.mp4", bytes: 3 << 20, video: true, report: { gaps: 2, gapSeconds: 1.25 } }];
+  const link = { links: 1, file: { available: true, recording: 0, media: 0, bytes: 0, full: false, saved } };
+  const de = await run({ lang: "de-DE", state, target: "video", link });
+  check(de.ids.out.textContent.includes("5,0 MiB") && de.ids.out.textContent.includes("0s – 1.234,5s"), `German browser: bytes and seconds in German digits (got ${de.ids.out.textContent})`);
+  check(de.ids["file-state"].textContent.includes("3,0 MiB") && de.ids["file-state"].textContent.includes("1,3 s"), `German browser: the gap's seconds in German digits (got ${de.ids["file-state"].textContent})`);
+  const en = await run({ lang: "en-US", state, target: "video", link });
+  check(!/\.toFixed\(/.test(source), "the popup writes no number by toFixed (it knows no language)");
+  check(en.ids.out.textContent.includes("5.0 MiB") && en.ids.out.textContent.includes("0s – 1,234.5s"), "English browser: bytes and seconds in English digits");
+}
 {
   const p = await run({ lang: "de-AT", target: "tailnet", tailnet: { available: true, paired: true, host: "{id}", device: "ab".repeat(16), state: "connected", offer: "" }, overview: { verdict: { state: "locked", groups: ["social"] }, on: true, unlocked: [], own: [], learning: [] } });
   const { en, de } = p.eval("I18N.tables");
