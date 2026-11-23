@@ -23,7 +23,7 @@ export function bridge() {
         bytes: 1024,
         segments: 3,
         duration_ms: 4000,
-        source_buffers: [],
+        source_buffers: [{ sb: 1, kind: "video", mime: "video/mp4", segments: 3, bytes: 1024 }],
       },
     ],
     captures_error: null,

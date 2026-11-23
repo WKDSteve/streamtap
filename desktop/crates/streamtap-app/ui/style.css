@@ -105,7 +105,8 @@ option { background: var(--surface); color: var(--text); }
   padding: 12px 14px;
 }
 .panel[hidden] { display: none; }
-details.panel > summary { cursor: pointer; font-weight: 600; }
+/* With a mouse a target is 24 px high at least (ACC-04). */
+details.panel > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
 
 .notices { display: grid; gap: 8px; }
 .notice {
@@ -168,7 +169,7 @@ label { font-weight: 600; }
 .badge.drm { color: var(--bad); border-color: var(--bad); }
 .badge.muxed { color: var(--tertiary); border-color: var(--tertiary); }
 .meta { display: flex; flex-wrap: wrap; gap: 2px 14px; color: var(--muted); }
-.card details summary { cursor: pointer; color: var(--muted); }
+.card details summary { cursor: pointer; color: var(--muted); padding: 4px 0; }
 .card table { border-collapse: collapse; width: 100%; margin-top: 4px; font-size: 12px; }
 .card th, .card td { text-align: left; padding: 2px 8px 2px 0; overflow-wrap: anywhere; }
 .actions { display: flex; flex-wrap: wrap; gap: 6px; }

@@ -134,6 +134,14 @@ try {
       .map((n) => `${n.id} ${getComputedStyle(n).fontSize}`)
   );
   check("app: fields of 16 px", smallFields.length === 0, smallFields.join(", "));
+  const tinyTargets = await page.evaluate(() =>
+    [...document.querySelectorAll("button, summary, input:not([type=hidden]), select, a[href]")]
+      .filter((n) => n.getClientRects().length > 0 && !n.classList.contains("skip"))
+      .map((n) => [n, n.getBoundingClientRect()])
+      .filter(([, r]) => r.height < 24 || r.width < 24)
+      .map(([n, r]) => `${n.id || n.textContent.trim().slice(0, 20)} ${Math.round(r.width)}x${Math.round(r.height)}`)
+  );
+  check("app: targets of 24 px", tinyTargets.length === 0, tinyTargets.join(", "));
   // A long error text and a long host on a narrow window (CSS-08): the toast and the tab list wrap inside the window.
   await page.setViewportSize({ width: 420, height: 800 });
   await page.evaluate((word) => {
@@ -218,6 +226,10 @@ try {
                 .filter((n) => n.getBoundingClientRect().height < 48)
                 .map((n) => n.id || n.textContent.trim().slice(0, 20)),
               background: getComputedStyle(document.body).backgroundColor,
+              tiny: [...document.querySelectorAll(selector)]
+                .filter(visible)
+                .filter((n) => n.getBoundingClientRect().height < 24 || n.getBoundingClientRect().width < 24)
+                .map((n) => `${n.id || n.textContent.trim().slice(0, 20)} ${Math.round(n.getBoundingClientRect().width)}x${Math.round(n.getBoundingClientRect().height)}`),
               fields: [...document.querySelectorAll("input:not([type=checkbox]):not([type=radio]), textarea, select")]
                 .filter(visible)
                 .filter((n) => parseFloat(getComputedStyle(n).fontSize) < 16)
@@ -240,6 +252,8 @@ try {
             check(`${label}: touch targets of 48 px`, seen.small.length === 0, seen.small.join(", "));
           } else {
             check(`${label}: the PC's style is in effect`, !seen.coarse);
+            // With a mouse a target is at least 24 px high and wide (WCAG 2.5.8, ACC-04); the phone's 48 px is checked above.
+            check(`${label}: targets of 24 px`, seen.tiny.length === 0, seen.tiny.join(", "));
           }
           await axe(p, label);
           if (shots) await shoot(p, device, `${view.name}-${device.name}-${scheme}`);
