@@ -88,6 +88,31 @@ const run = async (label, fn) => {
   await refresh();
 };
 
+// A save of a form (FORM-06): the button waits for the answer (no second save while one is out), an error stands in the
+// form where it stays (not in a toast that goes after 5 s), the field it names is marked and takes the focus. The sink
+// answers with a sentence, not a field: the fields it names are found by their words; an error that names none marks none.
+const saving = async (form, button, error, label, fields, fn) => {
+  $(error).hidden = true;
+  $(error).textContent = "";
+  for (const [id] of fields) $(id).setAttribute("aria-invalid", "false");
+  $(button).disabled = true;
+  $(form).setAttribute("aria-busy", "true");
+  try {
+    await fn();
+  } catch (e) {
+    const words = `${label}: ${e}`;
+    $(error).textContent = words;
+    $(error).hidden = false;
+    const bad = fields.filter(([, about]) => about.test(String(e))).map(([id]) => id);
+    for (const id of bad) $(id).setAttribute("aria-invalid", "true");
+    if (bad.length) $(bad[0]).focus();
+  }
+  $(form).setAttribute("aria-busy", "false");
+  // The sink running locks the button (renderSettings); the redraw below may not run when nothing else changed.
+  $(button).disabled = state.snap?.sink.state === "running";
+  await refresh();
+};
+
 // ---- language and theme ---------------------------------------------------
 
 const pick = (value, allowed) => (allowed.includes(value) ? value : "system");
@@ -696,7 +721,7 @@ for (const id of ["port", "dir", "tailnet"]) $(id).addEventListener("input", () 
 
 $("tailnet-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  run(t("saveTailnet"), async () => {
+  saving("tailnet-form", "tailnet-save", "tailnet-error", t("saveTailnet"), [["tailnet", /./]], async () => {
     if (!state.settings) return;
     const tailnet = cleanTailnet($("tailnet").value);
     state.settings = await invoke("save_settings", { port: state.settings.port, capturesDir: state.settings.captures_dir, tailnet });
@@ -723,7 +748,7 @@ $("phones-refresh").addEventListener("click", async () => {
 
 $("settings-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  run(t("saveSettings"), async () => {
+  saving("settings-form", "settings-save", "settings-error", t("saveSettings"), [["port", /port/i], ["dir", /folder|director|captures|path/i]], async () => {
     state.settings = await invoke("save_settings", { port: Number($("port").value), capturesDir: $("dir").value, tailnet: state.settings?.tailnet ?? "" });
     state.dirty.delete("port");
     state.dirty.delete("dir");

@@ -48,9 +48,10 @@
       <div class="field wide">
         <label for="tailnet" data-i18n="tailnetName">Name of this PC in the tailnet</label>
         <div class="row">
-          <input id="tailnet" name="tailnet" type="text" spellcheck="false" autocapitalize="none" aria-describedby="tailnet-hint">
+          <input id="tailnet" name="tailnet" type="text" spellcheck="false" autocapitalize="none" aria-describedby="tailnet-hint tailnet-error">
           <button id="tailnet-save" type="submit" class="primary" data-i18n="save">Save</button>
         </div>
+        <p id="tailnet-error" class="hint bad" role="alert" hidden></p>
         <p id="tailnet-lock" class="hint" hidden data-i18n="tailnetLock">Stop the sink to change the name.</p>
         <p id="tailnet-hint" class="hint" data-i18n="tailnetHint">As the tailnet shows it, for example pc.example.ts.net (with Headscale: pc and your base domain): lower case, no https://, no port. Empty: phones are off.</p>
       </div>
@@ -97,11 +98,11 @@
     <form id="settings-form" autocomplete="off">
       <div class="field">
         <label for="port" data-i18n="port">Port</label>
-        <input id="port" name="port" type="number" min="1024" max="65535" inputmode="numeric" required>
+        <input id="port" name="port" type="number" min="1024" max="65535" inputmode="numeric" required aria-describedby="settings-error">
       </div>
       <div class="field wide">
         <label for="dir" data-i18n="capturesFolder">Captures folder</label>
-        <input id="dir" name="dir" type="text" spellcheck="false" required>
+        <input id="dir" name="dir" type="text" spellcheck="false" required aria-describedby="settings-error">
       </div>
       <div class="field wide">
         <label for="token" data-i18n="token">Token</label>
@@ -113,6 +114,7 @@
         </div>
         <p class="hint" data-i18n="tokenHint">A browser paired through Connect browser gets port and token by itself. Otherwise paste them into the streamtap extension popup, then reload the video page.</p>
       </div>
+      <p id="settings-error" class="hint bad" role="alert" hidden></p>
       <div class="row">
         <button id="settings-save" type="submit" class="primary" data-i18n="save">Save</button>
       </div>
