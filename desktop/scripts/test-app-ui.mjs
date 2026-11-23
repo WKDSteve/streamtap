@@ -70,6 +70,27 @@ for (const m of html.matchAll(/data-i18n(?:-aria-label|-title)?="([^"]+)"/g)) ch
   check(/<dt translate="no">ffmpeg<\/dt>/.test(html), 'the program name ffmpeg in index.html is translate="no"');
   check(inCommand.length === 0, `no static text holds a command (${inCommand.join(", ")})`);
 }
+// A command is marked with backticks (I18N.fill makes <code translate="no"> of it): in pairs, alike in both languages,
+// and never in a text of the page's own markup (data-i18n sets it plainly).
+{
+  const marks = (s) => (s.match(/`/g) || []).length;
+  const odd = Object.keys(en).filter((k) => marks(en[k]) % 2 || marks(de[k] ?? "") % 2 || marks(en[k]) !== marks(de[k] ?? ""));
+  check(odd.length === 0, `the backticks of a text come in pairs, alike in both languages (${odd.join(", ")})`);
+  const inMarkup = [...html.matchAll(/data-i18n(?:-aria-label|-title)?="([^"]+)"/g)].map((m) => m[1]).filter((k) => marks(en[k] ?? ""));
+  check(inMarkup.length === 0, `no static text carries a mark (${inMarkup.join(", ")})`);
+  check(Object.keys(en).filter((k) => marks(en[k])).length >= 7, "the texts with a command carry marks");
+  // fill(): the commands become elements, a value with a single backtick stays plain text.
+  const made = [];
+  const node = { textContent: "", replaceChildren: (...c) => made.push(...c) };
+  const dom = { createElement: () => ({ attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, textContent: "" }) };
+  const { fill } = vm.runInNewContext(`${read("i18n.js")}\nI18N;`, { document: dom });
+  fill(node, "Install `ffmpeg` now");
+  check(made.length === 3 && made[0] === "Install " && made[1].textContent === "ffmpeg" && made[1].attrs.translate === "no" && made[2] === " now", "fill: a mark becomes an element with translate=no");
+  fill(node, "a `b");
+  check(node.textContent === "a b" && made.length === 3, "fill: a single backtick is no mark and is dropped");
+  fill(node, "plain");
+  check(node.textContent === "plain", "fill: a text without marks is set as it is");
+}
 const app = read("app.js");
 for (const m of app.matchAll(/\bt\(\s*"([^"]+)"/g)) check(m[1] in en, `app.js uses unknown key ${m[1]}`);
 // The confirm dialog's heading and button keys (ask({ heading: "...", ok: "..." })).

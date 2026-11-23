@@ -121,7 +121,7 @@ const I18N = (() => {
     savedVideoNotes: "saved video: {name}, {bytes} ({notes})",
     savedRecording: "saved recording: {name}, {bytes}",
     savedRecordingNotes: "saved recording: {name}, {bytes} ({notes})",
-    savedFallback: "{line} - no video: {why}; on the PC: streamtap-sink replay, then mux",
+    savedFallback: "{line} - no video: {why}; on the PC: `streamtap-sink replay`, then mux",
     noteFull: "memory was full",
     noteGaps: "{gaps} gap(s), {seconds} s missing",
     noteDupes: "{n} repeated part(s) kept once",
@@ -144,7 +144,7 @@ const I18N = (() => {
     tnNotPaired: "Over the tailnet: not paired. On the PC: streamtap-sink devices pair, then scan its QR code with this phone or type the code below.",
     tnConnected: "Over the tailnet: connected to {pc} (device {id})",
     tnConnecting: "Over the tailnet: connecting to {pc}…",
-    tnUnreachable: "Over the tailnet: {pc} does not answer, nothing is sent. Is the PC on, the sink running with --tailnet, tailscale serve on, and this phone in the tailnet?",
+    tnUnreachable: "Over the tailnet: {pc} does not answer, nothing is sent. Is the PC on, the sink running with `--tailnet`, `tailscale serve` on, and this phone in the tailnet?",
     tnLost: "Over the tailnet: the connection to {pc} ended; the next segment tries again",
     tnRevoked: "Over the tailnet: {pc} no longer knows this device (revoked there): nothing is sent and its key was deleted here. Pair again.",
     tnHubChanged: "Over the tailnet: another sink answers as {pc} than the one this device was paired with; nothing was sent to it. Pair again if that is your PC.",
@@ -167,7 +167,7 @@ const I18N = (() => {
     tnPairFailed: "pairing failed",
     pairErrHost: "not a name in the tailnet (like pc.example.ts.net, no port)",
     pairErrCode: "the code is wrong, was used, or is older than a minute: make a new one on the PC",
-    pairErrUnreachable: "the PC does not answer: is the sink running with --tailnet, tailscale serve on, and this phone in the tailnet?",
+    pairErrUnreachable: "the PC does not answer: is the sink running with `--tailnet`, `tailscale serve` on, and this phone in the tailnet?",
     pairErrBusy: "too many pairing attempts: wait a minute",
     pairErrFull: "the PC has its 16 devices: revoke one there first",
     pairErrKnown: "this key is already paired there",
@@ -292,7 +292,7 @@ const I18N = (() => {
     savedVideoNotes: "Video gespeichert: {name}, {bytes} ({notes})",
     savedRecording: "Aufnahme gespeichert: {name}, {bytes}",
     savedRecordingNotes: "Aufnahme gespeichert: {name}, {bytes} ({notes})",
-    savedFallback: "{line} - kein Video: {why}; am PC: streamtap-sink replay, dann mux",
+    savedFallback: "{line} - kein Video: {why}; am PC: `streamtap-sink replay`, dann mux",
     noteFull: "der Speicher war voll",
     noteGaps: "{gaps} Lücke(n), {seconds} s fehlen",
     noteDupes: "{n} wiederholte(r) Teil(e) einmal behalten",
@@ -314,7 +314,7 @@ const I18N = (() => {
     tnNotPaired: "Über das Tailnet: nicht gekoppelt. Am PC: streamtap-sink devices pair, dann den QR-Code mit diesem Handy scannen oder den Code unten eintippen.",
     tnConnected: "Über das Tailnet: verbunden mit {pc} (Gerät {id})",
     tnConnecting: "Über das Tailnet: verbindet mit {pc}…",
-    tnUnreachable: "Über das Tailnet: {pc} antwortet nicht, nichts wird gesendet. Ist der PC an, läuft die Senke mit --tailnet, ist tailscale serve an, und ist dieses Handy im Tailnet?",
+    tnUnreachable: "Über das Tailnet: {pc} antwortet nicht, nichts wird gesendet. Ist der PC an, läuft die Senke mit `--tailnet`, ist `tailscale serve` an, und ist dieses Handy im Tailnet?",
     tnLost: "Über das Tailnet: die Verbindung zu {pc} ist beendet; das nächste Segment versucht es erneut",
     tnRevoked: "Über das Tailnet: {pc} kennt dieses Gerät nicht mehr (dort widerrufen): nichts wird gesendet, und sein Schlüssel wurde hier gelöscht. Kopple erneut.",
     tnHubChanged: "Über das Tailnet: als {pc} antwortet eine andere Senke als die, mit der dieses Gerät gekoppelt wurde; an sie wurde nichts gesendet. Kopple erneut, wenn das dein PC ist.",
@@ -337,7 +337,7 @@ const I18N = (() => {
     tnPairFailed: "die Kopplung ist fehlgeschlagen",
     pairErrHost: "kein Name im Tailnet (wie pc.example.ts.net, ohne Port)",
     pairErrCode: "der Code ist falsch, wurde benutzt oder ist älter als eine Minute: erzeuge am PC einen neuen",
-    pairErrUnreachable: "der PC antwortet nicht: läuft die Senke mit --tailnet, ist tailscale serve an, und ist dieses Handy im Tailnet?",
+    pairErrUnreachable: "der PC antwortet nicht: läuft die Senke mit `--tailnet`, ist `tailscale serve` an, und ist dieses Handy im Tailnet?",
     pairErrBusy: "zu viele Kopplungsversuche: warte eine Minute",
     pairErrFull: "der PC hat seine 16 Geräte: widerrufe dort zuerst eines",
     pairErrKnown: "dieser Schlüssel ist dort schon gekoppelt",
@@ -372,8 +372,33 @@ const I18N = (() => {
     for (const node of root.querySelectorAll("[data-i18n-placeholder]")) node.setAttribute("placeholder", t(node.dataset.i18nPlaceholder));
   };
 
+
+  // A text may mark a command or a program with backticks (`ffmpeg`): it is shown in an element of its own that the
+  // browser's page translation leaves alone (<code translate="no">, HTML-05). Only a node that is filled with this
+  // reads the marks; t() gives the text as it is. An odd number of backticks (a value that has one) is no mark: the
+  // text is put in plain, without them. Nothing is parsed as markup.
+  const fill = (node, text) => {
+    const parts = String(text).split("`");
+    if (parts.length === 1) {
+      node.textContent = text;
+    } else if (parts.length % 2 === 0) {
+      node.textContent = parts.join("");
+    } else {
+      node.replaceChildren(
+        ...parts.map((part, i) => {
+          if (i % 2 === 0) return part;
+          const code = document.createElement("code");
+          code.setAttribute("translate", "no");
+          code.textContent = part;
+          return code;
+        }).filter((x) => x !== "")
+      );
+    }
+  };
+
   return {
     t,
+    fill,
     resolve,
     applyStatic,
     tables,

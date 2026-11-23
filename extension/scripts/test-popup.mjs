@@ -390,7 +390,9 @@ const forged = {
   const { ids, sent } = p;
   const line = ids["tailnet-state"];
   check(line.textContent.includes(EVIL) && line.textContent.includes("does not answer, nothing is sent"), "tailnet: a PC that does not answer is said, with the forged name as text");
-  check(line.children.every((c) => c instanceof FakeText) && line.className === "locked", "tailnet: the state line holds text only");
+  check(line.children.every((c) => c instanceof FakeText || (c.tag === "code" && c.attrs.translate === "no" && c.children.every((x) => x instanceof FakeText))) && line.className === "locked", "tailnet: the state line holds text and commands only");
+  const commands = line.children.filter((c) => !(c instanceof FakeText)).map((c) => c.textContent);
+  check(commands.join("|") === "--tailnet|tailscale serve" && !line.textContent.includes("`"), `tailnet: the commands of the line stand in elements of their own, no mark is left (got ${commands})`);
   check(ids["target-line"].textContent === line.textContent && ids["target-line"].className === "locked", "tailnet: the start page carries the same sentence");
   check(ids["tailnet-offer"].hidden === false && ids["tailnet-offer-text"].textContent.includes(EVIL), "tailnet: an opened pairing link is offered by the PC's name");
   check(ids["tailnet-forget"].hidden === false, "tailnet: a paired device can forget the pairing");
@@ -594,6 +596,12 @@ const forged = {
   const unused = keysEn.filter((k) => !mentioned.has(k));
   check(unused.length === 0, `no text is left over${unused.length ? ` (unused: ${unused.join(", ")})` : ""}`);
   check(en.savedVideoNotes && en.savedRecordingNotes && source.includes('(s.video ? "savedVideo" : "savedRecording") + (notes.length ? "Notes" : "")'), "the two keys built from a stem exist");
+  // A command is marked with backticks (`cmd`, I18N.fill makes <code translate="no"> of it): the marks come in pairs,
+  // in both languages alike, and never in a text the page sets as a plain attribute or static text.
+  const marks = (s) => (s.match(/`/g) || []).length;
+  const odd = keysEn.filter((k) => marks(en[k]) % 2 || marks(de[k]) % 2 || marks(en[k]) !== marks(de[k]));
+  check(odd.length === 0, `the backticks of a text come in pairs, alike in both languages${odd.length ? ` (${odd.join(", ")})` : ""}`);
+  check(keysEn.filter((k) => marks(en[k])).length >= 3 && !inPage.some((k) => marks(en[k] ?? "")), "texts with a command carry marks, the static texts of the page carry none");
   // Static text: what stands in popup.html without scripts is the English text of its key.
   const stale = [...html.matchAll(/data-i18n="(\w+)"[^>]*>([^<]*)</g)].filter(([, key, textInPage]) => en[key] !== textInPage.replace(/&amp;/g, "&")).map((m) => m[1]);
   check(stale.length === 0, `the text in popup.html is the English text of its key${stale.length ? ` (not: ${stale.join(", ")})` : ""}`);

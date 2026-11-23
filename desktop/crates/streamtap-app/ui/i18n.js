@@ -68,12 +68,12 @@ const I18N = (() => {
     groupGuests: "Guests",
     groupDomainUsers: "Domain Users",
     groupAllAppPackages: "All Application Packages",
-    noSinkTitle: "streamtap-sink was not found.",
-    noSinkBody: "It must sit next to this app (or in desktop/target/release while developing). Build it with scripts/build.ps1.",
+    noSinkTitle: "`streamtap-sink` was not found.",
+    noSinkBody: "It must sit next to this app (or in desktop/target/release while developing). Build it with `scripts/build.ps1`.",
     crashedTitle: "The sink stopped by itself.",
     crashedBody: "Often the port is already in use: change it in Settings, or close the other program. Last output:",
-    noFfmpegTitle: "ffmpeg was not found on PATH.",
-    noFfmpegBody: "Capturing works, but muxing a capture into an MP4 needs ffmpeg. Install it and restart this app.",
+    noFfmpegTitle: "`ffmpeg` was not found on `PATH`.",
+    noFfmpegBody: "Capturing works, but muxing a capture into an MP4 needs `ffmpeg`. Install it and restart this app.",
     capturesErrorTitle: "Cannot list captures.",
 
     emptyStoppedTitle: "The sink is not running.",
@@ -83,16 +83,16 @@ const I18N = (() => {
     emptyStep2: "Reload the page with the video and start playing it.",
     emptyStep3: "The capture appears here within a few seconds. DRM-protected streams are refused on purpose.",
 
-    muxRunningText: "Muxing with ffmpeg, no re-encoding. This can take a while for long videos.",
+    muxRunningText: "Muxing with `ffmpeg`, no re-encoding. This can take a while for long videos.",
     muxOkText: "Mux finished. The result is out.mp4 in the capture folder.",
     muxFailed: "Mux failed: {meaning}",
     muxFailedCode: "Mux failed (exit {code}): {meaning}",
     "reason.exit-1": "a file or socket operation failed",
     "reason.exit-2": "usage error (the app passed bad arguments)",
     "reason.exit-3": "the capture holds nothing to mux",
-    "reason.exit-4": "ffmpeg is missing or cannot be started; install ffmpeg and put it on PATH",
+    "reason.exit-4": "`ffmpeg` is missing or cannot be started; install `ffmpeg` and put it on `PATH`",
     "reason.exit-5": "a tool timed out or wrote too much output",
-    "reason.exit-6": "ffmpeg failed",
+    "reason.exit-6": "`ffmpeg` failed",
     "reason.exit-unexpected": "unexpected exit code",
     "reason.signal": "the sink was stopped by a signal",
     "reason.spawn": "the sink could not be started",
@@ -137,7 +137,7 @@ const I18N = (() => {
     register: "Register",
     registerAgain: "Register again",
     hostMissing: "streamtap-host was not found next to the app",
-    hostMissingNote: "streamtap-host was not found next to the app (build it with scripts/build.ps1).",
+    hostMissingNote: "streamtap-host was not found next to the app (build it with `scripts/build.ps1`).",
     browserProfile: "{browser} (profile {profile})",
     connected: "connected",
     notConnected: "not connected",
@@ -270,12 +270,12 @@ const I18N = (() => {
     groupGuests: "Gäste",
     groupDomainUsers: "Domänen-Benutzer",
     groupAllAppPackages: "Alle Anwendungspakete",
-    noSinkTitle: "streamtap-sink wurde nicht gefunden.",
-    noSinkBody: "Es muss neben dieser App liegen (bei der Entwicklung auch in desktop/target/release). Baue es mit scripts/build.ps1.",
+    noSinkTitle: "`streamtap-sink` wurde nicht gefunden.",
+    noSinkBody: "Es muss neben dieser App liegen (bei der Entwicklung auch in desktop/target/release). Baue es mit `scripts/build.ps1`.",
     crashedTitle: "Der Sink hat sich von selbst beendet.",
     crashedBody: "Oft ist der Port schon belegt: Ändere ihn in den Einstellungen oder schließe das andere Programm. Letzte Ausgabe:",
-    noFfmpegTitle: "ffmpeg wurde im PATH nicht gefunden.",
-    noFfmpegBody: "Aufnehmen funktioniert, aber zum Muxen einer Aufnahme in eine MP4 wird ffmpeg gebraucht. Installiere es und starte diese App neu.",
+    noFfmpegTitle: "`ffmpeg` wurde im `PATH` nicht gefunden.",
+    noFfmpegBody: "Aufnehmen funktioniert, aber zum Muxen einer Aufnahme in eine MP4 wird `ffmpeg` gebraucht. Installiere es und starte diese App neu.",
     capturesErrorTitle: "Die Aufnahmen können nicht aufgelistet werden.",
 
     emptyStoppedTitle: "Der Sink läuft nicht.",
@@ -285,16 +285,16 @@ const I18N = (() => {
     emptyStep2: "Lade die Seite mit dem Video neu und starte die Wiedergabe.",
     emptyStep3: "Die Aufnahme erscheint hier nach wenigen Sekunden. DRM-geschützte Streams werden absichtlich abgelehnt.",
 
-    muxRunningText: "Muxen mit ffmpeg, ohne Neukodierung. Bei langen Videos kann das eine Weile dauern.",
+    muxRunningText: "Muxen mit `ffmpeg`, ohne Neukodierung. Bei langen Videos kann das eine Weile dauern.",
     muxOkText: "Muxen fertig. Das Ergebnis ist out.mp4 im Ordner der Aufnahme.",
     muxFailed: "Muxen fehlgeschlagen: {meaning}",
     muxFailedCode: "Muxen fehlgeschlagen (Exit-Code {code}): {meaning}",
     "reason.exit-1": "eine Datei- oder Socket-Operation ist fehlgeschlagen",
     "reason.exit-2": "Aufruffehler (die App hat falsche Argumente übergeben)",
     "reason.exit-3": "die Aufnahme enthält nichts zum Muxen",
-    "reason.exit-4": "ffmpeg fehlt oder lässt sich nicht starten; installiere ffmpeg und nimm es in den PATH auf",
+    "reason.exit-4": "`ffmpeg` fehlt oder lässt sich nicht starten; installiere `ffmpeg` und nimm es in den `PATH` auf",
     "reason.exit-5": "ein Werkzeug hat das Zeitlimit überschritten oder zu viel ausgegeben",
-    "reason.exit-6": "ffmpeg ist fehlgeschlagen",
+    "reason.exit-6": "`ffmpeg` ist fehlgeschlagen",
     "reason.exit-unexpected": "unerwarteter Exit-Code",
     "reason.signal": "der Sink wurde durch ein Signal beendet",
     "reason.spawn": "der Sink konnte nicht gestartet werden",
@@ -339,7 +339,7 @@ const I18N = (() => {
     register: "Registrieren",
     registerAgain: "Erneut registrieren",
     hostMissing: "streamtap-host wurde neben der App nicht gefunden",
-    hostMissingNote: "streamtap-host wurde neben der App nicht gefunden (baue es mit scripts/build.ps1).",
+    hostMissingNote: "streamtap-host wurde neben der App nicht gefunden (baue es mit `scripts/build.ps1`).",
     browserProfile: "{browser} (Profil {profile})",
     connected: "verbunden",
     notConnected: "nicht verbunden",
@@ -432,8 +432,33 @@ const I18N = (() => {
     for (const node of root.querySelectorAll("[data-i18n-title]")) node.setAttribute("title", t(node.dataset.i18nTitle));
   };
 
+
+  // A text may mark a command or a program with backticks (`ffmpeg`): it is shown in an element of its own that the
+  // browser's page translation leaves alone (<code translate="no">, HTML-05). Only a node that is filled with this
+  // reads the marks; t() gives the text as it is. An odd number of backticks (a value that has one) is no mark: the
+  // text is put in plain, without them. Nothing is parsed as markup.
+  const fill = (node, text) => {
+    const parts = String(text).split("`");
+    if (parts.length === 1) {
+      node.textContent = text;
+    } else if (parts.length % 2 === 0) {
+      node.textContent = parts.join("");
+    } else {
+      node.replaceChildren(
+        ...parts.map((part, i) => {
+          if (i % 2 === 0) return part;
+          const code = document.createElement("code");
+          code.setAttribute("translate", "no");
+          code.textContent = part;
+          return code;
+        }).filter((x) => x !== "")
+      );
+    }
+  };
+
   return {
     t,
+    fill,
     resolve,
     applyStatic,
     tables,

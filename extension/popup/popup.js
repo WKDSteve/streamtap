@@ -23,7 +23,7 @@ const text = (tag, className, value) => {
 // One line of state: its words and how it reads ("" is the quiet grey).
 const say = (node, cls, words) => {
   node.className = cls || "muted";
-  node.textContent = words;
+  I18N.fill(node, words);
 };
 
 // Numbers are written the way the browser's language writes them (5,0 MiB in German, 5.0 MiB in English), JS-04.
@@ -461,7 +461,7 @@ const load = async () => {
     const usable = Boolean(f && f.available);
     $("target-file").disabled = !usable;
     $("target-video").disabled = !usable;
-    $("file-state").textContent = usable && onDevice(view.target) ? fileLines(f).join("\n") : "";
+    I18N.fill($("file-state"), usable && onDevice(view.target) ? fileLines(f).join("\n") : "");
     showTargetNote();
     fileSave.hidden = !(usable && onDevice(view.target) && f.recording > 0);
   };
