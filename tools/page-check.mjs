@@ -93,6 +93,30 @@ try {
     await page.mouse.move(0, 0);
   }
 
+  // What is typed and not saved survives a redraw, also when the focus is elsewhere (FORM-07).
+  await page.fill("#port", "17999");
+  await page.fill("#dir", "D:/typed");
+  await page.fill("#tailnet", "typed.example.ts.net");
+  await page.locator("#settings-toggle").focus();
+  await page.evaluate(() => {
+    state.signature = "";
+    render(state.snap);
+  });
+  const typed = await page.evaluate(() => [$("port").value, $("dir").value, $("tailnet").value]);
+  check("app: typed settings survive a redraw", typed.join() === "17999,D:/typed,typed.example.ts.net", typed.join());
+  // A saved field is the stored value again (the values of the stand-in are typed back, so the rest of the check sees them).
+  await page.fill("#port", "17650");
+  await page.fill("#dir", "C:/captures");
+  await page.evaluate(async () => {
+    document.getElementById("settings-form").requestSubmit();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  });
+  const saved = await page.evaluate(async () => {
+    await refresh();
+    return [state.dirty.has("port"), state.dirty.has("dir"), state.dirty.has("tailnet")].join();
+  });
+  check("app: a saved setting is no longer an edit", saved === "false,false,true", saved);
+
   // The phones panel while the sink runs: the paired phone and a pairing code with its QR code. The stand-in's
   // snapshot is the object the page holds, so the sink is "started" by changing it.
   // Axe reads the style sheets of a file:// page itself and logs that it may not; only what the panel adds counts.

@@ -53,7 +53,8 @@ export function bridge() {
   const answers = { snapshot, get_settings: settings, phone_devices: phones, phone_pair: pairing };
   window.__TAURI__ = {
     core: {
-      invoke: async (cmd) => answers[cmd] ?? null,
+      // A save answers with what was saved, as the app does.
+      invoke: async (cmd, args) => (cmd === "save_settings" ? { ...settings, port: args.port, captures_dir: args.capturesDir, tailnet: args.tailnet } : answers[cmd] ?? null),
     },
   };
 }

@@ -23,6 +23,8 @@ const state = {
   // The phones panel: the paired phones (null: not known), the pairing code on show, why the sink could not be asked.
   phones: { list: null, pairing: null, expired: false, error: "", ticks: 0 },
   signature: "",
+  // Fields the user typed into and has not saved: a redraw must not write the stored value over them (FORM-07).
+  dirty: new Set(),
   busy: false,
   // Language and theme as stored ("system" follows the webview / the OS).
   prefs: { language: "system", theme: "system" },
@@ -296,10 +298,8 @@ const renderSettings = (snap) => {
   const s = state.settings;
   $("settings-lock").hidden = !running;
   for (const id of ["port", "dir", "token-new", "settings-save"]) $(id).disabled = running;
-  if (s && document.activeElement !== $("port") && document.activeElement !== $("dir")) {
-    $("port").value = s.port;
-    $("dir").value = s.captures_dir;
-  }
+  if (s && !state.dirty.has("port")) $("port").value = s.port;
+  if (s && !state.dirty.has("dir")) $("dir").value = s.captures_dir;
   if (s) $("token").value = s.token;
   $("token").type = state.tokenShown ? "text" : "password";
   $("token-show").textContent = state.tokenShown ? t("hide") : t("show");
@@ -452,7 +452,7 @@ const renderPhones = (snap) => {
   $("tailnet-lock").hidden = !running;
   $("tailnet").disabled = running;
   $("tailnet-save").disabled = running;
-  if (document.activeElement !== $("tailnet")) $("tailnet").value = name;
+  if (!state.dirty.has("tailnet")) $("tailnet").value = name;
   $("serve-box").hidden = !name;
   $("serve-cmd").textContent = `tailscale serve --bg ${state.settings?.port ?? ""}`;
 
@@ -691,6 +691,9 @@ $("phones-toggle").addEventListener("click", async () => {
   if (state.snap) render(state.snap);
 });
 
+// A field with an edit in it is the user's until it is saved, whether the focus is in it or not.
+for (const id of ["port", "dir", "tailnet"]) $(id).addEventListener("input", () => state.dirty.add(id));
+
 $("tailnet-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   run(t("saveTailnet"), async () => {
@@ -698,6 +701,7 @@ $("tailnet-form").addEventListener("submit", (ev) => {
     const tailnet = cleanTailnet($("tailnet").value);
     state.settings = await invoke("save_settings", { port: state.settings.port, capturesDir: state.settings.captures_dir, tailnet });
     $("tailnet").value = state.settings.tailnet;
+    state.dirty.delete("tailnet");
     toast(state.settings.tailnet ? t("tailnetSaved") : t("tailnetCleared"));
   });
 });
@@ -721,6 +725,8 @@ $("settings-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   run(t("saveSettings"), async () => {
     state.settings = await invoke("save_settings", { port: Number($("port").value), capturesDir: $("dir").value, tailnet: state.settings?.tailnet ?? "" });
+    state.dirty.delete("port");
+    state.dirty.delete("dir");
     toast(t("settingsSaved"));
   });
 });
