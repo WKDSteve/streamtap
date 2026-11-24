@@ -141,6 +141,13 @@ check(
   html.indexOf('href="palette.css"') >= 0 && html.indexOf('href="palette.css"') < html.indexOf('href="style.css"'),
   "index.html loads palette.css before style.css"
 );
+// A motion beside the text that never ends cannot be paused: every animation runs a few times and stops, 5 s at most.
+for (const [, shorthand] of css.matchAll(/animation:([^;}]*)/g)) {
+  const words = shorthand.trim().split(/\s+/);
+  const seconds = Number(words.find((w) => /^\d+(?:\.\d+)?s$/.test(w))?.slice(0, -1));
+  const count = words.includes("infinite") ? Infinity : Number(words.find((w) => /^\d+$/.test(w)) ?? 1);
+  check(seconds * count <= 5, `style.css: the animation "${shorthand.trim()}" ends by itself within 5 s`);
+}
 check(!/#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?|oklch|oklab|lab|lch|hwb|color)\(/i.test(css.replace(/\/\*[\s\S]*?\*\//g, "")), "style.css writes no colour literal");
 const ownTokens = [...css.matchAll(/^\s*--([\w-]+):/gm)].map((m) => m[1]).sort().join(",");
 check(ownTokens === "err-bg,info-bg,warn-bg", `style.css defines only the notice surfaces (${ownTokens})`);

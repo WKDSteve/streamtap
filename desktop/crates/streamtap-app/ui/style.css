@@ -227,8 +227,10 @@ dialog p { overflow-wrap: anywhere; }
   .bar-actions button { flex: 1; }
 }
 
+/* The pulse says "just started" and stops by itself after two beats (4 s): a motion that runs on for ever beside the text
+   cannot be paused. Opacity only; the green of the dot says "running" without it. */
 @media (prefers-reduced-motion: no-preference) {
-  .dot-running { animation: pulse 2s ease-in-out infinite; }
+  .dot-running { animation: pulse 2s ease-in-out 2; }
 }
 @keyframes pulse { 50% { opacity: 0.45; } }
 
