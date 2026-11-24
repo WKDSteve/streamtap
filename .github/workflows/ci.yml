@@ -222,6 +222,9 @@ jobs:
       - run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --sheet drm-refused --root . --strict
         env:
           LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
+      - run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --sheet popup-draft --root . --strict
+        env:
+          LIB_NVIM_DIR: ${{ github.workspace }}/.deps/lib.nvim
       # The host of this build, which Chromium starts for the extension (testing.nvim's native_host: on Linux its manifest
       # sits in the run's profile) and which finds no app in the empty folder of the run.
       - run: nvim -n -i NONE --headless -u NONE -l .deps/testing.nvim/scripts/testing.lua sheets run --sheet host-no-app --root . --strict

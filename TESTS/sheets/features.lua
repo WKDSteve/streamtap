@@ -45,6 +45,11 @@ return {
     docs = "README.md",
   },
   {
+    id = "streamtap.popup-draft",
+    title = "What is typed into the popup's settings and not saved is still there when the popup opens again, a secret never",
+    docs = "extension/README.md",
+  },
+  {
     id = "streamtap.button-states",
     title = "The filled button of the app's page shows rest, pointer and keyboard focus apart, light and dark",
     docs = "desktop/README.md",
