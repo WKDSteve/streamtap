@@ -245,7 +245,9 @@ class FakeEl {
   showModal() {
     this.open = true;
   }
-  focus() {}
+  focus() {
+    this.focused = true;
+  }
   select() {}
 }
 
@@ -524,6 +526,34 @@ for (const [tailnet, running, want] of [
   app.byId("settings-form").fire("submit");
   await settle();
   check(backend.saved.at(-1)?.tailnet === "pc.example.ts.net" && backend.saved.at(-1)?.port === 17651, "phones: saving port and folder keeps the tailnet name");
+}
+
+// A refused save marks the field the sink names, never one picked by the words of the sentence.
+{
+  let refusal;
+  const app = loadApp({
+    get_settings: () => SETTINGS,
+    snapshot: () => SNAPSHOT,
+    save_settings: () => {
+      throw refusal;
+    },
+  });
+  await settle();
+  // The sentence is about a port in the folder's name: only the field of the answer counts.
+  refusal = { field: "dir", message: "the port of the captures folder is odd" };
+  app.byId("settings-form").fire("submit");
+  await settle();
+  check(app.byId("settings-error").hidden === false && app.byId("settings-error").textContent.endsWith("the port of the captures folder is odd"), "form: the sentence of the answer stands in the form");
+  check(app.byId("dir").attrs["aria-invalid"] === "true" && app.byId("dir").focused === true, "form: the field of the answer is marked and takes the focus");
+  check(app.byId("port").attrs["aria-invalid"] === "false" && !app.byId("port").focused, "form: a word in the sentence marks no other field");
+  refusal = "stop the sink first";
+  app.byId("settings-form").fire("submit");
+  await settle();
+  check(app.byId("settings-error").textContent.endsWith("stop the sink first") && app.byId("dir").attrs["aria-invalid"] === "false" && app.byId("port").attrs["aria-invalid"] === "false", "form: an error without a field marks none, and the marks of the last try are gone");
+  refusal = { field: "tailnet", message: "no name" };
+  app.byId("tailnet-form").fire("submit");
+  await settle();
+  check(app.byId("tailnet").attrs["aria-invalid"] === "true" && app.byId("tailnet-error").textContent.endsWith("no name"), "form: the tailnet form marks its field by the field of the answer");
 }
 
 // The name is saved as the sink takes it, with port and folder as they are.

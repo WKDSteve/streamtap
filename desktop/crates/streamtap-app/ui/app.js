@@ -93,14 +93,14 @@ const run = async (label, fn) => {
 };
 
 // A save of a form: the button waits for the answer (no second save while one is out), an error stands in the
-// form where it stays (not in a toast that goes after 5 s), the field it names is marked and takes the focus. The sink
-// answers with a sentence, not a field: the fields it names are found by their words; an error that names none marks none.
+// form where it stays (not in a toast that goes after 5 s), the field it names is marked and takes the focus. A refused
+// setting arrives as { field, message }; the field is one of the form's, or absent: an error that names none marks none.
 const describing = (id, bad, error = "") => [id === "tailnet" ? "tailnet-hint" : "", bad ? error : ""].filter(Boolean).join(" ");
 const setDescribed = (id, ids) => (ids ? $(id).setAttribute("aria-describedby", ids) : $(id).removeAttribute("aria-describedby"));
 const saving = async (form, button, error, label, fields, fn) => {
   $(error).hidden = true;
   $(error).textContent = "";
-  for (const [id] of fields) {
+  for (const id of fields) {
     $(id).setAttribute("aria-invalid", "false");
     // The words describe a field only while it is invalid (a described-by text is read out whatever it says).
     setDescribed(id, describing(id, false));
@@ -110,10 +110,10 @@ const saving = async (form, button, error, label, fields, fn) => {
   try {
     await fn();
   } catch (e) {
-    const words = `${label}: ${e}`;
+    const words = `${label}: ${e?.message ?? e}`;
     $(error).textContent = words;
     $(error).hidden = false;
-    const bad = fields.filter(([, about]) => about.test(String(e))).map(([id]) => id);
+    const bad = fields.filter((id) => id === e?.field);
     for (const id of bad) {
       $(id).setAttribute("aria-invalid", "true");
       setDescribed(id, describing(id, true, error));
@@ -735,7 +735,7 @@ for (const id of ["port", "dir", "tailnet"]) $(id).addEventListener("input", () 
 
 $("tailnet-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  saving("tailnet-form", "tailnet-save", "tailnet-error", t("saveTailnet"), [["tailnet", /./]], async () => {
+  saving("tailnet-form", "tailnet-save", "tailnet-error", t("saveTailnet"), ["tailnet"], async () => {
     if (!state.settings) return;
     const tailnet = cleanTailnet($("tailnet").value);
     state.settings = await invoke("save_settings", { port: state.settings.port, capturesDir: state.settings.captures_dir, tailnet });
@@ -762,7 +762,7 @@ $("phones-refresh").addEventListener("click", async () => {
 
 $("settings-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  saving("settings-form", "settings-save", "settings-error", t("saveSettings"), [["port", /port/i], ["dir", /folder|director|captures|path/i]], async () => {
+  saving("settings-form", "settings-save", "settings-error", t("saveSettings"), ["port", "dir"], async () => {
     state.settings = await invoke("save_settings", { port: Number($("port").value), capturesDir: $("dir").value, tailnet: state.settings?.tailnet ?? "" });
     state.dirty.delete("port");
     state.dirty.delete("dir");

@@ -41,6 +41,51 @@ pub(crate) struct Settings {
     pub(crate) theme: Theme,
 }
 
+/// A refused setting: the sentence, and the field of the settings form it is about, when it is about one (`port`,
+/// `dir`, `tailnet`; the page marks that field). The page gets both as an object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SettingsError {
+    pub(crate) field: Option<&'static str>,
+    pub(crate) message: String,
+}
+
+impl SettingsError {
+    fn at(field: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            field: Some(field),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SettingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// An error that names no field (a stopped sink, a file that cannot be written).
+impl From<String> for SettingsError {
+    fn from(message: String) -> Self {
+        Self {
+            field: None,
+            message,
+        }
+    }
+}
+
+impl From<&str> for SettingsError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+impl From<SettingsError> for String {
+    fn from(e: SettingsError) -> Self {
+        e.message
+    }
+}
+
 /// The UI language: `system` follows the webview's language (German for
 /// `de*`, else English).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,9 +183,12 @@ impl Settings {
     }
 
     /// Checks what the sink would reject or what would be unsafe to hand it.
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), SettingsError> {
         if self.port < MIN_PORT {
-            return Err(format!("port must be {MIN_PORT} or higher"));
+            return Err(SettingsError::at(
+                "port",
+                format!("port must be {MIN_PORT} or higher"),
+            ));
         }
         let token = self.token.expose();
         if token.len() < MIN_TOKEN_LEN
@@ -149,7 +197,8 @@ impl Settings {
         {
             return Err(format!(
                 "token must be {MIN_TOKEN_LEN} to {MAX_TOKEN_LEN} visible ASCII characters"
-            ));
+            )
+            .into());
         }
         // The app hands the token over on stdin; a token that starts with `-`
         // would still be read as a flag by `serve --token <token>` (manual use).
@@ -157,19 +206,28 @@ impl Settings {
             return Err("token must not start with '-'".into());
         }
         if !self.captures_dir.is_absolute() {
-            return Err("captures directory must be an absolute path".into());
+            return Err(SettingsError::at(
+                "dir",
+                "captures directory must be an absolute path",
+            ));
         }
         if self.captures_dir.parent().is_none() {
-            return Err("captures directory must not be a drive or filesystem root".into());
+            return Err(SettingsError::at(
+                "dir",
+                "captures directory must not be a drive or filesystem root",
+            ));
         }
         if self.captures_dir.to_string_lossy().starts_with('-') {
-            return Err("captures directory must not start with '-'".into());
+            return Err(SettingsError::at(
+                "dir",
+                "captures directory must not start with '-'",
+            ));
         }
         if !self.tailnet.is_empty() && !crate::phones::tailnet_name_ok(&self.tailnet) {
-            return Err(
-                "the name in the tailnet must be a plain host name: lower case, no https://, no port (pc.example.ts.net)"
-                    .into(),
-            );
+            return Err(SettingsError::at(
+                "tailnet",
+                "the name in the tailnet must be a plain host name: lower case, no https://, no port (pc.example.ts.net)",
+            ));
         }
         Ok(())
     }
@@ -272,6 +330,29 @@ mod tests {
             .unwrap()
             .to_path_buf();
         assert!(s.validate().is_err(), "filesystem root");
+    }
+
+    #[test]
+    fn a_refused_setting_names_its_field() {
+        let field = |change: fn(&mut Settings)| {
+            let mut s = base();
+            change(&mut s);
+            s.validate().unwrap_err().field
+        };
+        assert_eq!(field(|s| s.port = 80), Some("port"));
+        assert_eq!(
+            field(|s| s.captures_dir = PathBuf::from("relative/dir")),
+            Some("dir")
+        );
+        assert_eq!(field(|s| s.tailnet = "https://pc".into()), Some("tailnet"));
+        // The token is not a field of the form: the error names none.
+        assert_eq!(field(|s| s.token = "short".into()), None);
+        // The page gets the field and the sentence as an object.
+        let mut s = base();
+        s.port = 80;
+        let json = serde_json::to_value(s.validate().unwrap_err()).unwrap();
+        assert_eq!(json["field"], "port");
+        assert!(json["message"].as_str().unwrap().contains("1024"));
     }
 
     #[test]

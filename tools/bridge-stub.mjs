@@ -56,8 +56,8 @@ export function bridge() {
   window.__TAURI__ = {
     core: {
       invoke: async (cmd, args) => {
-        if (cmd === "save_settings" && args.port === 2000) throw "the port 2000 is in use";
-        if (cmd === "save_settings" && args.tailnet === "bad") throw "the tailnet name is not a name";
+        if (cmd === "save_settings" && args.port === 2000) throw { field: "port", message: "the port 2000 is in use" };
+        if (cmd === "save_settings" && args.tailnet === "bad") throw { field: "tailnet", message: "the tailnet name is not a name" };
         if (cmd === "save_settings") return { ...settings, port: args.port, captures_dir: args.capturesDir, tailnet: args.tailnet };
         return answers[cmd] ?? null;
       },

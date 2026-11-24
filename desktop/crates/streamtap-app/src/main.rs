@@ -302,12 +302,15 @@ fn require_stopped(g: &mut Inner) -> CmdResult<()> {
     }
 }
 
-fn apply_settings(g: &mut Inner, new: Settings) -> CmdResult<()> {
+fn apply_settings(g: &mut Inner, new: Settings) -> Result<(), config::SettingsError> {
     new.validate()?;
     let dir_changes = new.captures_dir != g.settings.captures_dir;
     if dir_changes && g.mux.values().any(|m| matches!(m, MuxState::Running)) {
         // The job would report into the wrong folder's list.
-        return Err("a mux is still running; wait until it is done".into());
+        return Err(config::SettingsError {
+            field: Some("dir"),
+            message: "a mux is still running; wait until it is done".into(),
+        });
     }
     config::save(&g.config_path, &new)?;
     if dir_changes {
@@ -327,7 +330,7 @@ async fn save_settings(
     port: u16,
     captures_dir: String,
     tailnet: String,
-) -> CmdResult<Settings> {
+) -> Result<Settings, config::SettingsError> {
     let mut g = state.lock();
     require_stopped(&mut g)?;
     let new = Settings {
@@ -916,7 +919,10 @@ mod tests {
             captures_dir: dir.join("other"),
             ..g.settings.clone()
         };
-        assert!(apply_settings(&mut g, other.clone()).is_err());
+        assert_eq!(
+            apply_settings(&mut g, other.clone()).unwrap_err().field,
+            Some("dir")
+        );
         g.mux.insert("1_x".into(), MuxState::Ok);
         assert!(apply_settings(&mut g, other).is_ok());
         drop(g);
