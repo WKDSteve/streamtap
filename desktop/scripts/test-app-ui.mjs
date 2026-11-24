@@ -535,6 +535,20 @@ for (const [tailnet, running, want] of [
   check(backend.saved.at(-1)?.tailnet === "pc.example.ts.net" && backend.saved.at(-1)?.port === 17651, "phones: saving port and folder keeps the tailnet name");
 }
 
+// A duration is written by Intl.DurationFormat in the page's language where the browser has it, by hand where not.
+{
+  const app = loadApp({ get_settings: () => SETTINGS, snapshot: () => SNAPSHOT });
+  await settle();
+  const real = app.page("typeof Intl.DurationFormat") === "function";
+  if (real) {
+    check(app.page("fmtDuration(3723000)") === "1:02:03" && app.page("fmtDuration(307000)") === "05:07", "duration: the browser's own format reads h:mm:ss and mm:ss");
+    app.page("globalThis.seen = []; Intl.DurationFormat = class { constructor(lang, opts) { seen.push(lang, opts.style); } format(parts) { return `via Intl ${parts.minutes}`; } }");
+    check(app.page("fmtDuration(307000)") === "via Intl 5" && app.page("seen.join()") === "en,digital", "duration: the page's language goes to Intl.DurationFormat");
+  }
+  app.page("delete Intl.DurationFormat");
+  check(app.page("fmtDuration(3723000)") === "1:02:03" && app.page("fmtDuration(307000)") === "05:07" && app.page("fmtDuration(0)") === "00:00", "duration: without Intl.DurationFormat the hand-made form says the same");
+}
+
 // A refused save marks the field the sink names, never one picked by the words of the sentence.
 {
   let refusal;

@@ -63,12 +63,20 @@ const fmtBytes = (n) => {
   return `${i === 0 ? v : fmtNumber(v, v < 10 ? 2 : 1)} ${units[i]}`;
 };
 
+// A duration is written by the browser in the page's language (Intl.DurationFormat: Baseline 2025, so only where it
+// exists), else by hand in the same shape: h:mm:ss, mm:ss under an hour.
 const fmtDuration = (ms) => {
   const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
+  const parts = { hours: Math.floor(s / 3600), minutes: Math.floor((s % 3600) / 60), seconds: s % 60 };
+  if (typeof Intl.DurationFormat === "function") {
+    try {
+      return new Intl.DurationFormat(I18N.lang, { style: "digital", hoursDisplay: "auto" }).format(parts);
+    } catch {
+      // A language the browser does not know for it: the hand-made form below.
+    }
+  }
   const p = (x) => String(x).padStart(2, "0");
-  return h ? `${h}:${p(m)}:${p(s % 60)}` : `${m}:${p(s % 60)}`;
+  return parts.hours ? `${parts.hours}:${p(parts.minutes)}:${p(parts.seconds)}` : `${p(parts.minutes)}:${p(parts.seconds)}`;
 };
 
 const fmtDate = (secs) => (secs ? new Date(secs * 1000).toLocaleString(I18N.lang) : t("unknownTime"));
