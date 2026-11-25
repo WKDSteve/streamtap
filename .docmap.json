@@ -1,0 +1,4 @@
+{
+  "$schema": "https://raw.githubusercontent.com/WKDSteve/docmap.nvim/main/docs/docmap.schema.json",
+  "checks": { "missing-module-tag": false }
+}
