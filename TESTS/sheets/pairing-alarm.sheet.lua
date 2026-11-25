@@ -2,8 +2,7 @@
 -- ("host not found"), the reconnect backs off 5, 10, 20 s, and the next wait (40 s) is longer than a service worker
 -- stays alive without an event, so it must be a chrome.alarms alarm and no setTimeout (task
 -- streamtap/settimeout-stellen-pruefen). The sheet waits for that alarm in the extension's own page; about 40 s.
--- Playwright's full Chromium, like mse-capture (CI job `extension-sheet`; not listed there yet: written without a
--- run of testing.nvim, see the report of the task).
+-- Playwright's full Chromium, like mse-capture (CI job `extension-sheet`).
 --   testing sheets run --sheet pairing-alarm
 return {
   id = "streamtap.pairing-alarm",
