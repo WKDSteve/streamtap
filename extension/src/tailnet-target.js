@@ -18,6 +18,7 @@
 // What the sink says is JSON in text messages, bounded here before it is parsed. Every wait has a time limit, so a
 // tunnel that hangs never leaves a link waiting, and each state (not paired, PC not reachable, revoked, another
 // sink, update needed) is kept for the popup (MOB-09).
+
 "use strict";
 
 const TN_PROTOCOL = 1;

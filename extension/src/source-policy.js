@@ -13,6 +13,7 @@
 // DRM is not a group: the hook refuses EME in any case, there is no switch.
 // The list and its reasons: tasks-vault, streamtap/ROADMAP/reports/
 // 2026-11-13_mobil-zulaessige-quellen.md. This is a judgement, not legal advice.
+
 "use strict";
 
 // Group id -> state by default and the hosts it covers (a host also covers its

@@ -1,9 +1,9 @@
-"use strict";
-
 // The UI only talks to the app's own Tauri commands (see capabilities/main.json).
 // Every string from disk or from the page (titles, URLs, MIME types) is set with
 // textContent, never as HTML. UI texts come from I18N (i18n.js); error texts of the
 // commands stay as the app sends them (English).
+
+"use strict";
 
 const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
 const $ = (id) => document.getElementById(id);

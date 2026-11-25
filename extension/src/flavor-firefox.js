@@ -7,6 +7,7 @@
 //   unless the user stored "off" (the same default as the Chrome build).
 // - nativePairing false: Firefox for Android has no native messaging, and the
 //   desktop app registers its host for Chrome, Edge and Brave only.
+
 "use strict";
 
 globalThis.STREAMTAP_FLAVOR = Object.freeze({ name: "firefox", sourcePolicyDefault: "on", nativePairing: false });

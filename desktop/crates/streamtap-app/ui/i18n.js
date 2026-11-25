@@ -1,10 +1,10 @@
-"use strict";
-
 // UI strings in English and German. No dependency, no build step: app.js uses the
 // global I18N. Static text in index.html carries data-i18n="key" (textContent) or
 // data-i18n-aria-label / data-i18n-title (attributes); applyStatic() fills them.
 // Error texts from the Rust commands and page-provided strings (titles, URLs) are
 // shown as they come.
+
+"use strict";
 
 const I18N = (() => {
   const en = {

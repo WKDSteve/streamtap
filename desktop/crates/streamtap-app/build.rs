@@ -1,4 +1,5 @@
 // Only the app's own commands are exposed to the webview (see capabilities/main.json).
+
 const COMMANDS: &[&str] = &[
     "snapshot",
     "get_settings",

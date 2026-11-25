@@ -12,6 +12,7 @@
 // Bounded (MSEC-08): all open recordings of the worker together hold at most FILE_MAX_TOTAL bytes. Beyond that a
 // recording takes no more media (init bytes and events still, up to twice the bound, so what it holds stays usable),
 // notes a `recordfull` event once at that point, and the popup says so. A recording without any media is not saved.
+
 "use strict";
 
 const FILE_MAGIC = "STREAMTAP-RECORDING/1\n";

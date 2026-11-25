@@ -1,7 +1,7 @@
-"use strict";
-
 // The popup: the start page says what is (this tab, its source, the target) and holds the one action that matters
 // while capturing; the settings live on their own pages (popup.html). Every text comes from i18n.js.
+
+"use strict";
 
 const t = I18N.t;
 const $ = (id) => document.getElementById(id);

@@ -12,6 +12,7 @@
 // Within the common case it is honest about what it holds: a fragment appended again after a seek (same track, same
 // decode time) is kept once; one that overlaps the one before is dropped; a gap between fragments (more than 50 ms or
 // 1 % of the fragment's length) is reported with its length.
+
 "use strict";
 
 const MUX_MAX_TRACKS = 8;

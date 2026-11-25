@@ -15,6 +15,7 @@
 // Everything that arrives from the host is checked field by field; everything
 // that leaves is built here (page-controlled strings are cleaned and bounded).
 // The token is never logged.
+
 "use strict";
 
 const NP_HOST = "io.github.wkdsteve.streamtap";

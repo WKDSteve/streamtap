@@ -11,6 +11,7 @@
 //
 // Wire format to the sink per binary message: u32 LE header length | JSON
 // header | payload. The first message is {"type":"hello","token":...}.
+
 "use strict";
 
 const SINK_MAX_PENDING_BYTES = 64 * 1024 * 1024; // per link, while connecting only

@@ -1,9 +1,9 @@
-"use strict";
-
 // The popup's texts in English and German. No dependency, no build step: popup.js uses the global I18N. Static text in
 // popup.html carries data-i18n="key" (textContent) or data-i18n-placeholder (the attribute); applyStatic() fills them.
 // The language follows the browser, like the desktop app: German for de*, else English.
 // A value put into a text ({name}) is never read as a template again and always ends up as text, never as markup.
+
+"use strict";
 
 const I18N = (() => {
   const en = {

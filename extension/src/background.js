@@ -4,6 +4,7 @@
 // worker is suspended, which is fine for a spike. The sink link (one WebSocket
 // per tapping frame) lives in sink-link.js, the pairing with the desktop app
 // (native messaging, tab list, per-tab capture) in native-pairing.js.
+
 "use strict";
 
 // Chrome runs this as a service worker and loads the other scripts here; the

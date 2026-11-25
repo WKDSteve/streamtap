@@ -15,6 +15,7 @@
 //
 // Injected outside an extension (tests) there is no chrome.*: the script then
 // only counts what it would have sent.
+
 (() => {
   "use strict";
 

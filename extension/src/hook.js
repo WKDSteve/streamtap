@@ -5,6 +5,7 @@
 //
 // Reporting channel: window.postMessage({ __vc: 1, ... }) -> content.js.
 // Console channel: console.debug("[vc-hook] ...") in the page console.
+
 (() => {
   "use strict";
 
