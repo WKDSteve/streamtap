@@ -450,9 +450,30 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   const retry = w.liveAlarms().at(-1);
   check(retry && retry.when - Date.now() >= 9 * 60 * 1000, `after a denial nobody asks again for minutes (alarm in ${retry && retry.when - Date.now()} ms)`);
   check(w.liveTimers().length === 0, "a wait of minutes is no setTimeout (the worker would lose it)");
+  // The service worker is ended (about 30 s idle) and started again: a new script context, the same session storage.
+  const restarted = makeWorld({ session: { ...w.session.data } });
+  restarted.start();
+  await flush();
+  const resumed = restarted.liveAlarms().at(-1);
+  check(
+    restarted.ports.length === 0 && resumed && resumed.when - Date.now() >= 9 * 60 * 1000,
+    `the pause after a denial survives a worker restart (ports ${restarted.ports.length}, alarm in ${resumed && resumed.when - Date.now()} ms)`
+  );
+  check(restarted.run("npStatus()").paused === true, "the restarted worker reports the pause to the popup");
+  const backedOff = makeWorld({ session: { npBackoff: 40 * 1000 } });
+  backedOff.start();
+  await flush();
+  backedOff.port().drop();
+  const kept = backedOff.liveAlarms().at(-1);
+  check(kept && kept.when - Date.now() >= 39 * 1000, `the backoff survives a worker restart (alarm in ${kept && kept.when - Date.now()} ms)`);
+  const forged = makeWorld({ session: { npPausedUntil: Date.now() + 365 * 24 * 3600 * 1000, npBackoff: 1e12 } });
+  forged.start();
+  await flush();
+  check(forged.run("np.pausedUntil - Date.now()") <= 10 * 60 * 1000 && forged.run("np.backoff") <= 5 * 60 * 1000, "stored values are bounded by the pause and the largest backoff");
   w.run("npRetryNow()");
   await flush();
   check(w.ports.length === 2, "the popup's pair-now asks again at once");
+  check(w.session.data.npPausedUntil === 0, "pair-now also ends the stored pause");
   check(w.liveAlarms().length === 0, "pair-now takes the waiting alarm back");
 
   // The alarm brings the connection back, and a second reconnect is not scheduled twice.

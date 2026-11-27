@@ -318,8 +318,27 @@ const npScheduleSend = (force) => {
 
 // ---- the connection -----------------------------------------------------------
 
+// The pause after a denial and the backoff live in session storage: a service worker is ended after about 30 s
+// idle, and the next one must not ask again before the pause is over.
+const npPersistRetry = () => {
+  try {
+    return Promise.resolve(chrome.storage.session.set({ npPausedUntil: np.pausedUntil, npBackoff: np.backoff })).catch(() => {});
+  } catch (e) {
+    return Promise.resolve();
+  }
+};
+
+// Takes the stored pause and backoff, bounded; a value from an older worker never shortens a newer one.
+const npRestoreRetry = (v) => {
+  const until = v && v.npPausedUntil;
+  if (Number.isFinite(until) && until > np.pausedUntil) np.pausedUntil = Math.min(until, Date.now() + NP_PAUSE_MS);
+  const backoff = v && v.npBackoff;
+  if (Number.isFinite(backoff) && backoff > np.backoff) np.backoff = Math.min(backoff, NP_BACKOFF_MAX_MS);
+};
+
 const npPause = () => {
   np.pausedUntil = Date.now() + NP_PAUSE_MS;
+  npPersistRetry();
 };
 
 const npOnMessage = async (m) => {
@@ -331,6 +350,7 @@ const npOnMessage = async (m) => {
       np.status.error = null;
       npChanged();
       np.backoff = NP_BACKOFF_MIN_MS;
+      if (m.pairing !== "denied" && m.pairing !== "revoked") npPersistRetry();
       if (m.pairing === "approved") {
         np.lastSig = "";
         npScheduleSend(true);
@@ -386,6 +406,7 @@ const npScheduleReconnect = () => {
   if (np.retryTimer || np.retryAlarm) return;
   const wait = Math.max(np.backoff, np.pausedUntil - Date.now());
   np.backoff = Math.min(np.backoff * 2, NP_BACKOFF_MAX_MS);
+  npPersistRetry();
   if (wait >= NP_ALARM_MIN_MS && npAlarmsAvailable()) {
     // Backoff of 30 s and more and the pause after a denial: survives the worker being ended.
     np.retryAlarm = true;
@@ -405,7 +426,8 @@ if (typeof chrome !== "undefined" && chrome.alarms && chrome.alarms.onAlarm) {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (!alarm || alarm.name !== NP_RETRY_ALARM) return;
     np.retryAlarm = false;
-    npConnect();
+    // A worker started by this alarm has restored the stored pause first (npInit).
+    np.ready.then(npConnect, npConnect);
   });
 }
 
@@ -467,6 +489,7 @@ const npStatus = () => ({
 const npRetryNow = () => {
   np.pausedUntil = 0;
   np.backoff = NP_BACKOFF_MIN_MS;
+  npPersistRetry();
   npCancelReconnect();
   npConnect();
 };
@@ -487,7 +510,8 @@ const npInit = (deps) => {
   np.deps = deps;
   np.ready = (async () => {
     try {
-      const v = await chrome.storage.session.get({ tapTabs: [], tapOrigins: {} });
+      const v = await chrome.storage.session.get({ tapTabs: [], tapOrigins: {}, npPausedUntil: 0, npBackoff: 0 });
+      npRestoreRetry(v);
       const origins = v.tapOrigins && typeof v.tapOrigins === "object" ? v.tapOrigins : {};
       if (Array.isArray(v.tapTabs)) {
         // A tab without a stored web origin cannot be checked later: it is not chosen.
@@ -505,5 +529,6 @@ const npInit = (deps) => {
       np.origins = new Map();
     }
   })();
-  npConnect();
+  // After the restore: a pause from before the worker was ended still holds.
+  np.ready.then(npConnect, npConnect);
 };
