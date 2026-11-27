@@ -152,9 +152,24 @@ const world = ({ target = "tailnet", stored = undefined } = {}) => {
     // A token of the local sink is set too: the tailnet target must never fall back to it.
     storage: { local: { get: (d, cb) => setTimeout(() => cb({ ...d, sinkTarget: target, sinkToken: "local-token" }), 0) } },
   };
-  // The module's waits (15 s) run in 60 ms here.
-  const quick = (f, ms) => setTimeout(f, ms > 1000 ? 60 : ms);
-  const ctx = vm.createContext({ console, Blob, TextEncoder, DataView, Uint8Array, Array, Promise, JSON, Math, Date, URL, URLSearchParams, setTimeout: quick, clearTimeout, fetch, crypto: webcrypto, indexedDB, chrome, WebSocket: FakeWebSocket });
+  // The module's time limits (15 s, a silent PC) do not run by the clock here: a check that wants one to pass says
+  // so (timeUp). Shortened to 60 ms by the clock, a loaded runner went past the limit in the middle of a login
+  // (CI run 45036786618), and the link then waited for its next segment.
+  const limits = new Map();
+  let nextLimit = 0;
+  const timer = (f, ms) => {
+    if (!(ms > 1000)) return setTimeout(f, ms);
+    const id = `limit-${++nextLimit}`;
+    limits.set(id, f);
+    return id;
+  };
+  const clearTimer = (h) => (limits.has(h) ? limits.delete(h) : clearTimeout(h));
+  const timeUp = () => {
+    const due = [...limits.values()];
+    limits.clear();
+    due.forEach((f) => f());
+  };
+  const ctx = vm.createContext({ console, Blob, TextEncoder, DataView, Uint8Array, Array, Promise, JSON, Math, Date, URL, URLSearchParams, setTimeout: timer, clearTimeout: clearTimer, fetch, crypto: webcrypto, indexedDB, chrome, WebSocket: FakeWebSocket });
   vm.runInContext(src("tailnet-target.js"), ctx, { filename: "tailnet-target.js" });
   vm.runInContext(src("sink-link.js"), ctx, { filename: "sink-link.js" });
   const port = (tabId) => {
@@ -169,7 +184,7 @@ const world = ({ target = "tailnet", stored = undefined } = {}) => {
     p.post({ t: "hello", session: `tailnet-${tabId}`, title: "test-tailnet.mjs" });
     return p;
   };
-  return { ctx, sink, idb, port, run: (code) => vm.runInContext(code, ctx) };
+  return { ctx, sink, idb, port, timeUp, run: (code) => vm.runInContext(code, ctx) };
 };
 
 let seq = 1;
@@ -210,7 +225,11 @@ const state = async (w) => (await w.run("tnStatus()")).state;
   w.sink.mode = "refuse:code";
   check((await w.run(`tnPair("${HOST}", "${CODE}", "p")`)).reason === "code", "pair-errors: the sink's refusal is passed on");
   w.sink.mode = "silent";
-  check((await w.run(`tnPair("${HOST}", "${CODE}", "p")`)).reason === "unreachable", "pair-errors: a silent PC ends at the time limit");
+  const asked = w.sink.heard.length;
+  const silent = w.run(`tnPair("${HOST}", "${CODE}", "p")`);
+  await until(() => w.sink.heard.length > asked);
+  w.timeUp();
+  check((await silent).reason === "unreachable", "pair-errors: a silent PC ends at the time limit");
   w.sink.mode = "close";
   check((await w.run(`tnPair("${HOST}", "${CODE}", "p")`)).reason === "unreachable", "pair-errors: a PC that is not there");
   w.sink.mode = "junk";
@@ -235,7 +254,7 @@ const state = async (w) => (await w.run("tnStatus()")).state;
   check(w.sink.sockets.at(-1).url === `wss://${HOST}/`, "login: wss to the paired PC only");
   check((await state(w)) === "connected", "login: the status says connected");
   p.gone();
-  await sleep(60);
+  await until(() => w.run("tn.open === 0"));
   check((await state(w)) === "idle", "login: after the video the status is back to paired");
 }
 
@@ -247,8 +266,8 @@ const state = async (w) => (await w.run("tnStatus()")).state;
   w.sink.mode = "hub";
   const p = w.port(2);
   p.post(seg("I", true));
-  await until(() => w.sink.heard.length > 0);
-  await sleep(100);
+  await until(() => w.run("tn.blocked === 'hub-changed'"));
+  await sleep(100); // nothing more is heard after the refusal: a wait for an absence
   check(w.sink.heard.map((h) => h.type).join(" ") === "login", "hub: another sink gets the login and no signature, no hello, no media");
   check((await state(w)) === "hub-changed", "hub: the status says another sink answers");
   const before = w.sink.sockets.length;
@@ -266,8 +285,8 @@ const state = async (w) => (await w.run("tnStatus()")).state;
   w.sink.mode = "refuse:device";
   const p = w.port(3);
   p.post(seg("I", true));
-  await until(() => w.sink.heard.some((h) => h.type === "login"));
-  await sleep(100);
+  // The key is deleted and read back (two transactions) before the pairing reads as gone: wait for that state.
+  await until(() => w.run("tn.blocked === 'revoked' && tn.pairing === null"));
   check((await state(w)) === "revoked", "revoked: the status says so");
   const gone = await w.run("tnStatus()");
   check(!w.idb.has("pc") && gone.paired === false && gone.host === HOST, "revoked: the key is deleted here too, the status still names the PC");
@@ -304,7 +323,7 @@ const state = async (w) => (await w.run("tnStatus()")).state;
   const p = w.port(4);
   p.post(seg("I", true));
   p.post(seg("m1"));
-  await sleep(250);
+  await until(() => w.run("tn.state === 'unreachable'"));
   check((await state(w)) === "unreachable", "unreachable: the status says the PC does not answer");
   check(w.run("sinkLinkStatus(4)").connected === false, "unreachable: the link is not connected");
   await sleep(1300);
@@ -313,8 +332,11 @@ const state = async (w) => (await w.run("tnStatus()")).state;
   check(w.run("sinkLinkStatus(4)").dropped > 0, "unreachable: the segments are counted as dropped, not kept without bound");
   w.sink.mode = "silent";
   await sleep(2200);
+  const heard = w.sink.heard.length;
   p.post(seg("m3"));
-  await sleep(300);
+  await until(() => w.sink.heard.slice(heard).some((h) => h.type === "login"));
+  check((await state(w)) === "connecting", "unreachable: a PC that opens and says nothing keeps the login waiting until its time limit");
+  w.timeUp();
   check((await state(w)) === "unreachable", "unreachable: a PC that opens and then says nothing ends at the time limit");
 }
 
