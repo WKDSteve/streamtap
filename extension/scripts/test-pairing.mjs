@@ -470,6 +470,15 @@ const tabsSent = (w) => w.port().sent.filter((m) => m.t === "tabs");
   forged.start();
   await flush();
   check(forged.run("np.pausedUntil - Date.now()") <= 10 * 60 * 1000 && forged.run("np.backoff") <= 5 * 60 * 1000, "stored values are bounded by the pause and the largest backoff");
+  // The popup's pair-now wakes a worker: it comes before the stored pause is read back, and wins over it.
+  const woken = makeWorld({ session: { npPausedUntil: Date.now() + 9 * 60 * 1000, npBackoff: 40 * 1000 } });
+  woken.start();
+  woken.run("npRetryNow()");
+  await flush();
+  check(
+    woken.ports.length === 1 && woken.run("npStatus()").paused === false && woken.run("np.backoff") === 5000,
+    `a pair-now during the restore is not undone by the stored pause (paused ${woken.run("npStatus()").paused}, backoff ${woken.run("np.backoff")})`
+  );
   w.run("npRetryNow()");
   await flush();
   check(w.ports.length === 2, "the popup's pair-now asks again at once");

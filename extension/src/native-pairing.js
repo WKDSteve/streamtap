@@ -48,6 +48,7 @@ const np = {
   retryTimer: null,
   retryAlarm: false, // a reconnect is waiting as an alarm (long waits)
   pausedUntil: 0,
+  retryWrites: 0, // pause/backoff writes of this worker; a restore read before one of them is stale
   sendTimer: null,
   lastSentAt: 0,
   lastSig: "",
@@ -321,6 +322,7 @@ const npScheduleSend = (force) => {
 // The pause after a denial and the backoff live in session storage: a service worker is ended after about 30 s
 // idle, and the next one must not ask again before the pause is over.
 const npPersistRetry = () => {
+  np.retryWrites++;
   try {
     return Promise.resolve(chrome.storage.session.set({ npPausedUntil: np.pausedUntil, npBackoff: np.backoff })).catch(() => {});
   } catch (e) {
@@ -510,8 +512,10 @@ const npInit = (deps) => {
   np.deps = deps;
   np.ready = (async () => {
     try {
+      const writes = np.retryWrites;
       const v = await chrome.storage.session.get({ tapTabs: [], tapOrigins: {}, npPausedUntil: 0, npBackoff: 0 });
-      npRestoreRetry(v);
+      // A pair-now (or a new state) while this was read is newer than what was read.
+      if (np.retryWrites === writes) npRestoreRetry(v);
       const origins = v.tapOrigins && typeof v.tapOrigins === "object" ? v.tapOrigins : {};
       if (Array.isArray(v.tapTabs)) {
         // A tab without a stored web origin cannot be checked later: it is not chosen.
